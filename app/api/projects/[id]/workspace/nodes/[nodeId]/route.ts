@@ -34,6 +34,8 @@ export async function PATCH(
 
     const { name, parent_id } = body || {};
 
+    const updates: { name?: string; parent_id?: string | null } = {};
+
     if (name !== undefined) {
       if (typeof name !== 'string') {
         return NextResponse.json({ error: 'Name must be a string.' }, { status: 400 });
@@ -42,22 +44,30 @@ export async function PATCH(
       if (!cleanName || cleanName === '.' || cleanName === '..' || cleanName.includes('/') || cleanName.includes('\\') || cleanName.includes('\0')) {
         return NextResponse.json({ error: 'Invalid name. Cannot be empty or contain path separators.' }, { status: 400 });
       }
+      updates.name = cleanName;
     }
 
-    if (parent_id !== undefined && parent_id !== null) {
-      if (typeof parent_id !== 'string') {
-        return NextResponse.json({ error: 'parent_id must be a string.' }, { status: 400 });
+    if (parent_id !== undefined) {
+      if (parent_id !== null) {
+        if (typeof parent_id !== 'string') {
+          return NextResponse.json({ error: 'parent_id must be a string.' }, { status: 400 });
+        }
+        if (parent_id === nodeId) {
+          return NextResponse.json({ error: 'Cannot move a folder into itself.' }, { status: 400 });
+        }
+        const parent = await db.getWorkspaceNode(parent_id);
+        if (!parent || parent.project_id !== projectId || parent.type !== 'folder') {
+          return NextResponse.json({ error: 'Target parent folder not found in this project.' }, { status: 400 });
+        }
       }
-      if (parent_id === nodeId) {
-        return NextResponse.json({ error: 'Cannot move a folder into itself.' }, { status: 400 });
-      }
-      const parent = await db.getWorkspaceNode(parent_id);
-      if (!parent || parent.project_id !== projectId || parent.type !== 'folder') {
-        return NextResponse.json({ error: 'Target parent folder not found in this project.' }, { status: 400 });
-      }
+      updates.parent_id = parent_id;
     }
 
-    const updated = await db.updateWorkspaceNode(nodeId, { name, parent_id }, user.id, user.name);
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json({ error: 'No update parameters specified.' }, { status: 400 });
+    }
+
+    const updated = await db.updateWorkspaceNode(nodeId, updates, user.id, user.name);
 
     return NextResponse.json({ node: updated });
   } catch (err: any) {

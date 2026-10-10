@@ -100,6 +100,15 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       // 10. Project immutability trigger
       expect(content).toContain('prevent_workspace_node_project_transfer');
       expect(content).toContain('BEFORE UPDATE OF project_id ON public.workspace_nodes');
+
+      // 11. Revoke direct mutation privileges on tables from authenticated and anon
+      expect(content).toContain('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.workspace_nodes FROM PUBLIC, anon, authenticated');
+      expect(content).toContain('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.workspace_revisions FROM PUBLIC, anon, authenticated');
+      expect(content).toContain('GRANT SELECT ON TABLE public.workspace_nodes TO authenticated, service_role');
+      expect(content).toContain('GRANT SELECT ON TABLE public.workspace_revisions TO authenticated, service_role');
+
+      // 12. Distinguish parent updates in update_workspace_node_atomic
+      expect(content).toContain('p_update_parent BOOLEAN DEFAULT FALSE');
     });
   });
 
@@ -428,6 +437,98 @@ describe('Technical Review Audit & Regression Test Suite', () => {
         db.updateWorkspaceNode(file1.id, { name: 'file2.ts' }, user.id, user.name)
       ).rejects.toThrow(/already exists/i);
     });
+
+    it('renaming a nested file preserves its parent folder and full path hierarchy', async () => {
+      const user = await db.createUser({ email: 'preserve_parent@mit.edu', name: 'PreserveUser' });
+      const proj = await db.createProject({ name: 'PreserveProj', description: '', leader_id: user.id });
+
+      const srcFolder = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'src',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const utilsFolder = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: srcFolder.id,
+        name: 'utils',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: utilsFolder.id,
+        name: 'math.ts',
+        type: 'file',
+        initialContent: 'export const add = (a: number, b: number) => a + b;',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      expect(file.parent_id).toBe(utilsFolder.id);
+      expect(file.path).toBe('/src/utils/math.ts');
+
+      // 1. Rename without passing parent_id -> MUST preserve existing parent
+      const renamedFile = await db.updateWorkspaceNode(
+        file.id,
+        { name: 'calculator.ts' },
+        user.id,
+        user.name
+      );
+
+      expect(renamedFile.name).toBe('calculator.ts');
+      expect(renamedFile.parent_id).toBe(utilsFolder.id);
+      expect(renamedFile.path).toBe('/src/utils/calculator.ts');
+
+      // 2. Renaming the nested folder 'utils' -> 'helpers' preserves its parent 'src'
+      const renamedFolder = await db.updateWorkspaceNode(
+        utilsFolder.id,
+        { name: 'helpers' },
+        user.id,
+        user.name
+      );
+
+      expect(renamedFolder.name).toBe('helpers');
+      expect(renamedFolder.parent_id).toBe(srcFolder.id);
+      expect(renamedFolder.path).toBe('/src/helpers');
+
+      // Descendant paths must reflect the renamed folder
+      const fileAfterFolderRename = await db.getWorkspaceNode(file.id);
+      expect(fileAfterFolderRename?.path).toBe('/src/helpers/calculator.ts');
+      expect(fileAfterFolderRename?.parent_id).toBe(utilsFolder.id);
+
+      // 3. Moving the file to another folder updates parent and path
+      const otherFolder = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'lib',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const movedFile = await db.updateWorkspaceNode(
+        file.id,
+        { parent_id: otherFolder.id },
+        user.id,
+        user.name
+      );
+      expect(movedFile.parent_id).toBe(otherFolder.id);
+      expect(movedFile.path).toBe('/lib/calculator.ts');
+
+      // 4. Explicit move to root (parent_id: null) sets parent to null and path to /calculator.ts
+      const rootFile = await db.updateWorkspaceNode(
+        file.id,
+        { parent_id: null },
+        user.id,
+        user.name
+      );
+      expect(rootFile.parent_id).toBeNull();
+      expect(rootFile.path).toBe('/calculator.ts');
+    });
   });
 
   // =========================================================================
@@ -727,14 +828,14 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       ).rejects.toThrow(/Failed to create workspace item: Failed to insert initial revision snapshot/i);
     });
 
-    it('SupabaseDatabaseAdapter routes folder mutations through atomic RPC operations', async () => {
-      let rpcCalls: string[] = [];
+    it('SupabaseDatabaseAdapter routes folder mutations through atomic RPC operations and distinguishes rename vs moves', async () => {
+      let rpcCalls: { fn: string; args: any }[] = [];
       const mockClient: any = {
         rpc: async (fnName: string, args: any) => {
-          rpcCalls.push(fnName);
+          rpcCalls.push({ fn: fnName, args });
           if (fnName === 'update_workspace_node_atomic') {
             return {
-              data: { id: 'node-1', name: 'new-name', path: '/new-name' },
+              data: { id: 'node-1', name: args.p_name || 'orig-name', parent_id: args.p_parent_id },
               error: null,
             };
           }
@@ -750,18 +851,43 @@ describe('Technical Review Audit & Regression Test Suite', () => {
 
       const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
 
-      const updated = await supabaseDb.updateWorkspaceNode(
+      // 1. Rename without changing parent -> p_update_parent: false, p_parent_id: null
+      const renamed = await supabaseDb.updateWorkspaceNode(
         'node-1',
-        { name: 'new-name' },
+        { name: 'renamed-name' },
         'user-1',
         'User 1'
       );
-      expect(updated.name).toBe('new-name');
-      expect(rpcCalls).toContain('update_workspace_node_atomic');
+      expect(renamed.name).toBe('renamed-name');
+      const renameCall = rpcCalls.find((c) => c.fn === 'update_workspace_node_atomic' && c.args.p_name === 'renamed-name');
+      expect(renameCall?.args.p_update_parent).toBe(false);
+      expect(renameCall?.args.p_parent_id).toBeNull();
 
+      // 2. Move to target folder -> p_update_parent: true, p_parent_id: 'folder-123'
+      await supabaseDb.updateWorkspaceNode(
+        'node-1',
+        { parent_id: 'folder-123' },
+        'user-1',
+        'User 1'
+      );
+      const moveCall = rpcCalls.find((c) => c.args.p_parent_id === 'folder-123');
+      expect(moveCall?.args.p_update_parent).toBe(true);
+      expect(moveCall?.args.p_parent_id).toBe('folder-123');
+
+      // 3. Explicit root move -> p_update_parent: true, p_parent_id: null
+      await supabaseDb.updateWorkspaceNode(
+        'node-1',
+        { parent_id: null },
+        'user-1',
+        'User 1'
+      );
+      const rootMoveCall = rpcCalls.find((c) => c.args.p_update_parent === true && c.args.p_parent_id === null);
+      expect(rootMoveCall).toBeDefined();
+
+      // 4. Delete operation -> calls delete_workspace_node_atomic
       const deleted = await supabaseDb.deleteWorkspaceNode('node-1');
       expect(deleted).toBe(true);
-      expect(rpcCalls).toContain('delete_workspace_node_atomic');
+      expect(rpcCalls.some((c) => c.fn === 'delete_workspace_node_atomic')).toBe(true);
     });
 
     it('HTTP route PUT /api/projects/:id/workspace/files/:fileId rejects missing baseRevision and validates project isolation', async () => {
@@ -873,6 +999,140 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       const forceBody = await forceRes.json();
       expect(forceBody.file.content).toBe('forced content');
       expect(forceBody.file.current_revision).toBe(3);
+    });
+
+    it('HTTP route PATCH /api/projects/:id/workspace/nodes/:nodeId distinguishes rename, folder move, and explicit root move', async () => {
+      const alice = await db.createUser({ email: 'patch_alice@mit.edu', name: 'Alice' });
+      const proj = await db.createProject({ name: 'PatchProj', description: '', leader_id: alice.id });
+
+      const srcFolder = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'src',
+        type: 'folder',
+        author_id: alice.id,
+        author_name: alice.name,
+      });
+
+      const utilsFolder = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: srcFolder.id,
+        name: 'utils',
+        type: 'folder',
+        author_id: alice.id,
+        author_name: alice.name,
+      });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: utilsFolder.id,
+        name: 'test.ts',
+        type: 'file',
+        initialContent: 'test',
+        author_id: alice.id,
+        author_name: alice.name,
+      });
+
+      expect(file.parent_id).toBe(utilsFolder.id);
+      expect(file.path).toBe('/src/utils/test.ts');
+
+      // 1. Rename only -> MUST preserve parent utilsFolder.id
+      const renameReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/nodes/${file.id}`,
+        alice.id,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ name: 'renamed.ts' }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const renameRes = await updateNodeHandler(renameReq, {
+        params: { id: proj.id, nodeId: file.id },
+      });
+      expect(renameRes.status).toBe(200);
+      const renameBody = await renameRes.json();
+      expect(renameBody.node.name).toBe('renamed.ts');
+      expect(renameBody.node.parent_id).toBe(utilsFolder.id);
+      expect(renameBody.node.path).toBe('/src/utils/renamed.ts');
+
+      // 2. Move to folder srcFolder -> updates parent and path
+      const moveReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/nodes/${file.id}`,
+        alice.id,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ parent_id: srcFolder.id }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const moveRes = await updateNodeHandler(moveReq, {
+        params: { id: proj.id, nodeId: file.id },
+      });
+      expect(moveRes.status).toBe(200);
+      const moveBody = await moveRes.json();
+      expect(moveBody.node.parent_id).toBe(srcFolder.id);
+      expect(moveBody.node.path).toBe('/src/renamed.ts');
+
+      // 3. Explicit root move (parent_id: null) -> updates parent to null and path to /renamed.ts
+      const rootMoveReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/nodes/${file.id}`,
+        alice.id,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ parent_id: null }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const rootMoveRes = await updateNodeHandler(rootMoveReq, {
+        params: { id: proj.id, nodeId: file.id },
+      });
+      expect(rootMoveRes.status).toBe(200);
+      const rootMoveBody = await rootMoveRes.json();
+      expect(rootMoveBody.node.parent_id).toBeNull();
+      expect(rootMoveBody.node.path).toBe('/renamed.ts');
+
+      // 4. Moving folder into its own descendant -> 400
+      const cycleReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/nodes/${srcFolder.id}`,
+        alice.id,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ parent_id: utilsFolder.id }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const cycleRes = await updateNodeHandler(cycleReq, {
+        params: { id: proj.id, nodeId: srcFolder.id },
+      });
+      expect(cycleRes.status).toBe(400);
+      const cycleBody = await cycleRes.json();
+      expect(cycleBody.error).toMatch(/descendant/i);
+
+      // 5. Cross-project parent folder injection -> 400
+      const stranger = await db.createUser({ email: 'stranger_patch@mit.edu', name: 'Stranger' });
+      const foreignProj = await db.createProject({ name: 'ForeignProj', description: '', leader_id: stranger.id });
+      const foreignFolder = await db.createWorkspaceNode({
+        project_id: foreignProj.id,
+        name: 'foreign_dir',
+        type: 'folder',
+        author_id: stranger.id,
+        author_name: stranger.name,
+      });
+
+      const foreignReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/nodes/${file.id}`,
+        alice.id,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ parent_id: foreignFolder.id }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const foreignRes = await updateNodeHandler(foreignReq, {
+        params: { id: proj.id, nodeId: file.id },
+      });
+      expect(foreignRes.status).toBe(400);
+      const foreignBody = await foreignRes.json();
+      expect(foreignBody.error).toMatch(/Target parent folder not found/i);
     });
   });
 });

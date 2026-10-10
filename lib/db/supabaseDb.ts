@@ -613,12 +613,16 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       }
     }
 
+    const hasParentUpdate = updates.parent_id !== undefined;
+
     const { data, error } = await this.client.rpc('update_workspace_node_atomic', {
       p_node_id: nodeId,
       p_name: newName || null,
-      p_parent_id: updates.parent_id !== undefined ? updates.parent_id : null,
+      p_parent_id: hasParentUpdate ? (updates.parent_id || null) : null,
       p_author_id: author_id,
       p_author_name: author_name,
+      p_project_id: null,
+      p_update_parent: hasParentUpdate,
     });
 
     if (error || !data) {

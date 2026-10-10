@@ -84,33 +84,16 @@ DROP POLICY IF EXISTS "Members can view workspace nodes" ON public.workspace_nod
 CREATE POLICY "Members can view workspace nodes"
     ON public.workspace_nodes FOR SELECT
     TO authenticated
-    USING (is_project_member(project_id, auth.uid()));
+    USING (public.is_project_member(project_id, auth.uid()));
 
+-- Prevent direct table writes from bypassing atomic operations (Enforced at database boundary)
 DROP POLICY IF EXISTS "Members can create workspace nodes" ON public.workspace_nodes;
-CREATE POLICY "Members can create workspace nodes"
-    ON public.workspace_nodes FOR INSERT
-    TO authenticated
-    WITH CHECK (
-        is_project_member(project_id, auth.uid()) AND
-        last_modified_by = auth.uid()
-    );
-
 DROP POLICY IF EXISTS "Members can update workspace nodes" ON public.workspace_nodes;
-CREATE POLICY "Members can update workspace nodes"
-    ON public.workspace_nodes FOR UPDATE
-    TO authenticated
-    USING (is_project_member(project_id, auth.uid()))
-    WITH CHECK (
-        is_project_member(project_id, auth.uid()) AND
-        last_modified_by = auth.uid()
-    );
-
 DROP POLICY IF EXISTS "Members can delete workspace nodes" ON public.workspace_nodes;
 DROP POLICY IF EXISTS "Leaders can hard delete workspace nodes" ON public.workspace_nodes;
-CREATE POLICY "Leaders can hard delete workspace nodes"
-    ON public.workspace_nodes FOR DELETE
-    TO authenticated
-    USING (is_project_leader(project_id, auth.uid()));
+
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.workspace_nodes FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON TABLE public.workspace_nodes TO authenticated, service_role;
 
 -- 2. WORKSPACE REVISIONS (Immutable History and Recovery)
 CREATE TABLE IF NOT EXISTS public.workspace_revisions (
@@ -150,16 +133,13 @@ DROP POLICY IF EXISTS "Members can view workspace revisions" ON public.workspace
 CREATE POLICY "Members can view workspace revisions"
     ON public.workspace_revisions FOR SELECT
     TO authenticated
-    USING (is_project_member(project_id, auth.uid()));
+    USING (public.is_project_member(project_id, auth.uid()));
 
+-- Prevent direct table writes from bypassing atomic operations (Enforced at database boundary)
 DROP POLICY IF EXISTS "Members can insert workspace revisions" ON public.workspace_revisions;
-CREATE POLICY "Members can insert workspace revisions"
-    ON public.workspace_revisions FOR INSERT
-    TO authenticated
-    WITH CHECK (
-        is_project_member(project_id, auth.uid()) AND
-        author_id = auth.uid()
-    );
+
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.workspace_revisions FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON TABLE public.workspace_revisions TO authenticated, service_role;
 
 -- Revision Immutability Protection: Historical records cannot be modified or deleted
 CREATE OR REPLACE FUNCTION public.prevent_workspace_revision_modification()
@@ -230,7 +210,7 @@ BEGIN
     END IF;
 
     -- Verify project membership
-    IF NOT is_project_member(p_project_id, v_caller_id) THEN
+    IF NOT public.is_project_member(p_project_id, v_caller_id) THEN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
@@ -267,6 +247,8 @@ BEGIN
         IF v_size > 10 * 1024 * 1024 THEN
             RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
         END IF;
+    ELSE
+        v_size := 0;
     END IF;
 
     -- 1. Insert file node
@@ -288,7 +270,7 @@ BEGIN
         v_clean_name,
         v_node_path,
         p_type,
-        1,
+        CASE WHEN p_type = 'file' THEN 1 ELSE 0 END,
         v_caller_id,
         v_author_name,
         v_size,
@@ -298,7 +280,7 @@ BEGIN
 
     -- 2. If file, insert initial revision atomically in the SAME transaction
     IF p_type = 'file' THEN
-        v_checksum := encode(digest(COALESCE(p_initial_content, ''), 'sha256'), 'hex');
+        v_checksum := encode(public.digest(COALESCE(p_initial_content, ''), 'sha256'), 'hex');
 
         INSERT INTO public.workspace_revisions (
             node_id,
@@ -383,7 +365,7 @@ BEGIN
     END IF;
 
     -- Verify caller is an authorized member of this project
-    IF NOT is_project_member(v_node.project_id, v_caller_id) THEN
+    IF NOT public.is_project_member(v_node.project_id, v_caller_id) THEN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
@@ -411,7 +393,7 @@ BEGIN
     END IF;
 
     IF v_checksum IS NULL OR v_checksum = '' THEN
-        v_checksum := encode(digest(COALESCE(p_content, ''), 'sha256'), 'hex');
+        v_checksum := encode(public.digest(COALESCE(p_content, ''), 'sha256'), 'hex');
     END IF;
 
     v_next_rev := v_node.current_revision + 1;
@@ -459,11 +441,12 @@ $$;
 -- 5. ATOMIC FOLDER MOVE / RENAME WITH CYCLE PREVENTION AND PATH CASCADE
 CREATE OR REPLACE FUNCTION public.update_workspace_node_atomic(
     p_node_id UUID,
-    p_name TEXT,
-    p_parent_id UUID,
+    p_name TEXT DEFAULT NULL,
+    p_parent_id UUID DEFAULT NULL,
     p_author_id UUID DEFAULT NULL,
     p_author_name TEXT DEFAULT NULL,
-    p_project_id UUID DEFAULT NULL
+    p_project_id UUID DEFAULT NULL,
+    p_update_parent BOOLEAN DEFAULT FALSE
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -477,6 +460,7 @@ DECLARE
     v_parent public.workspace_nodes%ROWTYPE;
     v_old_path TEXT;
     v_new_path TEXT;
+    v_new_parent_id UUID;
     v_parent_path TEXT := '';
     v_now TIMESTAMPTZ := timezone('utc'::text, now());
     v_clean_name TEXT;
@@ -510,7 +494,7 @@ BEGIN
         RAISE EXCEPTION 'Workspace item not found.';
     END IF;
 
-    IF NOT is_project_member(v_node.project_id, v_caller_id) THEN
+    IF NOT public.is_project_member(v_node.project_id, v_caller_id) THEN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
@@ -525,35 +509,58 @@ BEGIN
         RAISE EXCEPTION 'Invalid file or folder name. Name cannot be empty or contain path separators.';
     END IF;
 
-    -- Validate new parent if supplied
-    IF p_parent_id IS NOT NULL THEN
-        IF p_parent_id = p_node_id THEN
-            RAISE EXCEPTION 'Cannot move a folder into itself.';
-        END IF;
-
-        SELECT * INTO v_parent
-        FROM public.workspace_nodes
-        WHERE id = p_parent_id AND project_id = v_node.project_id AND deleted_at IS NULL;
-
-        IF NOT FOUND OR v_parent.type <> 'folder' THEN
-            RAISE EXCEPTION 'Target parent folder not found or belongs to another project.';
-        END IF;
-
-        IF v_node.type = 'folder' THEN
-            IF v_parent.path = v_old_path OR v_parent.path LIKE (v_old_path || '/%') THEN
-                RAISE EXCEPTION 'Cannot move a folder into one of its descendants.';
+    -- Handle parent updates vs preserving existing parent (Task 1)
+    IF p_update_parent IS TRUE THEN
+        IF p_parent_id IS NOT NULL THEN
+            IF p_parent_id = p_node_id THEN
+                RAISE EXCEPTION 'Cannot move a folder into itself.';
             END IF;
 
-            v_curr_parent := v_parent.parent_id;
-            WHILE v_curr_parent IS NOT NULL LOOP
-                IF v_curr_parent = p_node_id THEN
+            SELECT * INTO v_parent
+            FROM public.workspace_nodes
+            WHERE id = p_parent_id AND project_id = v_node.project_id AND deleted_at IS NULL;
+
+            IF NOT FOUND OR v_parent.type <> 'folder' THEN
+                RAISE EXCEPTION 'Target parent folder not found or belongs to another project.';
+            END IF;
+
+            IF v_node.type = 'folder' THEN
+                IF v_parent.path = v_old_path OR v_parent.path LIKE (v_old_path || '/%') THEN
                     RAISE EXCEPTION 'Cannot move a folder into one of its descendants.';
                 END IF;
-                SELECT parent_id INTO v_curr_parent FROM public.workspace_nodes WHERE id = v_curr_parent AND deleted_at IS NULL;
-            END LOOP;
-        END IF;
 
-        v_parent_path := v_parent.path;
+                v_curr_parent := v_parent.parent_id;
+                WHILE v_curr_parent IS NOT NULL LOOP
+                    IF v_curr_parent = p_node_id THEN
+                        RAISE EXCEPTION 'Cannot move a folder into one of its descendants.';
+                    END IF;
+                    SELECT parent_id INTO v_curr_parent FROM public.workspace_nodes WHERE id = v_curr_parent AND deleted_at IS NULL;
+                END LOOP;
+            END IF;
+
+            v_new_parent_id := p_parent_id;
+            v_parent_path := v_parent.path;
+        ELSE
+            -- Explicit move to project root
+            v_new_parent_id := NULL;
+            v_parent_path := '';
+        END IF;
+    ELSE
+        -- Preserve existing parent
+        v_new_parent_id := v_node.parent_id;
+        IF v_node.parent_id IS NOT NULL THEN
+            SELECT * INTO v_parent
+            FROM public.workspace_nodes
+            WHERE id = v_node.parent_id AND project_id = v_node.project_id AND deleted_at IS NULL;
+
+            IF FOUND THEN
+                v_parent_path := v_parent.path;
+            ELSE
+                v_parent_path := '';
+            END IF;
+        ELSE
+            v_parent_path := '';
+        END IF;
     END IF;
 
     v_new_path := v_parent_path || '/' || v_clean_name;
@@ -570,7 +577,7 @@ BEGIN
     UPDATE public.workspace_nodes
     SET
         name = v_clean_name,
-        parent_id = p_parent_id,
+        parent_id = v_new_parent_id,
         path = v_new_path,
         last_modified_by = v_caller_id,
         last_modified_name = v_author_name,
@@ -595,6 +602,7 @@ $$;
 -- 6. ATOMIC FOLDER & FILE DELETION (Soft-deletes target & all descendants in one transaction)
 CREATE OR REPLACE FUNCTION public.delete_workspace_node_atomic(
     p_node_id UUID,
+    p_author_id UUID DEFAULT NULL,
     p_project_id UUID DEFAULT NULL
 )
 RETURNS JSONB
@@ -605,6 +613,7 @@ AS $$
 DECLARE
     v_caller_id UUID := auth.uid();
     v_node public.workspace_nodes%ROWTYPE;
+    v_author_name TEXT;
     v_now TIMESTAMPTZ := timezone('utc'::text, now());
 BEGIN
     SELECT * INTO v_node
@@ -618,13 +627,22 @@ BEGIN
 
     IF v_caller_id IS NULL THEN
         IF current_user = 'service_role' OR current_user = 'postgres' THEN
-            v_caller_id := v_node.last_modified_by;
+            v_caller_id := COALESCE(p_author_id, v_node.last_modified_by);
         ELSE
             RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
         END IF;
     END IF;
 
-    IF NOT is_project_member(v_node.project_id, v_caller_id) THEN
+    IF p_author_id IS NOT NULL AND p_author_id <> v_caller_id THEN
+        RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
+    END IF;
+
+    SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
+    IF v_author_name IS NULL OR v_author_name = '' THEN
+        v_author_name := 'Anonymous';
+    END IF;
+
+    IF NOT public.is_project_member(v_node.project_id, v_caller_id) THEN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
@@ -634,13 +652,19 @@ BEGIN
 
     -- Soft delete target node
     UPDATE public.workspace_nodes
-    SET deleted_at = v_now
+    SET deleted_at = v_now,
+        last_modified_by = v_caller_id,
+        last_modified_name = v_author_name,
+        updated_at = v_now
     WHERE id = p_node_id;
 
     -- If folder, soft delete all descendants in the same transaction
     IF v_node.type = 'folder' THEN
         UPDATE public.workspace_nodes
-        SET deleted_at = v_now
+        SET deleted_at = v_now,
+            last_modified_by = v_caller_id,
+            last_modified_name = v_author_name,
+            updated_at = v_now
         WHERE project_id = v_node.project_id
           AND deleted_at IS NULL
           AND path LIKE (v_node.path || '/%');
@@ -651,18 +675,22 @@ END;
 $$;
 
 -- 7. EXPLICIT PRIVILEGE RESTRICTIONS (Principle of Least Privilege)
-REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, workspace_node_type, TEXT, UUID, TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, workspace_node_type, TEXT, UUID, TEXT) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, workspace_node_type, TEXT, UUID, TEXT) TO service_role;
+REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) TO service_role;
 
 REVOKE ALL ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) FROM anon;
 GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) TO service_role;
 
-REVOKE ALL ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID) TO service_role;
+REVOKE ALL ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) FROM anon;
+GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) TO service_role;
 
-REVOKE ALL ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID) TO service_role;
+REVOKE ALL ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) FROM anon;
+GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) TO service_role;
