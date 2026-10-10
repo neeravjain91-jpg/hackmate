@@ -90,4 +90,40 @@ export interface IDatabaseAdapter {
   ): Promise<Contribution[]>;
   getContributionById(contributionId: string): Promise<Contribution | null>;
   getContributionFileById(fileId: string): Promise<ContributionFile | null>;
+
+  // Common Development Workspace Management
+  getWorkspaceTree(projectId: string): Promise<import('../types').WorkspaceTreeItem[]>;
+  getWorkspaceNode(nodeId: string): Promise<import('../types').WorkspaceNode | null>;
+  createWorkspaceNode(data: {
+    project_id: string;
+    parent_id?: string | null;
+    name: string;
+    type: import('../types').WorkspaceNodeType;
+    initialContent?: string;
+    author_id: string;
+    author_name: string;
+  }): Promise<import('../types').WorkspaceNode>;
+  updateWorkspaceNode(
+    nodeId: string,
+    updates: { name?: string; parent_id?: string | null },
+    author_id: string,
+    author_name: string
+  ): Promise<import('../types').WorkspaceNode>;
+  deleteWorkspaceNode(nodeId: string): Promise<boolean>;
+  getWorkspaceFile(fileId: string): Promise<import('../types').WorkspaceFileDetail | null>;
+  saveWorkspaceFile(
+    fileId: string,
+    content: string,
+    baseRevision: number | undefined,
+    author_id: string,
+    author_name: string
+  ): Promise<{ file: import('../types').WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }>;
+  getWorkspaceFileRevisions(fileId: string): Promise<import('../types').WorkspaceRevision[]>;
+  restoreWorkspaceRevision(
+    fileId: string,
+    targetRevisionNumber: number,
+    author_id: string,
+    author_name: string
+  ): Promise<import('../types').WorkspaceFileDetail>;
 }
+

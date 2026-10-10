@@ -12,6 +12,11 @@ import {
   Contribution,
   ContributionFile,
   ProjectWithDetails,
+  WorkspaceNode,
+  WorkspaceNodeType,
+  WorkspaceRevision,
+  WorkspaceFileDetail,
+  WorkspaceTreeItem,
 } from '../types';
 import { IDatabaseAdapter } from './types';
 
@@ -496,4 +501,318 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     if (error || !data) return null;
     return data as ContributionFile;
   }
+
+  // --- Common Development Workspace Operations ---
+  async getWorkspaceTree(projectId: string): Promise<WorkspaceTreeItem[]> {
+    const { data: nodes, error } = await this.client
+      .from('workspace_nodes')
+      .select('*')
+      .eq('project_id', projectId)
+      .is('deleted_at', null);
+
+    if (error || !nodes) return [];
+
+    const nodeMap = new Map<string, WorkspaceTreeItem>();
+    nodes.forEach((n: any) => {
+      nodeMap.set(n.id, { ...n, children: n.type === 'folder' ? [] : undefined });
+    });
+
+    const roots: WorkspaceTreeItem[] = [];
+    nodes.forEach((n: any) => {
+      const item = nodeMap.get(n.id)!;
+      if (!n.parent_id || !nodeMap.has(n.parent_id)) {
+        roots.push(item);
+      } else {
+        const parent = nodeMap.get(n.parent_id);
+        if (parent && parent.children) {
+          parent.children.push(item);
+        } else {
+          roots.push(item);
+        }
+      }
+    });
+
+    const sortItems = (items: WorkspaceTreeItem[]) => {
+      items.sort((a, b) => {
+        if (a.type !== b.type) {
+          return a.type === 'folder' ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name);
+      });
+      items.forEach((item) => {
+        if (item.children) sortItems(item.children);
+      });
+    };
+
+    sortItems(roots);
+    return roots;
+  }
+
+  async getWorkspaceNode(nodeId: string): Promise<WorkspaceNode | null> {
+    const { data, error } = await this.client
+      .from('workspace_nodes')
+      .select('*')
+      .eq('id', nodeId)
+      .is('deleted_at', null)
+      .single();
+
+    if (error || !data) return null;
+    return data as WorkspaceNode;
+  }
+
+  async createWorkspaceNode(input: {
+    project_id: string;
+    parent_id?: string | null;
+    name: string;
+    type: WorkspaceNodeType;
+    initialContent?: string;
+    author_id: string;
+    author_name: string;
+  }): Promise<WorkspaceNode> {
+    const cleanName = input.name.trim();
+    if (!cleanName || cleanName === '.' || cleanName === '..' || cleanName.includes('/') || cleanName.includes('\\') || cleanName.includes('\0')) {
+      throw new Error('Invalid file or folder name. Name cannot be empty or contain path separators.');
+    }
+
+    if (input.initialContent && Buffer.byteLength(input.initialContent, 'utf-8') > 10 * 1024 * 1024) {
+      throw new Error('File content exceeds the maximum size limit of 10MB.');
+    }
+
+    let parentPath = '';
+
+    if (input.parent_id) {
+      const parent = await this.getWorkspaceNode(input.parent_id);
+      if (!parent || parent.type !== 'folder') {
+        throw new Error('Parent folder not found.');
+      }
+      parentPath = parent.path;
+    }
+
+    const nodePath = `${parentPath}/${cleanName}`;
+    const initialContent = input.initialContent ?? '';
+    const size = input.type === 'file' ? Buffer.byteLength(initialContent, 'utf-8') : undefined;
+
+    const { data: node, error } = await this.client
+      .from('workspace_nodes')
+      .insert({
+        project_id: input.project_id,
+        parent_id: input.parent_id || null,
+        name: cleanName,
+        path: nodePath,
+        type: input.type,
+        current_revision: 1,
+        last_modified_by: input.author_id,
+        last_modified_name: input.author_name,
+        size,
+      })
+      .select('*')
+      .single();
+
+    if (error || !node) {
+      throw new Error(`Failed to create workspace item: ${error?.message}`);
+    }
+
+    if (input.type === 'file') {
+      const checksum = crypto.createHash('sha256').update(initialContent).digest('hex');
+      await this.client.from('workspace_revisions').insert({
+        node_id: node.id,
+        project_id: input.project_id,
+        revision_number: 1,
+        content: initialContent,
+        author_id: input.author_id,
+        author_name: input.author_name,
+        checksum,
+      });
+    }
+
+    return node as WorkspaceNode;
+  }
+
+  async updateWorkspaceNode(
+    nodeId: string,
+    updates: { name?: string; parent_id?: string | null },
+    author_id: string,
+    author_name: string
+  ): Promise<WorkspaceNode> {
+    const node = await this.getWorkspaceNode(nodeId);
+    if (!node) throw new Error('Workspace item not found.');
+
+    const oldPath = node.path;
+    const newName = updates.name !== undefined ? updates.name.trim() : node.name;
+    const newParentId = updates.parent_id !== undefined ? updates.parent_id : node.parent_id;
+
+    let parentPath = '';
+    if (newParentId) {
+      const parent = await this.getWorkspaceNode(newParentId);
+      if (!parent) throw new Error('Parent folder not found.');
+      parentPath = parent.path;
+    }
+
+    const newPath = `${parentPath}/${newName}`;
+
+    const { data, error } = await this.client
+      .from('workspace_nodes')
+      .update({
+        name: newName,
+        parent_id: newParentId,
+        path: newPath,
+        last_modified_by: author_id,
+        last_modified_name: author_name,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', nodeId)
+      .select('*')
+      .single();
+
+    if (error || !data) {
+      throw new Error(`Failed to update workspace item: ${error?.message}`);
+    }
+
+    return data as WorkspaceNode;
+  }
+
+  async deleteWorkspaceNode(nodeId: string): Promise<boolean> {
+    const node = await this.getWorkspaceNode(nodeId);
+    if (!node || node.deleted_at) return false;
+
+    const now = new Date().toISOString();
+
+    // Soft delete to preserve historical revisions
+    const { error } = await this.client
+      .from('workspace_nodes')
+      .update({ deleted_at: now })
+      .eq('id', nodeId);
+
+    if (error) return false;
+
+    if (node.type === 'folder') {
+      await this.client
+        .from('workspace_nodes')
+        .update({ deleted_at: now })
+        .eq('project_id', node.project_id)
+        .like('path', `${node.path}/%`);
+    }
+
+    return true;
+  }
+
+  async getWorkspaceFile(fileId: string): Promise<WorkspaceFileDetail | null> {
+    const node = await this.getWorkspaceNode(fileId);
+    if (!node || node.type !== 'file') return null;
+
+    const { data: revisions } = await this.client
+      .from('workspace_revisions')
+      .select('*')
+      .eq('node_id', fileId)
+      .order('revision_number', { ascending: false });
+
+    const latestRev = revisions && revisions[0];
+    const content = latestRev ? latestRev.content : '';
+
+    return {
+      ...node,
+      content,
+      revisions: revisions || [],
+    };
+  }
+
+  async saveWorkspaceFile(
+    fileId: string,
+    content: string,
+    baseRevision: number | undefined,
+    author_id: string,
+    author_name: string
+  ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
+    const node = await this.getWorkspaceNode(fileId);
+    if (!node || node.type !== 'file') throw new Error('File not found.');
+
+    if (Buffer.byteLength(content, 'utf-8') > 10 * 1024 * 1024) {
+      throw new Error('File content exceeds the maximum size limit of 10MB.');
+    }
+
+    if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+      const current = await this.getWorkspaceFile(fileId);
+      return {
+        file: current!,
+        conflict: true,
+        currentRevision: node.current_revision,
+      };
+    }
+
+    const nextRevNum = node.current_revision + 1;
+    const now = new Date().toISOString();
+    const checksum = crypto.createHash('sha256').update(content).digest('hex');
+
+    const { error: revErr } = await this.client.from('workspace_revisions').insert({
+      node_id: fileId,
+      project_id: node.project_id,
+      revision_number: nextRevNum,
+      content,
+      author_id,
+      author_name,
+      checksum,
+      created_at: now,
+    });
+
+    if (revErr) {
+      throw new Error(`Failed to save revision: ${revErr.message}`);
+    }
+
+    await this.client
+      .from('workspace_nodes')
+      .update({
+        current_revision: nextRevNum,
+        last_modified_by: author_id,
+        last_modified_name: author_name,
+        updated_at: now,
+        size: Buffer.byteLength(content, 'utf-8'),
+      })
+      .eq('id', fileId);
+
+    const updated = await this.getWorkspaceFile(fileId);
+    return {
+      file: updated!,
+      conflict: false,
+    };
+  }
+
+  async getWorkspaceFileRevisions(fileId: string): Promise<WorkspaceRevision[]> {
+    const { data, error } = await this.client
+      .from('workspace_revisions')
+      .select('*')
+      .eq('node_id', fileId)
+      .order('revision_number', { ascending: false });
+
+    if (error || !data) return [];
+    return data as WorkspaceRevision[];
+  }
+
+  async restoreWorkspaceRevision(
+    fileId: string,
+    targetRevisionNumber: number,
+    author_id: string,
+    author_name: string
+  ): Promise<WorkspaceFileDetail> {
+    const { data: targetRev, error } = await this.client
+      .from('workspace_revisions')
+      .select('*')
+      .eq('node_id', fileId)
+      .eq('revision_number', targetRevisionNumber)
+      .single();
+
+    if (error || !targetRev) {
+      throw new Error(`Revision ${targetRevisionNumber} not found.`);
+    }
+
+    const saved = await this.saveWorkspaceFile(
+      fileId,
+      targetRev.content,
+      undefined,
+      author_id,
+      `${author_name} (Restored Rev #${targetRevisionNumber})`
+    );
+
+    return saved.file;
+  }
 }
+

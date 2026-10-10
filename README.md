@@ -20,6 +20,14 @@ HackMate is a web collaboration platform engineered specifically for hackathon t
   * Any project member can publish work with title, description, optional task association, version label (e.g. `v1.0.0`), usage instructions, dependencies, and file attachments.
   * Real-time search and filtering by title, contributor, and associated task.
   * Distinguishes latest upload from historical contributions without silent overwrites.
+* **Common Development Workspace (Milestone 2)**:
+  * Persistent hierarchical project file tree (folders & source files).
+  * In-browser code and text editing with line numbers and syntax formatting.
+  * Real-time save status indicators (`Saved`, `Unsaved changes`, `Saving...`, `Conflict Detected`).
+  * Optimistic concurrency control & conflict detection to prevent silent teammate overwrites.
+  * Full immutable revision history with author tracking and timestamps.
+  * Non-destructive version recovery: restoring an earlier snapshot creates a new revision without destructive rollbacks.
+  * Persistent disk mirror (`data/workspaces/{projectId}/`) alongside database records.
 * **Private Storage & Byte-for-Byte File Downloads**:
   * Relational database stores file metadata and checksums (SHA-256).
   * Private object storage preserves binary integrity.
@@ -55,9 +63,17 @@ HackMate is a web collaboration platform engineered specifically for hackathon t
 │   │   │       ├── tasks/[taskId]/route.ts (status updates & review)
 │   │   │       ├── contributions/route.ts (publish & list shared work)
 │   │   │       ├── contributions/[contribId]/route.ts (contribution detail)
-│   │   │       └── files/[fileId]/download/route.ts (private authorized download)
+│   │   │       ├── files/[fileId]/download/route.ts (private authorized download)
+│   │   │       └── workspace/
+│   │   │           ├── tree/route.ts (workspace file tree)
+│   │   │           ├── nodes/route.ts (create file/folder)
+│   │   │           ├── nodes/[nodeId]/route.ts (rename/delete)
+│   │   │           ├── files/[fileId]/route.ts (get & save with conflict detection)
+│   │   │           ├── files/[fileId]/revisions/route.ts (immutable revision history)
+│   │   │           └── files/[fileId]/restore/route.ts (non-destructive rollback)
 │   ├── dashboard/page.tsx (Screen A: Project dashboard)
 │   ├── projects/[id]/page.tsx (Screen B: Project Overview)
+│   ├── projects/[id]/workspace/page.tsx (Common Development Workspace)
 │   ├── projects/[id]/tasks/page.tsx (Screen C: Task Pipeline & Reviews)
 │   ├── projects/[id]/shared-work/page.tsx (Screen D: Shared Work Library)
 │   ├── projects/[id]/team/page.tsx (Screen E: Team Roster & Invitations)
@@ -66,14 +82,14 @@ HackMate is a web collaboration platform engineered specifically for hackathon t
 ├── components/
 │   ├── AuthProvider.tsx (Session state & hooks)
 │   ├── Navbar.tsx (Global top header)
-│   └── ProjectNav.tsx (Project navigation tabs)
+│   └── ProjectNav.tsx (Project navigation tabs with Workspace)
 ├── lib/
 │   ├── types.ts (Domain TypeScript interfaces)
-│   ├── auth/session.ts (HMAC-signed session token manager)
+│   ├── auth/session.ts (Hardened session token manager)
 │   ├── db/
 │   │   ├── types.ts (IDatabaseAdapter interface)
-│   │   ├── localDb.ts (Persistent JSON adapter with atomic locks)
-│   │   ├── supabaseDb.ts (Supabase PostgreSQL adapter)
+│   │   ├── localDb.ts (Persistent JSON adapter with atomic locks & workspace)
+│   │   ├── supabaseDb.ts (Supabase PostgreSQL adapter with workspace)
 │   │   └── index.ts (Database adapter factory)
 │   └── storage/
 │       ├── types.ts (IStorageAdapter interface)
@@ -81,10 +97,13 @@ HackMate is a web collaboration platform engineered specifically for hackathon t
 │       ├── supabaseStorage.ts (Supabase private bucket adapter)
 │       └── index.ts (Storage adapter factory)
 ├── supabase/
-│   └── migrations/20241010_init_hackmate.sql (PostgreSQL schema, triggers, RLS)
+│   └── migrations/
+│       ├── 20241010_init_hackmate.sql (PostgreSQL schema, triggers, RLS)
+│       └── 20241011_add_workspace.sql (Workspace nodes & revisions schema)
 ├── tests/
 │   ├── hackmate.test.ts (Core specification tests: Tests 1–11)
-│   └── api.test.ts (HTTP route handler end-to-end test suite)
+│   ├── api.test.ts (HTTP route handler end-to-end test suite)
+│   └── workspace.test.ts (Common Development Workspace acceptance tests: W1–W9)
 ├── .env.example (Environment template)
 └── _satellite_embedding_archive/ (Preserved historical workspace files)
 ```

@@ -94,3 +94,47 @@ export interface ProjectWithDetails extends Project {
   tasksCount?: number;
   contributionsCount?: number;
 }
+
+// ==============================================================================
+// COMMON DEVELOPMENT WORKSPACE DOMAIN TYPES
+// ==============================================================================
+
+export type WorkspaceNodeType = 'file' | 'folder';
+
+export interface WorkspaceNode {
+  id: string;
+  project_id: string;
+  parent_id: string | null;
+  name: string;
+  path: string; // e.g. "/src/main.py"
+  type: WorkspaceNodeType;
+  current_revision: number;
+  last_modified_by: string;
+  last_modified_name: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at?: string | null;
+  size?: number;
+}
+
+export interface WorkspaceRevision {
+  id: string;
+  node_id: string;
+  project_id: string;
+  revision_number: number;
+  content: string;
+  author_id: string;
+  author_name: string;
+  checksum: string;
+  created_at: string;
+}
+
+export interface WorkspaceFileDetail extends WorkspaceNode {
+  content: string;
+  revisions?: WorkspaceRevision[];
+}
+
+export interface WorkspaceTreeItem extends WorkspaceNode {
+  children?: WorkspaceTreeItem[];
+}
+

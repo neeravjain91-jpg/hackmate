@@ -13,6 +13,11 @@ import {
   Contribution,
   ContributionFile,
   ProjectWithDetails,
+  WorkspaceNode,
+  WorkspaceNodeType,
+  WorkspaceRevision,
+  WorkspaceFileDetail,
+  WorkspaceTreeItem,
 } from '../types';
 import { IDatabaseAdapter } from './types';
 
@@ -23,17 +28,24 @@ interface Schema {
   tasks: Task[];
   contributions: Contribution[];
   contribution_files: ContributionFile[];
+  workspace_nodes: WorkspaceNode[];
+  workspace_revisions: WorkspaceRevision[];
 }
 
 export class LocalDatabaseAdapter implements IDatabaseAdapter {
   private filePath: string;
+  private workspacesBaseDir: string;
   private memoryLock: Promise<void> = Promise.resolve();
 
   constructor(filePath?: string) {
     this.filePath = filePath || process.env.LOCAL_DB_PATH || path.join(process.cwd(), 'data', 'hackmate.json');
+    this.workspacesBaseDir = path.join(path.dirname(this.filePath), 'workspaces');
     const dir = path.dirname(this.filePath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
+    }
+    if (!fs.existsSync(this.workspacesBaseDir)) {
+      fs.mkdirSync(this.workspacesBaseDir, { recursive: true });
     }
     if (!fs.existsSync(this.filePath)) {
       const initial: Schema = {
@@ -43,6 +55,8 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         tasks: [],
         contributions: [],
         contribution_files: [],
+        workspace_nodes: [],
+        workspace_revisions: [],
       };
       fs.writeFileSync(this.filePath, JSON.stringify(initial, null, 2), 'utf-8');
     }
@@ -64,7 +78,17 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
       if (fs.existsSync(this.filePath)) {
         content = await fs.promises.readFile(this.filePath, 'utf-8');
       }
-      const data: Schema = JSON.parse(content || '{"users":[],"projects":[],"project_members":[],"tasks":[],"contributions":[],"contribution_files":[]}');
+      const parsed: any = JSON.parse(content || '{}');
+      const data: Schema = {
+        users: parsed.users || [],
+        projects: parsed.projects || [],
+        project_members: parsed.project_members || [],
+        tasks: parsed.tasks || [],
+        contributions: parsed.contributions || [],
+        contribution_files: parsed.contribution_files || [],
+        workspace_nodes: parsed.workspace_nodes || [],
+        workspace_revisions: parsed.workspace_revisions || [],
+      };
       
       const { result, dataToSave } = await fn(data);
       if (dataToSave) {
@@ -637,4 +661,446 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
       return { result: file ? { ...file } : null };
     });
   }
+
+  // --- Common Development Workspace Operations ---
+  async getWorkspaceTree(projectId: string): Promise<WorkspaceTreeItem[]> {
+    return this.withLock(async (data) => {
+      const nodes = (data.workspace_nodes || []).filter((n) => n.project_id === projectId && !n.deleted_at);
+
+      // Build hierarchical tree
+      const nodeMap = new Map<string, WorkspaceTreeItem>();
+      nodes.forEach((n) => {
+        nodeMap.set(n.id, { ...n, children: n.type === 'folder' ? [] : undefined });
+      });
+
+      const roots: WorkspaceTreeItem[] = [];
+
+      nodes.forEach((n) => {
+        const item = nodeMap.get(n.id)!;
+        if (!n.parent_id || !nodeMap.has(n.parent_id)) {
+          roots.push(item);
+        } else {
+          const parent = nodeMap.get(n.parent_id);
+          if (parent && parent.children) {
+            parent.children.push(item);
+          } else {
+            roots.push(item);
+          }
+        }
+      });
+
+      // Sort: folders first, then alphabetical
+      const sortItems = (items: WorkspaceTreeItem[]) => {
+        items.sort((a, b) => {
+          if (a.type !== b.type) {
+            return a.type === 'folder' ? -1 : 1;
+          }
+          return a.name.localeCompare(b.name);
+        });
+        items.forEach((item) => {
+          if (item.children) sortItems(item.children);
+        });
+      };
+
+      sortItems(roots);
+      return { result: roots };
+    });
+  }
+
+  async getWorkspaceNode(nodeId: string): Promise<WorkspaceNode | null> {
+    return this.withLock(async (data) => {
+      const node = (data.workspace_nodes || []).find((n) => n.id === nodeId && !n.deleted_at);
+      return { result: node ? { ...node } : null };
+    });
+  }
+
+  async createWorkspaceNode(input: {
+    project_id: string;
+    parent_id?: string | null;
+    name: string;
+    type: WorkspaceNodeType;
+    initialContent?: string;
+    author_id: string;
+    author_name: string;
+  }): Promise<WorkspaceNode> {
+    return this.withLock(async (data) => {
+      const isMember = (data.project_members || []).some(
+        (pm) => pm.project_id === input.project_id && pm.user_id === input.author_id
+      );
+      if (!isMember) {
+        throw new Error('Forbidden. Only project members can create workspace files or folders.');
+      }
+
+      const cleanName = input.name.trim();
+      if (!cleanName || cleanName === '.' || cleanName === '..' || cleanName.includes('/') || cleanName.includes('\\') || cleanName.includes('\0')) {
+        throw new Error('Invalid file or folder name. Name cannot be empty or contain path separators.');
+      }
+
+      if (input.initialContent && Buffer.byteLength(input.initialContent, 'utf-8') > 10 * 1024 * 1024) {
+        throw new Error('File content exceeds the maximum size limit of 10MB.');
+      }
+
+      let parentPath = '';
+      if (input.parent_id) {
+        const parent = (data.workspace_nodes || []).find(
+          (n) => n.id === input.parent_id && n.project_id === input.project_id && !n.deleted_at
+        );
+        if (!parent || parent.type !== 'folder') {
+          throw new Error('Parent folder not found or target is not a folder.');
+        }
+        parentPath = parent.path;
+      }
+
+      const nodePath = `${parentPath}/${cleanName}`;
+      const duplicate = (data.workspace_nodes || []).some(
+        (n) => n.project_id === input.project_id && n.path === nodePath && !n.deleted_at
+      );
+      if (duplicate) {
+        throw new Error(`An item with path "${nodePath}" already exists in this project.`);
+      }
+
+      const now = new Date().toISOString();
+      const nodeId = uuidv4();
+      const initialContent = input.initialContent ?? '';
+      const size = input.type === 'file' ? Buffer.byteLength(initialContent, 'utf-8') : undefined;
+
+      const newNode: WorkspaceNode = {
+        id: nodeId,
+        project_id: input.project_id,
+        parent_id: input.parent_id || null,
+        name: cleanName,
+        path: nodePath,
+        type: input.type,
+        current_revision: 1,
+        last_modified_by: input.author_id,
+        last_modified_name: input.author_name,
+        created_at: now,
+        updated_at: now,
+        size,
+      };
+
+      data.workspace_nodes.push(newNode);
+
+      if (input.type === 'file') {
+        const checksum = crypto.createHash('sha256').update(initialContent).digest('hex');
+        const initialRevision: WorkspaceRevision = {
+          id: uuidv4(),
+          node_id: nodeId,
+          project_id: input.project_id,
+          revision_number: 1,
+          content: initialContent,
+          author_id: input.author_id,
+          author_name: input.author_name,
+          checksum,
+          created_at: now,
+        };
+        data.workspace_revisions.push(initialRevision);
+
+        // Persist file snapshot on disk
+        const projectDir = path.join(this.workspacesBaseDir, input.project_id);
+        const diskPath = path.join(projectDir, nodePath.replace(/^\//, ''));
+        fs.mkdirSync(path.dirname(diskPath), { recursive: true });
+        fs.writeFileSync(diskPath, initialContent, 'utf-8');
+      }
+
+      return { result: { ...newNode }, dataToSave: data };
+    });
+  }
+
+  async updateWorkspaceNode(
+    nodeId: string,
+    updates: { name?: string; parent_id?: string | null },
+    author_id: string,
+    author_name: string
+  ): Promise<WorkspaceNode> {
+    return this.withLock(async (data) => {
+      const node = (data.workspace_nodes || []).find((n) => n.id === nodeId && !n.deleted_at);
+      if (!node) throw new Error('Workspace item not found.');
+
+      const isMember = (data.project_members || []).some(
+        (pm) => pm.project_id === node.project_id && pm.user_id === author_id
+      );
+      if (!isMember) {
+        throw new Error('Forbidden. Only project members can rename or move workspace items.');
+      }
+
+      const oldPath = node.path;
+      let newName = node.name;
+      let newParentId = node.parent_id;
+
+      if (updates.name !== undefined) {
+        newName = updates.name.trim();
+        if (!newName || newName.includes('/') || newName.includes('\\')) {
+          throw new Error('Invalid name. Cannot be empty or contain path separators.');
+        }
+      }
+
+      if (updates.parent_id !== undefined) {
+        newParentId = updates.parent_id;
+      }
+
+      let parentPath = '';
+      if (newParentId) {
+        const parent = (data.workspace_nodes || []).find(
+          (n) => n.id === newParentId && n.project_id === node.project_id && !n.deleted_at
+        );
+        if (!parent || parent.type !== 'folder') {
+          throw new Error('Target parent folder not found.');
+        }
+        parentPath = parent.path;
+      }
+
+      const newPath = `${parentPath}/${newName}`;
+
+      // Update current node
+      node.name = newName;
+      node.parent_id = newParentId || null;
+      node.path = newPath;
+      node.last_modified_by = author_id;
+      node.last_modified_name = author_name;
+      node.updated_at = new Date().toISOString();
+
+      // If folder, cascade prefix update to all descendants
+      if (node.type === 'folder') {
+        const descendants = (data.workspace_nodes || []).filter(
+          (n) => n.project_id === node.project_id && n.id !== node.id && !n.deleted_at && n.path.startsWith(`${oldPath}/`)
+        );
+        descendants.forEach((d) => {
+          d.path = `${newPath}${d.path.slice(oldPath.length)}`;
+        });
+      }
+
+      return { result: { ...node }, dataToSave: data };
+    });
+  }
+
+  async deleteWorkspaceNode(nodeId: string): Promise<boolean> {
+    return this.withLock(async (data) => {
+      const target = (data.workspace_nodes || []).find((n) => n.id === nodeId && !n.deleted_at);
+      if (!target) return { result: false };
+
+      const targetPath = target.path;
+      const projectId = target.project_id;
+      const now = new Date().toISOString();
+
+      // Identify target and all descendants if folder
+      const nodeIdsToSoftDelete = new Set<string>();
+      nodeIdsToSoftDelete.add(target.id);
+
+      if (target.type === 'folder') {
+        (data.workspace_nodes || []).forEach((n) => {
+          if (n.project_id === projectId && !n.deleted_at && (n.path === targetPath || n.path.startsWith(`${targetPath}/`))) {
+            nodeIdsToSoftDelete.add(n.id);
+          }
+        });
+      }
+
+      // Mark deleted_at on nodes without destroying recoverable revision history
+      (data.workspace_nodes || []).forEach((n) => {
+        if (nodeIdsToSoftDelete.has(n.id)) {
+          n.deleted_at = now;
+        }
+      });
+
+      // DO NOT delete workspace_revisions - history is preserved!
+
+      // Clean disk representation if exists
+      try {
+        const diskPath = path.join(this.workspacesBaseDir, projectId, targetPath.replace(/^\//, ''));
+        if (fs.existsSync(diskPath)) {
+          fs.rmSync(diskPath, { recursive: true, force: true });
+        }
+      } catch {
+        // Disk cleanup is best-effort
+      }
+
+      return { result: true, dataToSave: data };
+    });
+  }
+
+  async getWorkspaceFile(fileId: string): Promise<WorkspaceFileDetail | null> {
+    return this.withLock(async (data) => {
+      const node = (data.workspace_nodes || []).find((n) => n.id === fileId && n.type === 'file' && !n.deleted_at);
+      if (!node) return { result: null };
+
+      // Find latest revision
+      const revisions = (data.workspace_revisions || [])
+        .filter((r) => r.node_id === fileId)
+        .sort((a, b) => b.revision_number - a.revision_number);
+
+      const latestRev = revisions[0];
+      const content = latestRev ? latestRev.content : '';
+
+      return {
+        result: {
+          ...node,
+          content,
+          revisions,
+        },
+      };
+    });
+  }
+
+  async saveWorkspaceFile(
+    fileId: string,
+    content: string,
+    baseRevision: number | undefined,
+    author_id: string,
+    author_name: string
+  ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
+    return this.withLock<{ file: WorkspaceFileDetail; conflict: boolean; currentRevision?: number }>(async (data) => {
+      const node = (data.workspace_nodes || []).find((n) => n.id === fileId && n.type === 'file' && !n.deleted_at);
+      if (!node) throw new Error('Workspace file not found.');
+
+      if (Buffer.byteLength(content, 'utf-8') > 10 * 1024 * 1024) {
+        throw new Error('File content exceeds the maximum size limit of 10MB.');
+      }
+
+      const isMember = (data.project_members || []).some(
+        (pm) => pm.project_id === node.project_id && pm.user_id === author_id
+      );
+      if (!isMember) {
+        throw new Error('Forbidden. Only project members can edit workspace files.');
+      }
+
+      // CONFLICT DETECTION: Optimistic concurrency control
+      if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+        const latestRev = (data.workspace_revisions || [])
+          .filter((r) => r.node_id === fileId)
+          .sort((a, b) => b.revision_number - a.revision_number)[0];
+
+        return {
+          result: {
+            file: {
+              ...node,
+              content: latestRev ? latestRev.content : '',
+            },
+            conflict: true,
+            currentRevision: node.current_revision,
+          },
+        };
+      }
+
+      const nextRevNum = node.current_revision + 1;
+      const now = new Date().toISOString();
+      const checksum = crypto.createHash('sha256').update(content).digest('hex');
+
+      node.current_revision = nextRevNum;
+      node.last_modified_by = author_id;
+      node.last_modified_name = author_name;
+      node.updated_at = now;
+      node.size = Buffer.byteLength(content, 'utf-8');
+
+      const newRevision: WorkspaceRevision = {
+        id: uuidv4(),
+        node_id: fileId,
+        project_id: node.project_id,
+        revision_number: nextRevNum,
+        content,
+        author_id,
+        author_name,
+        checksum,
+        created_at: now,
+      };
+
+      data.workspace_revisions.push(newRevision);
+
+      // Persist to disk
+      const projectDir = path.join(this.workspacesBaseDir, node.project_id);
+      const diskPath = path.join(projectDir, node.path.replace(/^\//, ''));
+      fs.mkdirSync(path.dirname(diskPath), { recursive: true });
+      fs.writeFileSync(diskPath, content, 'utf-8');
+
+      const revisions = (data.workspace_revisions || [])
+        .filter((r) => r.node_id === fileId)
+        .sort((a, b) => b.revision_number - a.revision_number);
+
+      return {
+        result: {
+          file: {
+            ...node,
+            content,
+            revisions,
+          },
+          conflict: false,
+        },
+        dataToSave: data,
+      };
+    });
+  }
+
+  async getWorkspaceFileRevisions(fileId: string): Promise<WorkspaceRevision[]> {
+    return this.withLock(async (data) => {
+      const revisions = (data.workspace_revisions || [])
+        .filter((r) => r.node_id === fileId)
+        .sort((a, b) => b.revision_number - a.revision_number);
+
+      return { result: revisions };
+    });
+  }
+
+  async restoreWorkspaceRevision(
+    fileId: string,
+    targetRevisionNumber: number,
+    author_id: string,
+    author_name: string
+  ): Promise<WorkspaceFileDetail> {
+    return this.withLock(async (data) => {
+      const node = (data.workspace_nodes || []).find((n) => n.id === fileId && n.type === 'file' && !n.deleted_at);
+      if (!node) throw new Error('Workspace file not found.');
+
+      const targetRev = (data.workspace_revisions || []).find(
+        (r) => r.node_id === fileId && r.revision_number === targetRevisionNumber
+      );
+      if (!targetRev) {
+        throw new Error(`Revision ${targetRevisionNumber} not found for this file.`);
+      }
+
+      // Restore as a brand new revision with target content
+      const nextRevNum = node.current_revision + 1;
+      const now = new Date().toISOString();
+      const content = targetRev.content;
+      const checksum = crypto.createHash('sha256').update(content).digest('hex');
+
+      node.current_revision = nextRevNum;
+      node.last_modified_by = author_id;
+      node.last_modified_name = `${author_name} (Restored Rev #${targetRevisionNumber})`;
+      node.updated_at = now;
+      node.size = Buffer.byteLength(content, 'utf-8');
+
+      const newRevision: WorkspaceRevision = {
+        id: uuidv4(),
+        node_id: fileId,
+        project_id: node.project_id,
+        revision_number: nextRevNum,
+        content,
+        author_id,
+        author_name: `${author_name} (Restored Rev #${targetRevisionNumber})`,
+        checksum,
+        created_at: now,
+      };
+
+      data.workspace_revisions.push(newRevision);
+
+      // Persist to disk
+      const projectDir = path.join(this.workspacesBaseDir, node.project_id);
+      const diskPath = path.join(projectDir, node.path.replace(/^\//, ''));
+      fs.mkdirSync(path.dirname(diskPath), { recursive: true });
+      fs.writeFileSync(diskPath, content, 'utf-8');
+
+      const revisions = (data.workspace_revisions || [])
+        .filter((r) => r.node_id === fileId)
+        .sort((a, b) => b.revision_number - a.revision_number);
+
+      return {
+        result: {
+          ...node,
+          content,
+          revisions,
+        },
+        dataToSave: data,
+      };
+    });
+  }
 }
+

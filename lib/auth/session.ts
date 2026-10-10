@@ -7,7 +7,15 @@ export const SESSION_COOKIE_NAME = 'hackmate_session';
 const SESSION_EXPIRY_DAYS = 7;
 
 function getAuthSecret(): string {
-  return process.env.AUTH_SECRET || 'hackmate-default-dev-secret-change-in-production-1234567890';
+  const secret = process.env.AUTH_SECRET;
+  const isProduction = process.env.NODE_ENV === 'production';
+  const isDefaultOrWeak = !secret || secret === 'hackmate-default-dev-secret-change-in-production-1234567890' || secret.includes('change-in-production');
+
+  if (isProduction && isDefaultOrWeak) {
+    throw new Error('SECURITY VIOLATION: A robust AUTH_SECRET environment variable must be explicitly configured in production.');
+  }
+
+  return secret || 'hackmate-default-dev-secret-change-in-production-1234567890';
 }
 
 export function createSessionToken(userId: string): string {

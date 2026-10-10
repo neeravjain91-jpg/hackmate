@@ -3,7 +3,7 @@
 import React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, CheckSquare, FolderArchive, Users, ShieldAlert, Award } from 'lucide-react';
+import { LayoutDashboard, CheckSquare, FolderArchive, Users, ShieldAlert, Award, Code } from 'lucide-react';
 import { ProjectWithDetails } from '@/lib/types';
 
 interface ProjectNavProps {
@@ -20,6 +20,11 @@ export function ProjectNav({ project }: ProjectNavProps) {
       href: basePath,
       exact: true,
       icon: LayoutDashboard,
+    },
+    {
+      name: 'Workspace',
+      href: `${basePath}/workspace`,
+      icon: Code,
     },
     {
       name: 'Tasks',
