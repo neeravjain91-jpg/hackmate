@@ -830,7 +830,7 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
 
       if (updates.name !== undefined) {
         newName = updates.name.trim();
-        if (!newName || newName.includes('/') || newName.includes('\\')) {
+        if (!newName || newName === '.' || newName === '..' || newName.includes('/') || newName.includes('\\') || newName.includes('\0')) {
           throw new Error('Invalid name. Cannot be empty or contain path separators.');
         }
       }
@@ -841,16 +841,48 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
 
       let parentPath = '';
       if (newParentId) {
-        const parent = (data.workspace_nodes || []).find(
-          (n) => n.id === newParentId && n.project_id === node.project_id && !n.deleted_at
-        );
-        if (!parent || parent.type !== 'folder') {
-          throw new Error('Target parent folder not found.');
+        // Prevent directory cycle: cannot move into self
+        if (newParentId === nodeId) {
+          throw new Error('Cannot move a folder into itself.');
         }
+
+        const parent = (data.workspace_nodes || []).find(
+          (n) => n.id === newParentId && !n.deleted_at
+        );
+        if (!parent || parent.project_id !== node.project_id || parent.type !== 'folder') {
+          throw new Error('Target parent folder not found, belongs to another project, or is not a folder.');
+        }
+
+        // Prevent directory cycle: cannot move into one of its descendants
+        if (node.type === 'folder') {
+          if (parent.path === oldPath || parent.path.startsWith(`${oldPath}/`)) {
+            throw new Error('Cannot move a folder into one of its descendants.');
+          }
+
+          let currParentId: string | null = parent.parent_id;
+          while (currParentId) {
+            if (currParentId === nodeId) {
+              throw new Error('Cannot move a folder into one of its descendants.');
+            }
+            const ancestor = (data.workspace_nodes || []).find((n) => n.id === currParentId && !n.deleted_at);
+            currParentId = ancestor?.parent_id || null;
+          }
+        }
+
         parentPath = parent.path;
       }
 
       const newPath = `${parentPath}/${newName}`;
+
+      // Prevent duplicate paths in the project
+      const duplicate = (data.workspace_nodes || []).some(
+        (n) => n.project_id === node.project_id && n.id !== nodeId && n.path === newPath && !n.deleted_at
+      );
+      if (duplicate) {
+        throw new Error(`An item with path "${newPath}" already exists in this project.`);
+      }
+
+      const now = new Date().toISOString();
 
       // Update current node
       node.name = newName;
@@ -858,16 +890,29 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
       node.path = newPath;
       node.last_modified_by = author_id;
       node.last_modified_name = author_name;
-      node.updated_at = new Date().toISOString();
+      node.updated_at = now;
 
       // If folder, cascade prefix update to all descendants
-      if (node.type === 'folder') {
+      if (node.type === 'folder' && oldPath !== newPath) {
         const descendants = (data.workspace_nodes || []).filter(
           (n) => n.project_id === node.project_id && n.id !== node.id && !n.deleted_at && n.path.startsWith(`${oldPath}/`)
         );
         descendants.forEach((d) => {
           d.path = `${newPath}${d.path.slice(oldPath.length)}`;
+          d.updated_at = now;
         });
+      }
+
+      // Persist disk rename if applicable
+      try {
+        const oldDiskPath = path.join(this.workspacesBaseDir, node.project_id, oldPath.replace(/^\//, ''));
+        const newDiskPath = path.join(this.workspacesBaseDir, node.project_id, newPath.replace(/^\//, ''));
+        if (fs.existsSync(oldDiskPath)) {
+          fs.mkdirSync(path.dirname(newDiskPath), { recursive: true });
+          fs.renameSync(oldDiskPath, newDiskPath);
+        }
+      } catch {
+        // Disk move is best-effort
       }
 
       return { result: { ...node }, dataToSave: data };
@@ -949,6 +994,13 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     author_name: string
   ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
     return this.withLock<{ file: WorkspaceFileDetail; conflict: boolean; currentRevision?: number }>(async (data) => {
+      if (
+        baseRevision !== undefined &&
+        (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
+      ) {
+        throw new Error('Invalid base revision number. Must be a positive integer.');
+      }
+
       const node = (data.workspace_nodes || []).find((n) => n.id === fileId && n.type === 'file' && !n.deleted_at);
       if (!node) throw new Error('Workspace file not found.');
 
@@ -1043,11 +1095,41 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     fileId: string,
     targetRevisionNumber: number,
     author_id: string,
-    author_name: string
+    author_name: string,
+    baseRevision?: number
   ): Promise<WorkspaceFileDetail> {
     return this.withLock(async (data) => {
+      if (
+        typeof targetRevisionNumber !== 'number' ||
+        !Number.isInteger(targetRevisionNumber) ||
+        targetRevisionNumber < 1
+      ) {
+        throw new Error('Invalid target revision number. Must be a positive integer.');
+      }
+
+      if (
+        baseRevision !== undefined &&
+        (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
+      ) {
+        throw new Error('Invalid base revision number. Must be a positive integer.');
+      }
+
       const node = (data.workspace_nodes || []).find((n) => n.id === fileId && n.type === 'file' && !n.deleted_at);
       if (!node) throw new Error('Workspace file not found.');
+
+      const isMember = (data.project_members || []).some(
+        (pm) => pm.project_id === node.project_id && pm.user_id === author_id
+      );
+      if (!isMember) {
+        throw new Error('Forbidden. Only project members can restore workspace files.');
+      }
+
+      // Concurrency check: Ensure no newer revision was saved if baseRevision is specified
+      if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+        throw new Error(
+          `Conflict: File has been updated to revision ${node.current_revision} by another teammate.`
+        );
+      }
 
       const targetRev = (data.workspace_revisions || []).find(
         (r) => r.node_id === fileId && r.revision_number === targetRevisionNumber

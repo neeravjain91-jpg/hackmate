@@ -25,22 +25,52 @@ export async function POST(
       return NextResponse.json({ error: 'File not found in this project.' }, { status: 404 });
     }
 
-    const body = await request.json();
-    const { revisionNumber } = body;
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: 'Malformed JSON payload.' }, { status: 400 });
+    }
 
-    if (!revisionNumber || typeof revisionNumber !== 'number') {
-      return NextResponse.json({ error: 'Valid revisionNumber is required.' }, { status: 400 });
+    const { revisionNumber, baseRevision } = body || {};
+
+    if (
+      revisionNumber === undefined ||
+      typeof revisionNumber !== 'number' ||
+      !Number.isInteger(revisionNumber) ||
+      revisionNumber < 1
+    ) {
+      return NextResponse.json(
+        { error: 'Valid positive integer revisionNumber is required.' },
+        { status: 400 }
+      );
+    }
+
+    if (
+      baseRevision !== undefined &&
+      (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
+    ) {
+      return NextResponse.json(
+        { error: 'Valid positive integer baseRevision is required.' },
+        { status: 400 }
+      );
     }
 
     const restoredFile = await db.restoreWorkspaceRevision(
       fileId,
       revisionNumber,
       user.id,
-      user.name
+      user.name,
+      baseRevision
     );
 
     return NextResponse.json({ file: restoredFile });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message || 'Failed to restore revision.' }, { status: 400 });
+    const isConflict = err.message?.includes('Conflict');
+    const status = isConflict ? 409 : 400;
+    return NextResponse.json(
+      { error: err.message || 'Failed to restore revision.', conflict: isConflict },
+      { status }
+    );
   }
 }

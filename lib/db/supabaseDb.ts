@@ -582,13 +582,27 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
     if (input.parent_id) {
       const parent = await this.getWorkspaceNode(input.parent_id);
-      if (!parent || parent.type !== 'folder') {
-        throw new Error('Parent folder not found.');
+      if (!parent || parent.project_id !== input.project_id || parent.type !== 'folder') {
+        throw new Error('Parent folder not found, belongs to another project, or is not a folder.');
       }
       parentPath = parent.path;
     }
 
     const nodePath = `${parentPath}/${cleanName}`;
+
+    // Prevent duplicate paths in the project
+    const { data: existing } = await this.client
+      .from('workspace_nodes')
+      .select('id')
+      .eq('project_id', input.project_id)
+      .eq('path', nodePath)
+      .is('deleted_at', null)
+      .maybeSingle();
+
+    if (existing) {
+      throw new Error(`An item with path "${nodePath}" already exists in this project.`);
+    }
+
     const initialContent = input.initialContent ?? '';
     const size = input.type === 'file' ? Buffer.byteLength(initialContent, 'utf-8') : undefined;
 
@@ -638,17 +652,65 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     if (!node) throw new Error('Workspace item not found.');
 
     const oldPath = node.path;
-    const newName = updates.name !== undefined ? updates.name.trim() : node.name;
-    const newParentId = updates.parent_id !== undefined ? updates.parent_id : node.parent_id;
+    let newName = node.name;
+    let newParentId = node.parent_id;
+
+    if (updates.name !== undefined) {
+      newName = updates.name.trim();
+      if (!newName || newName === '.' || newName === '..' || newName.includes('/') || newName.includes('\\') || newName.includes('\0')) {
+        throw new Error('Invalid name. Cannot be empty or contain path separators.');
+      }
+    }
+
+    if (updates.parent_id !== undefined) {
+      newParentId = updates.parent_id;
+    }
 
     let parentPath = '';
     if (newParentId) {
+      if (newParentId === nodeId) {
+        throw new Error('Cannot move a folder into itself.');
+      }
+
       const parent = await this.getWorkspaceNode(newParentId);
-      if (!parent) throw new Error('Parent folder not found.');
+      if (!parent || parent.project_id !== node.project_id || parent.type !== 'folder') {
+        throw new Error('Target parent folder not found, belongs to another project, or is not a folder.');
+      }
+
+      // Prevent directory cycles
+      if (node.type === 'folder') {
+        if (parent.path === oldPath || parent.path.startsWith(`${oldPath}/`)) {
+          throw new Error('Cannot move a folder into one of its descendants.');
+        }
+
+        let currParentId: string | null = parent.parent_id;
+        while (currParentId) {
+          if (currParentId === nodeId) {
+            throw new Error('Cannot move a folder into one of its descendants.');
+          }
+          const ancestor = await this.getWorkspaceNode(currParentId);
+          currParentId = ancestor?.parent_id || null;
+        }
+      }
+
       parentPath = parent.path;
     }
 
     const newPath = `${parentPath}/${newName}`;
+
+    // Prevent duplicate paths
+    const { data: duplicate } = await this.client
+      .from('workspace_nodes')
+      .select('id')
+      .eq('project_id', node.project_id)
+      .eq('path', newPath)
+      .neq('id', nodeId)
+      .is('deleted_at', null)
+      .maybeSingle();
+
+    if (duplicate) {
+      throw new Error(`An item with path "${newPath}" already exists in this project.`);
+    }
 
     const { data, error } = await this.client
       .from('workspace_nodes')
@@ -666,6 +728,26 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
     if (error || !data) {
       throw new Error(`Failed to update workspace item: ${error?.message}`);
+    }
+
+    // Consistently update descendant paths if folder
+    if (node.type === 'folder' && oldPath !== newPath) {
+      const { data: descendants } = await this.client
+        .from('workspace_nodes')
+        .select('id, path')
+        .eq('project_id', node.project_id)
+        .is('deleted_at', null)
+        .like('path', `${oldPath}/%`);
+
+      if (descendants && descendants.length > 0) {
+        for (const desc of descendants) {
+          const updatedDescPath = `${newPath}${desc.path.slice(oldPath.length)}`;
+          await this.client
+            .from('workspace_nodes')
+            .update({ path: updatedDescPath, updated_at: new Date().toISOString() })
+            .eq('id', desc.id);
+        }
+      }
     }
 
     return data as WorkspaceNode;
@@ -723,12 +805,51 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     author_id: string,
     author_name: string
   ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
-    const node = await this.getWorkspaceNode(fileId);
-    if (!node || node.type !== 'file') throw new Error('File not found.');
+    if (
+      baseRevision !== undefined &&
+      (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
+    ) {
+      throw new Error('Invalid base revision number. Must be a positive integer.');
+    }
 
     if (Buffer.byteLength(content, 'utf-8') > 10 * 1024 * 1024) {
       throw new Error('File content exceeds the maximum size limit of 10MB.');
     }
+
+    const checksum = crypto.createHash('sha256').update(content).digest('hex');
+
+    // 1. Attempt atomic save via PostgreSQL RPC function
+    try {
+      const { data: rpcRes, error: rpcErr } = await this.client.rpc('save_workspace_file_atomic', {
+        p_file_id: fileId,
+        p_content: content,
+        p_base_revision: baseRevision !== undefined ? baseRevision : null,
+        p_author_id: author_id,
+        p_author_name: author_name,
+        p_checksum: checksum,
+      });
+
+      if (!rpcErr && rpcRes) {
+        const fileRes = await this.getWorkspaceFile(fileId);
+        if (rpcRes.conflict) {
+          return {
+            file: fileRes!,
+            conflict: true,
+            currentRevision: rpcRes.currentRevision,
+          };
+        }
+        return {
+          file: fileRes!,
+          conflict: false,
+        };
+      }
+    } catch {
+      // RPC fallback to direct guarded query
+    }
+
+    // 2. Fallback guarded client update
+    const node = await this.getWorkspaceNode(fileId);
+    if (!node || node.type !== 'file') throw new Error('File not found.');
 
     if (baseRevision !== undefined && node.current_revision !== baseRevision) {
       const current = await this.getWorkspaceFile(fileId);
@@ -741,7 +862,6 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
     const nextRevNum = node.current_revision + 1;
     const now = new Date().toISOString();
-    const checksum = crypto.createHash('sha256').update(content).digest('hex');
 
     const { error: revErr } = await this.client.from('workspace_revisions').insert({
       node_id: fileId,
@@ -791,8 +911,31 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     fileId: string,
     targetRevisionNumber: number,
     author_id: string,
-    author_name: string
+    author_name: string,
+    baseRevision?: number
   ): Promise<WorkspaceFileDetail> {
+    if (
+      typeof targetRevisionNumber !== 'number' ||
+      !Number.isInteger(targetRevisionNumber) ||
+      targetRevisionNumber < 1
+    ) {
+      throw new Error('Invalid target revision number. Must be a positive integer.');
+    }
+
+    if (
+      baseRevision !== undefined &&
+      (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
+    ) {
+      throw new Error('Invalid base revision number. Must be a positive integer.');
+    }
+
+    const node = await this.getWorkspaceNode(fileId);
+    if (!node || node.type !== 'file') throw new Error('File not found.');
+
+    if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+      throw new Error(`Conflict: File has been updated to revision ${node.current_revision} by another teammate.`);
+    }
+
     const { data: targetRev, error } = await this.client
       .from('workspace_revisions')
       .select('*')
@@ -807,10 +950,14 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     const saved = await this.saveWorkspaceFile(
       fileId,
       targetRev.content,
-      undefined,
+      baseRevision,
       author_id,
       `${author_name} (Restored Rev #${targetRevisionNumber})`
     );
+
+    if (saved.conflict) {
+      throw new Error(`Conflict: File has been updated to revision ${saved.currentRevision} by another teammate.`);
+    }
 
     return saved.file;
   }

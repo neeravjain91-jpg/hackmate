@@ -54,8 +54,14 @@ export async function PUT(
       return NextResponse.json({ error: 'File not found in this project.' }, { status: 404 });
     }
 
-    const body = await request.json();
-    const { content, baseRevision } = body;
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: 'Malformed JSON payload.' }, { status: 400 });
+    }
+
+    const { content, baseRevision } = body || {};
 
     if (content === undefined || typeof content !== 'string') {
       return NextResponse.json({ error: 'File content must be a string.' }, { status: 400 });
@@ -65,10 +71,17 @@ export async function PUT(
       return NextResponse.json({ error: 'File content exceeds the maximum size limit of 10MB.' }, { status: 400 });
     }
 
+    if (
+      baseRevision !== undefined &&
+      (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
+    ) {
+      return NextResponse.json({ error: 'Valid positive integer baseRevision is required.' }, { status: 400 });
+    }
+
     const result = await db.saveWorkspaceFile(
       fileId,
       content,
-      baseRevision !== undefined ? Number(baseRevision) : undefined,
+      baseRevision,
       user.id,
       user.name
     );
@@ -87,6 +100,8 @@ export async function PUT(
 
     return NextResponse.json({ file: result.file, conflict: false });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message || 'Failed to save file.' }, { status: 500 });
+    const isConflict = err.message?.includes('Conflict');
+    const status = isConflict ? 409 : 500;
+    return NextResponse.json({ error: err.message || 'Failed to save file.' }, { status });
   }
 }

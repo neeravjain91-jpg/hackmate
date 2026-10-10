@@ -123,7 +123,8 @@ export interface IDatabaseAdapter {
     fileId: string,
     targetRevisionNumber: number,
     author_id: string,
-    author_name: string
+    author_name: string,
+    baseRevision?: number
   ): Promise<import('../types').WorkspaceFileDetail>;
 }
 

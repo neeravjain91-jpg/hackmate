@@ -23,21 +23,50 @@ export async function POST(
       );
     }
 
-    const body = await request.json();
-    const { name, parent_id, type, initialContent } = body;
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json({ error: 'Malformed JSON payload.' }, { status: 400 });
+    }
 
-    if (!name || typeof name !== 'string' || !name.trim()) {
+    const { name, parent_id, type, initialContent } = body || {};
+
+    if (!name || typeof name !== 'string') {
       return NextResponse.json({ error: 'Name is required.' }, { status: 400 });
+    }
+
+    const cleanName = name.trim();
+    if (!cleanName || cleanName === '.' || cleanName === '..' || cleanName.includes('/') || cleanName.includes('\\') || cleanName.includes('\0')) {
+      return NextResponse.json({ error: 'Invalid file or folder name. Name cannot be empty or contain path separators.' }, { status: 400 });
     }
 
     if (type !== 'file' && type !== 'folder') {
       return NextResponse.json({ error: 'Type must be "file" or "folder".' }, { status: 400 });
     }
 
+    if (initialContent !== undefined && typeof initialContent !== 'string') {
+      return NextResponse.json({ error: 'File content must be a string.' }, { status: 400 });
+    }
+
+    if (initialContent && Buffer.byteLength(initialContent, 'utf-8') > 10 * 1024 * 1024) {
+      return NextResponse.json({ error: 'File content exceeds the maximum size limit of 10MB.' }, { status: 400 });
+    }
+
+    if (parent_id) {
+      if (typeof parent_id !== 'string') {
+        return NextResponse.json({ error: 'parent_id must be a string.' }, { status: 400 });
+      }
+      const parent = await db.getWorkspaceNode(parent_id);
+      if (!parent || parent.project_id !== projectId || parent.type !== 'folder') {
+        return NextResponse.json({ error: 'Parent folder not found in this project.' }, { status: 400 });
+      }
+    }
+
     const node = await db.createWorkspaceNode({
       project_id: projectId,
       parent_id: parent_id || null,
-      name: name.trim(),
+      name: cleanName,
       type,
       initialContent: initialContent || '',
       author_id: user.id,
@@ -46,7 +75,8 @@ export async function POST(
 
     return NextResponse.json({ node }, { status: 201 });
   } catch (err: any) {
-    const status = err.message?.includes('already exists') ? 409 : 400;
+    const isDuplicate = err.message?.includes('already exists');
+    const status = isDuplicate ? 409 : 400;
     return NextResponse.json(
       { error: err.message || 'Failed to create workspace item.' },
       { status }

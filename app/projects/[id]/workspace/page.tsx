@@ -265,10 +265,18 @@ export default function WorkspacePage({ params }: { params: { id: string } }) {
       const res = await fetch(`/api/projects/${params.id}/workspace/files/${activeFile.id}/restore`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ revisionNumber: revNum }),
+        body: JSON.stringify({ revisionNumber: revNum, baseRevision: activeFile.current_revision }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to restore revision');
+      if (!res.ok) {
+        if (res.status === 409) {
+          setSaveStatus('conflict');
+          alert(data.error || 'Conflict detected: The file has been modified by another teammate.');
+          await handleOpenFile(activeFile.id);
+          return;
+        }
+        throw new Error(data.error || 'Failed to restore revision');
+      }
 
       setActiveFile(data.file);
       setFileContent(data.file.content);
