@@ -22,7 +22,7 @@ export async function GET(
 
     const file = await db.getWorkspaceFile(fileId);
     if (!file || file.project_id !== projectId) {
-      return NextResponse.json({ error: 'File not found.' }, { status: 404 });
+      return NextResponse.json({ error: 'File not found in this project.' }, { status: 404 });
     }
 
     return NextResponse.json({ file });
@@ -61,7 +61,7 @@ export async function PUT(
       return NextResponse.json({ error: 'Malformed JSON payload.' }, { status: 400 });
     }
 
-    const { content, baseRevision } = body || {};
+    const { content, baseRevision, forceOverwrite } = body || {};
 
     if (content === undefined || typeof content !== 'string') {
       return NextResponse.json({ error: 'File content must be a string.' }, { status: 400 });
@@ -78,12 +78,20 @@ export async function PUT(
       return NextResponse.json({ error: 'Valid positive integer baseRevision is required.' }, { status: 400 });
     }
 
+    if (baseRevision === undefined && !forceOverwrite) {
+      return NextResponse.json(
+        { error: 'Concurrency check required: baseRevision must be specified for workspace saves.' },
+        { status: 400 }
+      );
+    }
+
     const result = await db.saveWorkspaceFile(
       fileId,
       content,
       baseRevision,
       user.id,
-      user.name
+      user.name,
+      Boolean(forceOverwrite)
     );
 
     if (result.conflict) {
@@ -101,7 +109,8 @@ export async function PUT(
     return NextResponse.json({ file: result.file, conflict: false });
   } catch (err: any) {
     const isConflict = err.message?.includes('Conflict');
-    const status = isConflict ? 409 : 500;
+    const isForbidden = err.message?.includes('Forbidden');
+    const status = isConflict ? 409 : isForbidden ? 403 : 500;
     return NextResponse.json({ error: err.message || 'Failed to save file.' }, { status });
   }
 }

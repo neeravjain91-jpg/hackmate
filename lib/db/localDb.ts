@@ -991,7 +991,8 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     content: string,
     baseRevision: number | undefined,
     author_id: string,
-    author_name: string
+    author_name: string,
+    forceOverwrite?: boolean
   ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
     return this.withLock<{ file: WorkspaceFileDetail; conflict: boolean; currentRevision?: number }>(async (data) => {
       if (
@@ -999,6 +1000,10 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
       ) {
         throw new Error('Invalid base revision number. Must be a positive integer.');
+      }
+
+      if (baseRevision === undefined && !forceOverwrite) {
+        throw new Error('Concurrency check required: baseRevision must be specified for workspace saves.');
       }
 
       const node = (data.workspace_nodes || []).find((n) => n.id === fileId && n.type === 'file' && !n.deleted_at);

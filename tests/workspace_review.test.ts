@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { NextRequest } from 'next/server';
 import { LocalDatabaseAdapter } from '@/lib/db/localDb';
+import { SupabaseDatabaseAdapter } from '@/lib/db/supabaseDb';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
 import { GET as getTreeHandler } from '@/app/api/projects/[id]/workspace/tree/route';
 import { POST as createNodeHandler } from '@/app/api/projects/[id]/workspace/nodes/route';
@@ -78,8 +79,27 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       expect(content).toContain('BEFORE UPDATE OR DELETE ON public.workspace_revisions');
 
       // 7. Atomic functions
+      expect(content).toContain('create_workspace_node_atomic');
       expect(content).toContain('save_workspace_file_atomic');
       expect(content).toContain('update_workspace_node_atomic');
+      expect(content).toContain('delete_workspace_node_atomic');
+
+      // 8. Security Definer and pinned search path
+      expect(content).toContain('SET search_path = public, pg_temp');
+
+      // 9. Restrict execution privileges
+      expect(content).toContain('REVOKE ALL ON FUNCTION public.create_workspace_node_atomic');
+      expect(content).toContain('REVOKE ALL ON FUNCTION public.save_workspace_file_atomic');
+      expect(content).toContain('REVOKE ALL ON FUNCTION public.update_workspace_node_atomic');
+      expect(content).toContain('REVOKE ALL ON FUNCTION public.delete_workspace_node_atomic');
+      expect(content).toContain('GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic');
+      expect(content).toContain('GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic');
+      expect(content).toContain('GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic');
+      expect(content).toContain('GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic');
+
+      // 10. Project immutability trigger
+      expect(content).toContain('prevent_workspace_node_project_transfer');
+      expect(content).toContain('BEFORE UPDATE OF project_id ON public.workspace_nodes');
     });
   });
 
@@ -546,6 +566,313 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       expect(res.status).toBe(400);
       const body = await res.json();
       expect(body.error).toMatch(/Parent folder not found in this project/i);
+    });
+  });
+
+  // =========================================================================
+  // AREA G: Supabase RPC Function and Adapter Transaction Integrity
+  // =========================================================================
+  describe('Area G: Supabase RPC Function and Adapter Transaction Integrity', () => {
+    it('SupabaseDatabaseAdapter.saveWorkspaceFile requires baseRevision unless forceOverwrite is enabled', async () => {
+      const mockClient: any = {
+        rpc: async () => ({ data: null, error: null }),
+      };
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+
+      // Missing baseRevision without forceOverwrite -> throws concurrency check error
+      await expect(
+        supabaseDb.saveWorkspaceFile('file-1', 'content', undefined, 'user-1', 'User 1')
+      ).rejects.toThrow(/baseRevision must be specified/i);
+
+      // Invalid baseRevision numbers -> throws validation error
+      await expect(
+        supabaseDb.saveWorkspaceFile('file-1', 'content', -1, 'user-1', 'User 1')
+      ).rejects.toThrow(/positive integer/i);
+
+      await expect(
+        supabaseDb.saveWorkspaceFile('file-1', 'content', 1.5, 'user-1', 'User 1')
+      ).rejects.toThrow(/positive integer/i);
+    });
+
+    it('SupabaseDatabaseAdapter.saveWorkspaceFile propagates RPC errors without falling back to non-atomic writes', async () => {
+      let fromCallCount = 0;
+      const mockClient: any = {
+        rpc: async (fnName: string, args: any) => {
+          expect(fnName).toBe('save_workspace_file_atomic');
+          return { data: null, error: { message: 'Database transaction aborted' } };
+        },
+        from: () => {
+          fromCallCount++;
+          return {
+            select: () => ({ eq: () => ({ single: async () => ({ data: null }) }) }),
+          };
+        },
+      };
+
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+
+      await expect(
+        supabaseDb.saveWorkspaceFile('file-1', 'new code', 1, 'user-1', 'User 1')
+      ).rejects.toThrow(/Failed to save revision: Database transaction aborted/i);
+
+      // Verify that no fallback multi-query inserts or updates were attempted
+      expect(fromCallCount).toBe(0);
+    });
+
+    it('SupabaseDatabaseAdapter.saveWorkspaceFile handles revision conflicts atomically', async () => {
+      const mockFile = {
+        id: 'file-1',
+        project_id: 'proj-1',
+        name: 'app.ts',
+        type: 'file',
+        current_revision: 5,
+        content: 'latest content',
+      };
+
+      const mockClient: any = {
+        rpc: async (fnName: string, args: any) => {
+          expect(fnName).toBe('save_workspace_file_atomic');
+          expect(args.p_base_revision).toBe(3);
+          expect(args.p_force_overwrite).toBe(false);
+          return {
+            data: { conflict: true, currentRevision: 5 },
+            error: null,
+          };
+        },
+        from: (table: string) => ({
+          select: () => ({
+            eq: () => ({
+              is: () => ({
+                single: async () => ({ data: mockFile, error: null }),
+              }),
+              order: () => ({
+                eq: async () => ({ data: [{ revision_number: 5, content: 'latest content' }], error: null }),
+              }),
+            }),
+          }),
+        }),
+      };
+
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+      const res = await supabaseDb.saveWorkspaceFile('file-1', 'my draft', 3, 'user-1', 'User 1');
+
+      expect(res.conflict).toBe(true);
+      expect(res.currentRevision).toBe(5);
+      expect(res.file.id).toBe('file-1');
+    });
+
+    it('SupabaseDatabaseAdapter.saveWorkspaceFile passes forceOverwrite to RPC function', async () => {
+      let passedArgs: any = null;
+      const mockFile = {
+        id: 'file-1',
+        project_id: 'proj-1',
+        name: 'app.ts',
+        type: 'file',
+        current_revision: 2,
+        content: 'force overwrite content',
+      };
+
+      const mockClient: any = {
+        rpc: async (fnName: string, args: any) => {
+          passedArgs = args;
+          return {
+            data: {
+              node: mockFile,
+              revision: { revision_number: 2 },
+            },
+            error: null,
+          };
+        },
+        from: (table: string) => ({
+          select: () => ({
+            eq: () => ({
+              is: () => ({
+                single: async () => ({ data: mockFile, error: null }),
+              }),
+              order: () => ({
+                eq: async () => ({ data: [{ revision_number: 2, content: 'force overwrite content' }], error: null }),
+              }),
+            }),
+          }),
+        }),
+      };
+
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+      const res = await supabaseDb.saveWorkspaceFile('file-1', 'force overwrite content', undefined, 'user-1', 'User 1', true);
+
+      expect(passedArgs.p_force_overwrite).toBe(true);
+      expect(passedArgs.p_base_revision).toBeNull();
+      expect(res.conflict).toBe(false);
+    });
+
+    it('SupabaseDatabaseAdapter.createWorkspaceNode executes atomic RPC and rolls back on failure', async () => {
+      const mockClient: any = {
+        rpc: async (fnName: string, args: any) => {
+          expect(fnName).toBe('create_workspace_node_atomic');
+          return { data: null, error: { message: 'Failed to insert initial revision snapshot' } };
+        },
+      };
+
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+
+      await expect(
+        supabaseDb.createWorkspaceNode({
+          project_id: 'proj-1',
+          name: 'index.ts',
+          type: 'file',
+          initialContent: 'console.log("hello");',
+          author_id: 'user-1',
+          author_name: 'User 1',
+        })
+      ).rejects.toThrow(/Failed to create workspace item: Failed to insert initial revision snapshot/i);
+    });
+
+    it('SupabaseDatabaseAdapter routes folder mutations through atomic RPC operations', async () => {
+      let rpcCalls: string[] = [];
+      const mockClient: any = {
+        rpc: async (fnName: string, args: any) => {
+          rpcCalls.push(fnName);
+          if (fnName === 'update_workspace_node_atomic') {
+            return {
+              data: { id: 'node-1', name: 'new-name', path: '/new-name' },
+              error: null,
+            };
+          }
+          if (fnName === 'delete_workspace_node_atomic') {
+            return {
+              data: { success: true },
+              error: null,
+            };
+          }
+          return { data: null, error: null };
+        },
+      };
+
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+
+      const updated = await supabaseDb.updateWorkspaceNode(
+        'node-1',
+        { name: 'new-name' },
+        'user-1',
+        'User 1'
+      );
+      expect(updated.name).toBe('new-name');
+      expect(rpcCalls).toContain('update_workspace_node_atomic');
+
+      const deleted = await supabaseDb.deleteWorkspaceNode('node-1');
+      expect(deleted).toBe(true);
+      expect(rpcCalls).toContain('delete_workspace_node_atomic');
+    });
+
+    it('HTTP route PUT /api/projects/:id/workspace/files/:fileId rejects missing baseRevision and validates project isolation', async () => {
+      const alice = await db.createUser({ email: 'owner_alice@mit.edu', name: 'Alice' });
+      const bob = await db.createUser({ email: 'hacker_bob@mit.edu', name: 'Bob' });
+      const projA = await db.createProject({ name: 'Project A', description: '', leader_id: alice.id });
+      const projB = await db.createProject({ name: 'Project B', description: '', leader_id: bob.id });
+
+      const fileA = await db.createWorkspaceNode({
+        project_id: projA.id,
+        name: 'secret.txt',
+        type: 'file',
+        initialContent: 'secret info',
+        author_id: alice.id,
+        author_name: alice.name,
+      });
+
+      // 1. Missing baseRevision without forceOverwrite -> 400 Bad Request
+      const missingBaseReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${projA.id}/workspace/files/${fileA.id}`,
+        alice.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'tampered' }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const missingBaseRes = await saveFileHandler(missingBaseReq, {
+        params: { id: projA.id, fileId: fileA.id },
+      });
+      expect(missingBaseRes.status).toBe(400);
+      const missingBody = await missingBaseRes.json();
+      expect(missingBody.error).toMatch(/baseRevision must be specified/i);
+
+      // 2. Cross-project file save attempt -> 404 Not Found (file does not belong to Project B)
+      const crossReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${projB.id}/workspace/files/${fileA.id}`,
+        bob.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'cross-project overwrite', baseRevision: 1 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const crossRes = await saveFileHandler(crossReq, {
+        params: { id: projB.id, fileId: fileA.id },
+      });
+      expect(crossRes.status).toBe(404);
+
+      // 3. Unauthorized non-member attempt -> 403 Forbidden
+      const unauthReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${projA.id}/workspace/files/${fileA.id}`,
+        bob.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'unauthorized save', baseRevision: 1 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const unauthRes = await saveFileHandler(unauthReq, {
+        params: { id: projA.id, fileId: fileA.id },
+      });
+      expect(unauthRes.status).toBe(403);
+
+      // 4. Legitimate save with correct baseRevision -> 200 OK
+      const validReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${projA.id}/workspace/files/${fileA.id}`,
+        alice.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'updated valid content', baseRevision: 1 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const validRes = await saveFileHandler(validReq, {
+        params: { id: projA.id, fileId: fileA.id },
+      });
+      expect(validRes.status).toBe(200);
+
+      // 5. Subsequent save with old baseRevision (1) -> 409 Conflict
+      const conflictReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${projA.id}/workspace/files/${fileA.id}`,
+        alice.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'stale save', baseRevision: 1 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const conflictRes = await saveFileHandler(conflictReq, {
+        params: { id: projA.id, fileId: fileA.id },
+      });
+      expect(conflictRes.status).toBe(409);
+
+      // 6. Explicit forceOverwrite: true succeeds even when baseRevision is omitted
+      const forceReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${projA.id}/workspace/files/${fileA.id}`,
+        alice.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'forced content', forceOverwrite: true }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const forceRes = await saveFileHandler(forceReq, {
+        params: { id: projA.id, fileId: fileA.id },
+      });
+      expect(forceRes.status).toBe(200);
+      const forceBody = await forceRes.json();
+      expect(forceBody.file.content).toBe('forced content');
+      expect(forceBody.file.current_revision).toBe(3);
     });
   });
 });

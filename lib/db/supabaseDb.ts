@@ -578,68 +578,26 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       throw new Error('File content exceeds the maximum size limit of 10MB.');
     }
 
-    let parentPath = '';
+    const { data, error } = await this.client.rpc('create_workspace_node_atomic', {
+      p_project_id: input.project_id,
+      p_parent_id: input.parent_id || null,
+      p_name: cleanName,
+      p_type: input.type,
+      p_initial_content: input.initialContent ?? '',
+      p_author_id: input.author_id,
+      p_author_name: input.author_name,
+    });
 
-    if (input.parent_id) {
-      const parent = await this.getWorkspaceNode(input.parent_id);
-      if (!parent || parent.project_id !== input.project_id || parent.type !== 'folder') {
-        throw new Error('Parent folder not found, belongs to another project, or is not a folder.');
-      }
-      parentPath = parent.path;
+    if (error || !data) {
+      throw new Error(`Failed to create workspace item: ${error?.message || 'Database transaction error'}`);
     }
 
-    const nodePath = `${parentPath}/${cleanName}`;
-
-    // Prevent duplicate paths in the project
-    const { data: existing } = await this.client
-      .from('workspace_nodes')
-      .select('id')
-      .eq('project_id', input.project_id)
-      .eq('path', nodePath)
-      .is('deleted_at', null)
-      .maybeSingle();
-
-    if (existing) {
-      throw new Error(`An item with path "${nodePath}" already exists in this project.`);
+    const node = data as WorkspaceNode;
+    if (input.type === 'file' && node.current_revision !== 1) {
+      throw new Error('Transaction verification failed: Initial revision was not properly persisted.');
     }
 
-    const initialContent = input.initialContent ?? '';
-    const size = input.type === 'file' ? Buffer.byteLength(initialContent, 'utf-8') : undefined;
-
-    const { data: node, error } = await this.client
-      .from('workspace_nodes')
-      .insert({
-        project_id: input.project_id,
-        parent_id: input.parent_id || null,
-        name: cleanName,
-        path: nodePath,
-        type: input.type,
-        current_revision: 1,
-        last_modified_by: input.author_id,
-        last_modified_name: input.author_name,
-        size,
-      })
-      .select('*')
-      .single();
-
-    if (error || !node) {
-      throw new Error(`Failed to create workspace item: ${error?.message}`);
-    }
-
-    if (input.type === 'file') {
-      const checksum = crypto.createHash('sha256').update(initialContent).digest('hex');
-      await this.client.from('workspace_revisions').insert({
-        node_id: node.id,
-        project_id: input.project_id,
-        revision_number: 1,
-        content: initialContent,
-        author_id: input.author_id,
-        author_name: input.author_name,
-        checksum,
-      });
-    }
-
-    return node as WorkspaceNode;
+    return node;
   }
 
   async updateWorkspaceNode(
@@ -648,134 +606,38 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     author_id: string,
     author_name: string
   ): Promise<WorkspaceNode> {
-    const node = await this.getWorkspaceNode(nodeId);
-    if (!node) throw new Error('Workspace item not found.');
-
-    const oldPath = node.path;
-    let newName = node.name;
-    let newParentId = node.parent_id;
-
-    if (updates.name !== undefined) {
-      newName = updates.name.trim();
+    const newName = updates.name !== undefined ? updates.name.trim() : undefined;
+    if (newName !== undefined) {
       if (!newName || newName === '.' || newName === '..' || newName.includes('/') || newName.includes('\\') || newName.includes('\0')) {
         throw new Error('Invalid name. Cannot be empty or contain path separators.');
       }
     }
 
-    if (updates.parent_id !== undefined) {
-      newParentId = updates.parent_id;
-    }
-
-    let parentPath = '';
-    if (newParentId) {
-      if (newParentId === nodeId) {
-        throw new Error('Cannot move a folder into itself.');
-      }
-
-      const parent = await this.getWorkspaceNode(newParentId);
-      if (!parent || parent.project_id !== node.project_id || parent.type !== 'folder') {
-        throw new Error('Target parent folder not found, belongs to another project, or is not a folder.');
-      }
-
-      // Prevent directory cycles
-      if (node.type === 'folder') {
-        if (parent.path === oldPath || parent.path.startsWith(`${oldPath}/`)) {
-          throw new Error('Cannot move a folder into one of its descendants.');
-        }
-
-        let currParentId: string | null = parent.parent_id;
-        while (currParentId) {
-          if (currParentId === nodeId) {
-            throw new Error('Cannot move a folder into one of its descendants.');
-          }
-          const ancestor = await this.getWorkspaceNode(currParentId);
-          currParentId = ancestor?.parent_id || null;
-        }
-      }
-
-      parentPath = parent.path;
-    }
-
-    const newPath = `${parentPath}/${newName}`;
-
-    // Prevent duplicate paths
-    const { data: duplicate } = await this.client
-      .from('workspace_nodes')
-      .select('id')
-      .eq('project_id', node.project_id)
-      .eq('path', newPath)
-      .neq('id', nodeId)
-      .is('deleted_at', null)
-      .maybeSingle();
-
-    if (duplicate) {
-      throw new Error(`An item with path "${newPath}" already exists in this project.`);
-    }
-
-    const { data, error } = await this.client
-      .from('workspace_nodes')
-      .update({
-        name: newName,
-        parent_id: newParentId,
-        path: newPath,
-        last_modified_by: author_id,
-        last_modified_name: author_name,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', nodeId)
-      .select('*')
-      .single();
+    const { data, error } = await this.client.rpc('update_workspace_node_atomic', {
+      p_node_id: nodeId,
+      p_name: newName || null,
+      p_parent_id: updates.parent_id !== undefined ? updates.parent_id : null,
+      p_author_id: author_id,
+      p_author_name: author_name,
+    });
 
     if (error || !data) {
-      throw new Error(`Failed to update workspace item: ${error?.message}`);
-    }
-
-    // Consistently update descendant paths if folder
-    if (node.type === 'folder' && oldPath !== newPath) {
-      const { data: descendants } = await this.client
-        .from('workspace_nodes')
-        .select('id, path')
-        .eq('project_id', node.project_id)
-        .is('deleted_at', null)
-        .like('path', `${oldPath}/%`);
-
-      if (descendants && descendants.length > 0) {
-        for (const desc of descendants) {
-          const updatedDescPath = `${newPath}${desc.path.slice(oldPath.length)}`;
-          await this.client
-            .from('workspace_nodes')
-            .update({ path: updatedDescPath, updated_at: new Date().toISOString() })
-            .eq('id', desc.id);
-        }
-      }
+      throw new Error(`Failed to update workspace item: ${error?.message || 'Database transaction error'}`);
     }
 
     return data as WorkspaceNode;
   }
 
   async deleteWorkspaceNode(nodeId: string): Promise<boolean> {
-    const node = await this.getWorkspaceNode(nodeId);
-    if (!node || node.deleted_at) return false;
+    const { data, error } = await this.client.rpc('delete_workspace_node_atomic', {
+      p_node_id: nodeId,
+    });
 
-    const now = new Date().toISOString();
-
-    // Soft delete to preserve historical revisions
-    const { error } = await this.client
-      .from('workspace_nodes')
-      .update({ deleted_at: now })
-      .eq('id', nodeId);
-
-    if (error) return false;
-
-    if (node.type === 'folder') {
-      await this.client
-        .from('workspace_nodes')
-        .update({ deleted_at: now })
-        .eq('project_id', node.project_id)
-        .like('path', `${node.path}/%`);
+    if (error || !data) {
+      throw new Error(`Failed to delete workspace item: ${error?.message || 'Database transaction error'}`);
     }
 
-    return true;
+    return data.success === true;
   }
 
   async getWorkspaceFile(fileId: string): Promise<WorkspaceFileDetail | null> {
@@ -803,7 +665,8 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     content: string,
     baseRevision: number | undefined,
     author_id: string,
-    author_name: string
+    author_name: string,
+    forceOverwrite?: boolean
   ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
     if (
       baseRevision !== undefined &&
@@ -812,82 +675,42 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       throw new Error('Invalid base revision number. Must be a positive integer.');
     }
 
+    if (baseRevision === undefined && !forceOverwrite) {
+      throw new Error('Concurrency check required: baseRevision must be specified for workspace saves.');
+    }
+
     if (Buffer.byteLength(content, 'utf-8') > 10 * 1024 * 1024) {
       throw new Error('File content exceeds the maximum size limit of 10MB.');
     }
 
     const checksum = crypto.createHash('sha256').update(content).digest('hex');
 
-    // 1. Attempt atomic save via PostgreSQL RPC function
-    try {
-      const { data: rpcRes, error: rpcErr } = await this.client.rpc('save_workspace_file_atomic', {
-        p_file_id: fileId,
-        p_content: content,
-        p_base_revision: baseRevision !== undefined ? baseRevision : null,
-        p_author_id: author_id,
-        p_author_name: author_name,
-        p_checksum: checksum,
-      });
-
-      if (!rpcErr && rpcRes) {
-        const fileRes = await this.getWorkspaceFile(fileId);
-        if (rpcRes.conflict) {
-          return {
-            file: fileRes!,
-            conflict: true,
-            currentRevision: rpcRes.currentRevision,
-          };
-        }
-        return {
-          file: fileRes!,
-          conflict: false,
-        };
-      }
-    } catch {
-      // RPC fallback to direct guarded query
-    }
-
-    // 2. Fallback guarded client update
-    const node = await this.getWorkspaceNode(fileId);
-    if (!node || node.type !== 'file') throw new Error('File not found.');
-
-    if (baseRevision !== undefined && node.current_revision !== baseRevision) {
-      const current = await this.getWorkspaceFile(fileId);
-      return {
-        file: current!,
-        conflict: true,
-        currentRevision: node.current_revision,
-      };
-    }
-
-    const nextRevNum = node.current_revision + 1;
-    const now = new Date().toISOString();
-
-    const { error: revErr } = await this.client.from('workspace_revisions').insert({
-      node_id: fileId,
-      project_id: node.project_id,
-      revision_number: nextRevNum,
-      content,
-      author_id,
-      author_name,
-      checksum,
-      created_at: now,
+    const { data: rpcRes, error: rpcErr } = await this.client.rpc('save_workspace_file_atomic', {
+      p_file_id: fileId,
+      p_content: content,
+      p_base_revision: baseRevision !== undefined ? baseRevision : null,
+      p_author_id: author_id,
+      p_author_name: author_name,
+      p_checksum: checksum,
+      p_force_overwrite: forceOverwrite ?? false,
     });
 
-    if (revErr) {
-      throw new Error(`Failed to save revision: ${revErr.message}`);
+    if (rpcErr) {
+      throw new Error(`Failed to save revision: ${rpcErr.message}`);
     }
 
-    await this.client
-      .from('workspace_nodes')
-      .update({
-        current_revision: nextRevNum,
-        last_modified_by: author_id,
-        last_modified_name: author_name,
-        updated_at: now,
-        size: Buffer.byteLength(content, 'utf-8'),
-      })
-      .eq('id', fileId);
+    if (!rpcRes) {
+      throw new Error('Failed to save revision: Database returned empty response.');
+    }
+
+    if (rpcRes.conflict) {
+      const currentFile = await this.getWorkspaceFile(fileId);
+      return {
+        file: currentFile!,
+        conflict: true,
+        currentRevision: rpcRes.currentRevision,
+      };
+    }
 
     const updated = await this.getWorkspaceFile(fileId);
     return {
@@ -930,7 +753,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     }
 
     const node = await this.getWorkspaceNode(fileId);
-    if (!node || node.type !== 'file') throw new Error('File not found.');
+    if (!node || node.type !== 'file') throw new Error('Workspace file not found.');
 
     if (baseRevision !== undefined && node.current_revision !== baseRevision) {
       throw new Error(`Conflict: File has been updated to revision ${node.current_revision} by another teammate.`);
@@ -952,7 +775,8 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       targetRev.content,
       baseRevision,
       author_id,
-      `${author_name} (Restored Rev #${targetRevisionNumber})`
+      `${author_name} (Restored Rev #${targetRevisionNumber})`,
+      baseRevision === undefined ? true : false
     );
 
     if (saved.conflict) {

@@ -116,7 +116,8 @@ export interface IDatabaseAdapter {
     content: string,
     baseRevision: number | undefined,
     author_id: string,
-    author_name: string
+    author_name: string,
+    forceOverwrite?: boolean
   ): Promise<{ file: import('../types').WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }>;
   getWorkspaceFileRevisions(fileId: string): Promise<import('../types').WorkspaceRevision[]>;
   restoreWorkspaceRevision(
