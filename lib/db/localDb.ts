@@ -1,0 +1,640 @@
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  UserProfile,
+  UserAuthRecord,
+  Project,
+  ProjectMember,
+  ProjectRole,
+  Task,
+  TaskStatus,
+  Contribution,
+  ContributionFile,
+  ProjectWithDetails,
+} from '../types';
+import { IDatabaseAdapter } from './types';
+
+interface Schema {
+  users: UserAuthRecord[];
+  projects: Project[];
+  project_members: ProjectMember[];
+  tasks: Task[];
+  contributions: Contribution[];
+  contribution_files: ContributionFile[];
+}
+
+export class LocalDatabaseAdapter implements IDatabaseAdapter {
+  private filePath: string;
+  private memoryLock: Promise<void> = Promise.resolve();
+
+  constructor(filePath?: string) {
+    this.filePath = filePath || process.env.LOCAL_DB_PATH || path.join(process.cwd(), 'data', 'hackmate.json');
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    if (!fs.existsSync(this.filePath)) {
+      const initial: Schema = {
+        users: [],
+        projects: [],
+        project_members: [],
+        tasks: [],
+        contributions: [],
+        contribution_files: [],
+      };
+      fs.writeFileSync(this.filePath, JSON.stringify(initial, null, 2), 'utf-8');
+    }
+  }
+
+  private async withLock<T>(fn: (data: Schema) => Promise<{ result: T; dataToSave?: Schema }>): Promise<T> {
+    let unlock: () => void;
+    const lockWait = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+
+    const previousLock = this.memoryLock;
+    this.memoryLock = lockWait;
+
+    await previousLock;
+
+    try {
+      let content = '{}';
+      if (fs.existsSync(this.filePath)) {
+        content = await fs.promises.readFile(this.filePath, 'utf-8');
+      }
+      const data: Schema = JSON.parse(content || '{"users":[],"projects":[],"project_members":[],"tasks":[],"contributions":[],"contribution_files":[]}');
+      
+      const { result, dataToSave } = await fn(data);
+      if (dataToSave) {
+        await fs.promises.writeFile(this.filePath, JSON.stringify(dataToSave, null, 2), 'utf-8');
+      }
+      return result;
+    } finally {
+      unlock!();
+    }
+  }
+
+  // --- Users ---
+  async getUserByEmail(email: string): Promise<UserAuthRecord | null> {
+    return this.withLock(async (data) => {
+      const user = data.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+      return { result: user ? { ...user } : null };
+    });
+  }
+
+  async getUserById(id: string): Promise<UserProfile | null> {
+    return this.withLock(async (data) => {
+      const user = data.users.find((u) => u.id === id);
+      if (!user) return { result: null };
+      const { password_hash, ...profile } = user;
+      return { result: profile };
+    });
+  }
+
+  async createUser(userData: {
+    email: string;
+    name: string;
+    password_hash?: string;
+    avatar_url?: string | null;
+  }): Promise<UserProfile> {
+    return this.withLock(async (data) => {
+      const existing = data.users.find((u) => u.email.toLowerCase() === userData.email.toLowerCase());
+      if (existing) {
+        throw new Error('User with this email already exists.');
+      }
+
+      const newUser: UserAuthRecord = {
+        id: uuidv4(),
+        email: userData.email.trim(),
+        name: userData.name.trim(),
+        avatar_url: userData.avatar_url || null,
+        password_hash: userData.password_hash,
+        created_at: new Date().toISOString(),
+      };
+
+      data.users.push(newUser);
+      const { password_hash, ...profile } = newUser;
+      return { result: profile, dataToSave: data };
+    });
+  }
+
+  // --- Projects ---
+  async createProject(projectData: {
+    name: string;
+    description: string;
+    hackathon_name?: string | null;
+    leader_id: string;
+  }): Promise<ProjectWithDetails> {
+    return this.withLock(async (data) => {
+      const leader = data.users.find((u) => u.id === projectData.leader_id);
+      if (!leader) {
+        throw new Error('Leader user does not exist.');
+      }
+
+      const inviteCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+      const now = new Date().toISOString();
+      const projectId = uuidv4();
+
+      const newProject: Project = {
+        id: projectId,
+        name: projectData.name.trim(),
+        description: projectData.description.trim(),
+        hackathon_name: projectData.hackathon_name?.trim() || null,
+        invite_code: inviteCode,
+        leader_id: projectData.leader_id,
+        created_at: now,
+        updated_at: now,
+      };
+
+      const leaderMembership: ProjectMember = {
+        id: uuidv4(),
+        project_id: projectId,
+        user_id: projectData.leader_id,
+        role: 'leader',
+        joined_at: now,
+      };
+
+      data.projects.push(newProject);
+      data.project_members.push(leaderMembership);
+
+      const { password_hash, ...leaderProfile } = leader;
+      const detailedMembership: ProjectMember = {
+        ...leaderMembership,
+        user: leaderProfile,
+      };
+
+      const result: ProjectWithDetails = {
+        ...newProject,
+        members: [detailedMembership],
+        memberCount: 1,
+        currentUserRole: 'leader',
+        tasksCount: 0,
+        contributionsCount: 0,
+      };
+
+      return { result, dataToSave: data };
+    });
+  }
+
+  async getProjectById(id: string): Promise<ProjectWithDetails | null> {
+    return this.withLock(async (data) => {
+      const project = data.projects.find((p) => p.id === id);
+      if (!project) return { result: null };
+
+      const members = data.project_members
+        .filter((pm) => pm.project_id === id)
+        .map((pm) => {
+          const user = data.users.find((u) => u.id === pm.user_id);
+          const userProfile = user ? { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url, created_at: user.created_at } : undefined;
+          return { ...pm, user: userProfile };
+        });
+
+      const tasksCount = data.tasks.filter((t) => t.project_id === id).length;
+      const contributionsCount = data.contributions.filter((c) => c.project_id === id).length;
+
+      const result: ProjectWithDetails = {
+        ...project,
+        members,
+        memberCount: members.length,
+        tasksCount,
+        contributionsCount,
+      };
+
+      return { result };
+    });
+  }
+
+  async getProjectByInviteCode(inviteCode: string): Promise<Project | null> {
+    return this.withLock(async (data) => {
+      const project = data.projects.find((p) => p.invite_code.toUpperCase() === inviteCode.trim().toUpperCase());
+      return { result: project ? { ...project } : null };
+    });
+  }
+
+  async getUserProjects(userId: string): Promise<ProjectWithDetails[]> {
+    return this.withLock(async (data) => {
+      const memberships = data.project_members.filter((pm) => pm.user_id === userId);
+      const projectIds = memberships.map((m) => m.project_id);
+
+      const projects = data.projects.filter((p) => projectIds.includes(p.id));
+
+      const detailedProjects: ProjectWithDetails[] = projects.map((project) => {
+        const members = data.project_members
+          .filter((pm) => pm.project_id === project.id)
+          .map((pm) => {
+            const user = data.users.find((u) => u.id === pm.user_id);
+            const userProfile = user ? { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url, created_at: user.created_at } : undefined;
+            return { ...pm, user: userProfile };
+          });
+
+        const myMembership = memberships.find((m) => m.project_id === project.id);
+        const tasksCount = data.tasks.filter((t) => t.project_id === project.id).length;
+        const contributionsCount = data.contributions.filter((c) => c.project_id === project.id).length;
+
+        return {
+          ...project,
+          members,
+          memberCount: members.length,
+          currentUserRole: myMembership?.role,
+          tasksCount,
+          contributionsCount,
+        };
+      });
+
+      return { result: detailedProjects };
+    });
+  }
+
+  async updateProject(
+    projectId: string,
+    leaderId: string,
+    updateData: { name?: string; description?: string; hackathon_name?: string | null }
+  ): Promise<Project> {
+    return this.withLock(async (data) => {
+      const project = data.projects.find((p) => p.id === projectId);
+      if (!project) throw new Error('Project not found.');
+      if (project.leader_id !== leaderId) throw new Error('Only the team leader can edit project details.');
+
+      if (updateData.name !== undefined) project.name = updateData.name.trim();
+      if (updateData.description !== undefined) project.description = updateData.description.trim();
+      if (updateData.hackathon_name !== undefined) project.hackathon_name = updateData.hackathon_name?.trim() || null;
+      project.updated_at = new Date().toISOString();
+
+      return { result: { ...project }, dataToSave: data };
+    });
+  }
+
+  // --- Membership & Concurrency-Safe 6-Member Limit ---
+  async getProjectMembers(projectId: string): Promise<ProjectMember[]> {
+    return this.withLock(async (data) => {
+      const members = data.project_members
+        .filter((pm) => pm.project_id === projectId)
+        .map((pm) => {
+          const user = data.users.find((u) => u.id === pm.user_id);
+          const userProfile = user ? { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url, created_at: user.created_at } : undefined;
+          return { ...pm, user: userProfile };
+        });
+      return { result: members };
+    });
+  }
+
+  async joinProject(projectId: string, userId: string, role: ProjectRole = 'member'): Promise<ProjectMember> {
+    return this.withLock(async (data) => {
+      const project = data.projects.find((p) => p.id === projectId);
+      if (!project) throw new Error('Project not found.');
+
+      const user = data.users.find((u) => u.id === userId);
+      if (!user) throw new Error('User not found.');
+
+      // Check if already a member
+      const existing = data.project_members.find(
+        (pm) => pm.project_id === projectId && pm.user_id === userId
+      );
+      if (existing) {
+        return { result: { ...existing } };
+      }
+
+      // CRITICAL REQUIREMENT: Concurrency-safe limit check
+      // A project must support 1 leader and up to 5 additional members (max 6 total).
+      const currentCount = data.project_members.filter((pm) => pm.project_id === projectId).length;
+      if (currentCount >= 6) {
+        throw new Error('Team is full. A hackathon project cannot have more than 6 members (1 leader and up to 5 teammates).');
+      }
+
+      const membership: ProjectMember = {
+        id: uuidv4(),
+        project_id: projectId,
+        user_id: userId,
+        role: project.leader_id === userId ? 'leader' : role,
+        joined_at: new Date().toISOString(),
+      };
+
+      data.project_members.push(membership);
+
+      const { password_hash, ...profile } = user;
+      return { result: { ...membership, user: profile }, dataToSave: data };
+    });
+  }
+
+  async isProjectMember(projectId: string, userId: string): Promise<boolean> {
+    return this.withLock(async (data) => {
+      const member = data.project_members.some((pm) => pm.project_id === projectId && pm.user_id === userId);
+      return { result: member };
+    });
+  }
+
+  async isProjectLeader(projectId: string, userId: string): Promise<boolean> {
+    return this.withLock(async (data) => {
+      const leader = data.project_members.some((pm) => pm.project_id === projectId && pm.user_id === userId && pm.role === 'leader');
+      return { result: leader };
+    });
+  }
+
+  // --- Tasks ---
+  async createTask(taskData: {
+    project_id: string;
+    title: string;
+    description: string;
+    assigned_to: string;
+    created_by: string;
+    deadline?: string | null;
+  }): Promise<Task> {
+    return this.withLock(async (data) => {
+      const project = data.projects.find((p) => p.id === taskData.project_id);
+      if (!project) throw new Error('Project not found.');
+
+      // Only leader can create tasks
+      const isLeader = data.project_members.some(
+        (pm) => pm.project_id === taskData.project_id && pm.user_id === taskData.created_by && pm.role === 'leader'
+      );
+      if (!isLeader) {
+        throw new Error('Only the team leader can create tasks.');
+      }
+
+      // Assignee must be a project member
+      const isAssigneeMember = data.project_members.some(
+        (pm) => pm.project_id === taskData.project_id && pm.user_id === taskData.assigned_to
+      );
+      if (!isAssigneeMember) {
+        throw new Error('Assigned user must be a member of this project.');
+      }
+
+      const now = new Date().toISOString();
+      const newTask: Task = {
+        id: uuidv4(),
+        project_id: taskData.project_id,
+        title: taskData.title.trim(),
+        description: taskData.description.trim(),
+        assigned_to: taskData.assigned_to,
+        created_by: taskData.created_by,
+        status: 'Assigned',
+        deadline: taskData.deadline || null,
+        created_at: now,
+        updated_at: now,
+      };
+
+      data.tasks.push(newTask);
+
+      const assignee = data.users.find((u) => u.id === newTask.assigned_to);
+      const creator = data.users.find((u) => u.id === newTask.created_by);
+
+      const enriched: Task = {
+        ...newTask,
+        assignee: assignee ? { id: assignee.id, email: assignee.email, name: assignee.name, avatar_url: assignee.avatar_url, created_at: assignee.created_at } : undefined,
+        creator: creator ? { id: creator.id, email: creator.email, name: creator.name, avatar_url: creator.avatar_url, created_at: creator.created_at } : undefined,
+      };
+
+      return { result: enriched, dataToSave: data };
+    });
+  }
+
+  async updateTask(
+    taskId: string,
+    actorUserId: string,
+    updates: {
+      title?: string;
+      description?: string;
+      assigned_to?: string;
+      status?: TaskStatus;
+      deadline?: string | null;
+    }
+  ): Promise<Task> {
+    return this.withLock(async (data) => {
+      const task = data.tasks.find((t) => t.id === taskId);
+      if (!task) throw new Error('Task not found.');
+
+      const isLeader = data.project_members.some(
+        (pm) => pm.project_id === task.project_id && pm.user_id === actorUserId && pm.role === 'leader'
+      );
+      const isAssignee = task.assigned_to === actorUserId;
+
+      if (!isLeader && !isAssignee) {
+        throw new Error('You do not have permission to modify this task.');
+      }
+
+      // If actor is the assigned member (not the leader)
+      if (!isLeader && isAssignee) {
+        // Members can only update status to 'In Progress' or 'Submitted'
+        if (updates.title !== undefined || updates.description !== undefined || updates.assigned_to !== undefined || updates.deadline !== undefined) {
+          throw new Error('Members cannot change task details, reassign tasks, or set deadlines.');
+        }
+
+        if (updates.status !== undefined) {
+          if (updates.status !== 'In Progress' && updates.status !== 'Submitted') {
+            throw new Error(`Members can only update status to 'In Progress' or 'Submitted'. Status '${updates.status}' requires leader review.`);
+          }
+          task.status = updates.status;
+        }
+      } else if (isLeader) {
+        // Leader has full editing and review permissions
+        if (updates.title !== undefined) task.title = updates.title.trim();
+        if (updates.description !== undefined) task.description = updates.description.trim();
+        if (updates.assigned_to !== undefined) {
+          const isMember = data.project_members.some(
+            (pm) => pm.project_id === task.project_id && pm.user_id === updates.assigned_to
+          );
+          if (!isMember) throw new Error('Reassigned user must be a member of this project.');
+          task.assigned_to = updates.assigned_to;
+        }
+        if (updates.deadline !== undefined) task.deadline = updates.deadline || null;
+        if (updates.status !== undefined) task.status = updates.status;
+      }
+
+      task.updated_at = new Date().toISOString();
+
+      const assignee = data.users.find((u) => u.id === task.assigned_to);
+      const creator = data.users.find((u) => u.id === task.created_by);
+
+      const enriched: Task = {
+        ...task,
+        assignee: assignee ? { id: assignee.id, email: assignee.email, name: assignee.name, avatar_url: assignee.avatar_url, created_at: assignee.created_at } : undefined,
+        creator: creator ? { id: creator.id, email: creator.email, name: creator.name, avatar_url: creator.avatar_url, created_at: creator.created_at } : undefined,
+      };
+
+      return { result: enriched, dataToSave: data };
+    });
+  }
+
+  async getProjectTasks(projectId: string): Promise<Task[]> {
+    return this.withLock(async (data) => {
+      const tasks = data.tasks
+        .filter((t) => t.project_id === projectId)
+        .map((task) => {
+          const assignee = data.users.find((u) => u.id === task.assigned_to);
+          const creator = data.users.find((u) => u.id === task.created_by);
+          return {
+            ...task,
+            assignee: assignee ? { id: assignee.id, email: assignee.email, name: assignee.name, avatar_url: assignee.avatar_url, created_at: assignee.created_at } : undefined,
+            creator: creator ? { id: creator.id, email: creator.email, name: creator.name, avatar_url: creator.avatar_url, created_at: creator.created_at } : undefined,
+          };
+        });
+
+      return { result: tasks };
+    });
+  }
+
+  async getTaskById(taskId: string): Promise<Task | null> {
+    return this.withLock(async (data) => {
+      const task = data.tasks.find((t) => t.id === taskId);
+      if (!task) return { result: null };
+
+      const assignee = data.users.find((u) => u.id === task.assigned_to);
+      const creator = data.users.find((u) => u.id === task.created_by);
+
+      return {
+        result: {
+          ...task,
+          assignee: assignee ? { id: assignee.id, email: assignee.email, name: assignee.name, avatar_url: assignee.avatar_url, created_at: assignee.created_at } : undefined,
+          creator: creator ? { id: creator.id, email: creator.email, name: creator.name, avatar_url: creator.avatar_url, created_at: creator.created_at } : undefined,
+        },
+      };
+    });
+  }
+
+  // --- Contributions ---
+  async createContribution(
+    contributionData: {
+      project_id: string;
+      title: string;
+      description: string;
+      contributor_id: string;
+      contributor_name: string;
+      task_id?: string | null;
+      version_label?: string | null;
+      usage_instructions: string;
+      dependencies: string;
+    },
+    files: Array<{
+      id: string;
+      file_name: string;
+      file_size: number;
+      mime_type: string;
+      storage_path: string;
+      checksum: string;
+    }>
+  ): Promise<Contribution> {
+    return this.withLock(async (data) => {
+      const isMember = data.project_members.some(
+        (pm) => pm.project_id === contributionData.project_id && pm.user_id === contributionData.contributor_id
+      );
+      if (!isMember) {
+        throw new Error('Only project members can publish contributions.');
+      }
+
+      const now = new Date().toISOString();
+      const contributionId = uuidv4();
+
+      const newContribution: Contribution = {
+        id: contributionId,
+        project_id: contributionData.project_id,
+        title: contributionData.title.trim(),
+        description: contributionData.description.trim(),
+        contributor_id: contributionData.contributor_id,
+        contributor_name: contributionData.contributor_name.trim(),
+        task_id: contributionData.task_id || null,
+        version_label: contributionData.version_label?.trim() || null,
+        usage_instructions: contributionData.usage_instructions.trim(),
+        dependencies: contributionData.dependencies.trim(),
+        created_at: now,
+        updated_at: now,
+      };
+
+      const fileRecords: ContributionFile[] = files.map((f) => ({
+        id: f.id,
+        contribution_id: contributionId,
+        project_id: contributionData.project_id,
+        file_name: f.file_name,
+        file_size: f.file_size,
+        mime_type: f.mime_type,
+        storage_path: f.storage_path,
+        checksum: f.checksum,
+        uploaded_at: now,
+      }));
+
+      data.contributions.push(newContribution);
+      data.contribution_files.push(...fileRecords);
+
+      const task = newContribution.task_id
+        ? data.tasks.find((t) => t.id === newContribution.task_id) || null
+        : null;
+
+      const result: Contribution = {
+        ...newContribution,
+        files: fileRecords,
+        task,
+      };
+
+      return { result, dataToSave: data };
+    });
+  }
+
+  async getProjectContributions(
+    projectId: string,
+    filters?: { search?: string; contributorId?: string; taskId?: string }
+  ): Promise<Contribution[]> {
+    return this.withLock(async (data) => {
+      let list = data.contributions.filter((c) => c.project_id === projectId);
+
+      if (filters?.search) {
+        const query = filters.search.toLowerCase();
+        list = list.filter(
+          (c) =>
+            c.title.toLowerCase().includes(query) ||
+            c.description.toLowerCase().includes(query) ||
+            c.contributor_name.toLowerCase().includes(query) ||
+            (c.version_label && c.version_label.toLowerCase().includes(query))
+        );
+      }
+
+      if (filters?.contributorId) {
+        list = list.filter((c) => c.contributor_id === filters.contributorId);
+      }
+
+      if (filters?.taskId) {
+        list = list.filter((c) => c.task_id === filters.taskId);
+      }
+
+      // Sort latest first
+      list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+      const enriched: Contribution[] = list.map((c) => {
+        const files = data.contribution_files.filter((cf) => cf.contribution_id === c.id);
+        const task = c.task_id ? data.tasks.find((t) => t.id === c.task_id) || null : null;
+        return {
+          ...c,
+          files,
+          task,
+        };
+      });
+
+      return { result: enriched };
+    });
+  }
+
+  async getContributionById(contributionId: string): Promise<Contribution | null> {
+    return this.withLock(async (data) => {
+      const contribution = data.contributions.find((c) => c.id === contributionId);
+      if (!contribution) return { result: null };
+
+      const files = data.contribution_files.filter((cf) => cf.contribution_id === contributionId);
+      const task = contribution.task_id ? data.tasks.find((t) => t.id === contribution.task_id) || null : null;
+
+      return {
+        result: {
+          ...contribution,
+          files,
+          task,
+        },
+      };
+    });
+  }
+
+  async getContributionFileById(fileId: string): Promise<ContributionFile | null> {
+    return this.withLock(async (data) => {
+      const file = data.contribution_files.find((cf) => cf.id === fileId);
+      return { result: file ? { ...file } : null };
+    });
+  }
+}

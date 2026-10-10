@@ -1,0 +1,47 @@
+# Python & Machine Learning
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Large binary datasets
+data/raw/glorys/*.nc
+data/raw/ostia/*.nc
+data/raw/sss/*.nc
+data/raw/duacs/*.nc
+data/raw/oscar/*.nc
+data/raw/ccmp/*.nc
+data/raw/argo/*.csv
+data/interim/*
+data/processed/*.zarr/
+data/processed/*.nc
+
+# Logs
+logs/*.log
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Node & Frontend
+node_modules/
+dist/
+.next/
+out/
+.vercel/
+.vercelignore
+
+# HackMate Local storage & env
+.env*.local
+data/storage/
+data/hackmate.json
+
+# Preserved historical archive
+_satellite_embedding_archive/
