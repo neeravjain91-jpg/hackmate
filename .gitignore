@@ -42,6 +42,7 @@ out/
 .env*.local
 data/storage/
 data/hackmate.json
+tsconfig.tsbuildinfo
 
 # Preserved historical archive
 _satellite_embedding_archive/
