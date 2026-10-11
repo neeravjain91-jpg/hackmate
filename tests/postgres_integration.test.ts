@@ -17,7 +17,13 @@ import {
   computeSha256,
 } from './fixtures/pgHarness';
 
+import {
+  provisionIsolatedPostgres,
+  IsolatedPostgresInstance,
+} from './fixtures/isolatedPgRunner';
+
 describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
+  let isolatedInstance: IsolatedPostgresInstance | null = null;
   let adminClient: Client;
   let testClient: Client;
 
@@ -30,15 +36,29 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
   const PROJECT_2 = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 
   beforeAll(async () => {
+    // 1. If not running in CI with a pre-provisioned disposable service container,
+    // provision an isolated temporary PostgreSQL cluster with its own ephemeral lifecycle.
+    if (process.env.CI !== 'true') {
+      isolatedInstance = await provisionIsolatedPostgres();
+      process.env.PGHOST = isolatedInstance.host;
+      process.env.PGPORT = String(isolatedInstance.port);
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
+    } else {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
+    }
+
     adminClient = await createAdminClient();
-    // 1. Apply bootstrap fixtures and all migrations in strict order
+    // Apply bootstrap fixtures and all migrations in strict order
     await applyMigrations(adminClient);
     testClient = await createTestRunnerClient();
-  });
+  }, 45000);
 
   afterAll(async () => {
     if (testClient) await testClient.end();
     if (adminClient) await adminClient.end();
+    if (isolatedInstance) {
+      await isolatedInstance.stop();
+    }
   });
 
   beforeEach(async () => {

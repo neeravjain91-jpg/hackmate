@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
+import net from 'net';
+import { execSync } from 'child_process';
 import { Client } from 'pg';
 import {
   validateDbTarget,
@@ -10,6 +12,10 @@ import {
   applyMigrations,
   EXPECTED_TEST_DATABASE,
 } from './fixtures/pgHarness';
+import {
+  provisionIsolatedPostgres,
+  IsolatedPostgresInstance,
+} from './fixtures/isolatedPgRunner';
 
 describe('PostgreSQL Harness Target Safety & Isolation', () => {
   const originalEnv = { ...process.env };
@@ -19,6 +25,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     delete process.env.CI;
     delete process.env.DATABASE_URL;
     delete process.env.TEST_DATABASE_URL;
+    delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
   });
 
   afterEach(() => {
@@ -67,8 +74,9 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     });
   });
 
-  describe('2. Host Validation for Local Execution', () => {
-    it('accepts loopback hosts for local test execution', () => {
+  describe('2. Host Validation & Disposable Isolation Enforcement', () => {
+    it('accepts loopback hosts when running against an isolated disposable instance', () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
       expect(() => {
         validateDbTarget({ host: '127.0.0.1', database: 'hackmate_test' });
       }).not.toThrow();
@@ -82,7 +90,21 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       }).not.toThrow();
     });
 
-    it('strictly rejects non-loopback hosts in local test execution', () => {
+    it('strictly rejects local execution when isolated disposable instance flag is missing', () => {
+      delete process.env.CI;
+      delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
+
+      expect(() => {
+        validateDbTarget({ host: '127.0.0.1', database: 'hackmate_test' });
+      }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
+
+      expect(() => {
+        validateDbTarget({ host: 'localhost', database: 'hackmate_test' });
+      }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
+    });
+
+    it('strictly rejects non-loopback hosts in local test execution even with disposable flag', () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
       const nonLoopbackHosts = [
         'db.supabase.co',
         'aws-rds.amazonaws.com',
@@ -100,6 +122,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     });
 
     it('rejects unspecified host', () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
       expect(() => {
         validateDbTarget({ database: 'hackmate_test' });
       }).toThrow(/Safety violation: Target host is unspecified/);
@@ -108,6 +131,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
   describe('3. Production DATABASE_URL Isolation & Redaction', () => {
     it('does not accept production-looking DATABASE_URL as an implicit test target', () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
       process.env.DATABASE_URL = 'postgres://prod_admin:supersecret@db.supabase.co:5432/hackmate_prod';
 
       // getDbConfig should NOT use DATABASE_URL
@@ -118,6 +142,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     });
 
     it('rejects production-looking connection string if passed explicitly and redacts credentials', () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
       const prodUrl = 'postgres://superadmin:supersecretpassword@db.supabase.co:5432/hackmate_prod';
 
       let thrownError: Error | null = null;
@@ -138,6 +163,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
   describe('4. Pre-Connection & Pre-Mutation Safeguards', () => {
     it('fails before any connection attempt occurs when config is invalid', async () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
       const connectSpy = vi.spyOn(Client.prototype, 'connect');
 
       await expect(
@@ -148,6 +174,21 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       ).rejects.toThrow(/Safety violation/);
 
       // Verify that Client.connect was NEVER invoked
+      expect(connectSpy).not.toHaveBeenCalled();
+    });
+
+    it('fails before any connection attempt occurs when connecting to shared cluster without disposable flag', async () => {
+      delete process.env.CI;
+      delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
+      const connectSpy = vi.spyOn(Client.prototype, 'connect');
+
+      await expect(
+        createAdminClient({
+          host: '127.0.0.1',
+          database: 'hackmate_test',
+        })
+      ).rejects.toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
+
       expect(connectSpy).not.toHaveBeenCalled();
     });
 
@@ -207,7 +248,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(validated.user).toBe('postgres');
     });
 
-    it('allows container service host "postgres" in CI environment', () => {
+    it('allows container service host "postgres" in CI environment without external credentials', () => {
       process.env.CI = 'true';
 
       const validated = validateDbTarget({
@@ -270,6 +311,114 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       for (const dir of scanDirs) {
         expect(() => scanDir(dir)).not.toThrow();
       }
+    });
+  });
+
+  describe('7. Disposable PostgreSQL Lifecycle & Cluster-Wide Role Isolation', () => {
+    it('provisions and stops an isolated temporary instance cleanly, removing data directory', async () => {
+      const inst = await provisionIsolatedPostgres();
+      expect(inst.host).toBe('127.0.0.1');
+      expect(inst.port).toBeGreaterThan(1024);
+
+      const checkListening = async () => {
+        return new Promise<boolean>((resolve) => {
+          const s = net.createConnection({ host: inst.host, port: inst.port }, () => {
+            s.destroy();
+            resolve(true);
+          });
+          s.on('error', () => resolve(false));
+        });
+      };
+
+      const isListeningBefore = await checkListening();
+      expect(isListeningBefore).toBe(true);
+
+      const waitForClosed = async (port: number, maxWaitMs = 3000): Promise<boolean> => {
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+          const isClosed = await new Promise<boolean>((resolve) => {
+            const s = net.createConnection({ host: '127.0.0.1', port }, () => {
+              s.destroy();
+              resolve(false);
+            });
+            s.on('error', () => resolve(true));
+          });
+          if (isClosed) return true;
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        return false;
+      };
+
+      // Stop instance
+      await inst.stop();
+
+      // Verify server port is closed
+      const isClosed = await waitForClosed(inst.port);
+      expect(isClosed).toBe(true);
+
+      // Verify data directory is deleted
+      if (inst.isWsl) {
+        let dirExists = true;
+        try {
+          execSync(`wsl bash -c "test -d ${inst.dataDir}"`, { stdio: 'ignore' });
+        } catch {
+          dirExists = false;
+        }
+        expect(dirExists).toBe(false);
+      } else {
+        expect(fs.existsSync(inst.dataDir)).toBe(false);
+      }
+    }, 45000);
+
+    it('cleans up isolated instance even if test throws an exception (try / finally lifecycle)', async () => {
+      let inst: IsolatedPostgresInstance | null = null;
+      let errorCaught = false;
+
+      try {
+        inst = await provisionIsolatedPostgres();
+        // Simulate test failure
+        throw new Error('Simulated test execution failure');
+      } catch (err: any) {
+        errorCaught = true;
+        expect(err.message).toBe('Simulated test execution failure');
+      } finally {
+        if (inst) {
+          await inst.stop();
+        }
+      }
+
+      expect(errorCaught).toBe(true);
+      expect(inst).not.toBeNull();
+
+      // Verify port is closed
+      const waitForClosed = async (port: number, maxWaitMs = 3000): Promise<boolean> => {
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+          const isClosed = await new Promise<boolean>((resolve) => {
+            const s = net.createConnection({ host: '127.0.0.1', port }, () => {
+              s.destroy();
+              resolve(false);
+            });
+            s.on('error', () => resolve(true));
+          });
+          if (isClosed) return true;
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        return false;
+      };
+
+      const isPortClosed = await waitForClosed(inst!.port);
+      expect(isPortClosed).toBe(true);
+    }, 45000);
+
+    it('guarantees test-only roles are isolated strictly to disposable clusters', () => {
+      // Local tests without HACKMATE_DISPOSABLE_INSTANCE fail closed before applying bootstrap_postgres.sql
+      delete process.env.CI;
+      delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
+
+      expect(() => {
+        validateDbTarget({ host: '127.0.0.1', database: 'hackmate_test' });
+      }).toThrow(/Direct connection to shared PostgreSQL cluster is disallowed/);
     });
   });
 });

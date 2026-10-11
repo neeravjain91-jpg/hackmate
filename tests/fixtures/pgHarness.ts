@@ -82,6 +82,17 @@ export function validateDbTarget(config: ClientConfig | HarnessConfig): Validate
     }
   }
 
+  // 3. Isolated instance enforcement:
+  // Local execution must never silently attach to an ordinary shared PostgreSQL cluster.
+  const isDisposable = process.env.HACKMATE_DISPOSABLE_INSTANCE === 'true';
+  if (!isCi && !isDisposable) {
+    throw new Error(
+      'Safety violation: Direct connection to shared PostgreSQL cluster is disallowed. ' +
+      'Local tests must execute against an isolated temporary instance with HACKMATE_DISPOSABLE_INSTANCE=true ' +
+      'to prevent persistent cluster-wide changes.'
+    );
+  }
+
   return {
     host,
     port: port || 5432,
