@@ -1,0 +1,62 @@
+name: PostgreSQL Integration & CI Quality Gates
+
+on:
+  push:
+    branches:
+      - feature/common-development-workspace
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL Integration & Quality Gates
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: hackmate_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: 5432
+      PGDATABASE: hackmate_test
+      PGUSER: postgres
+      PGPASSWORD: testpassword
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Run PostgreSQL Integration Tests
+        run: npm run test:postgres
+
+      - name: Run Full Test Suite
+        run: npm test
+
+      - name: Production Next.js Build
+        run: npm run build
