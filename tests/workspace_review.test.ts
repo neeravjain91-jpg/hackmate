@@ -85,7 +85,7 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       expect(content).toContain('delete_workspace_node_atomic');
 
       // 8. Security Definer and pinned search path
-      expect(content).toContain('SET search_path = public, pg_temp');
+      expect(content).toContain("SET search_path = ''");
 
       // 9. Restrict execution privileges
       expect(content).toContain('REVOKE ALL ON FUNCTION public.create_workspace_node_atomic');
@@ -1133,6 +1133,458 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       expect(foreignRes.status).toBe(400);
       const foreignBody = await foreignRes.json();
       expect(foreignBody.error).toMatch(/Target parent folder not found/i);
+    });
+  });
+
+  // =========================================================================
+  // AREA H: Concurrency-Safe Revision Restoration
+  // =========================================================================
+  describe('Area H: Concurrency-Safe Revision Restoration', () => {
+    it('HTTP restore route requires positive-integer baseRevision and rejects missing with 400', async () => {
+      const user = await db.createUser({ email: 'h_restore1@mit.edu', name: 'User H1' });
+      const proj = await db.createProject({ name: 'Proj H1', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.txt',
+        type: 'file',
+        initialContent: 'v1',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      await db.saveWorkspaceFile(file.id, 'v2', 1, user.id, user.name);
+
+      // 1. Missing baseRevision -> 400 Bad Request
+      const missingReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+        user.id,
+        {
+          method: 'POST',
+          body: JSON.stringify({ revisionNumber: 1 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const missingRes = await restoreRevisionHandler(missingReq, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(missingRes.status).toBe(400);
+      const missingBody = await missingRes.json();
+      expect(missingBody.error).toMatch(/baseRevision.*required/i);
+    });
+
+    it('HTTP restore route rejects non-numeric, zero, negative, and fractional baseRevision with 400', async () => {
+      const user = await db.createUser({ email: 'h_restore2@mit.edu', name: 'User H2' });
+      const proj = await db.createProject({ name: 'Proj H2', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.txt',
+        type: 'file',
+        initialContent: 'v1',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      for (const invalidBase of [-1, 0, 1.5, 'invalid', null]) {
+        const req = createAuthedRequest(
+          `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+          user.id,
+          {
+            method: 'POST',
+            body: JSON.stringify({ revisionNumber: 1, baseRevision: invalidBase }),
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+        const res = await restoreRevisionHandler(req, {
+          params: { id: proj.id, fileId: file.id },
+        });
+        expect(res.status).toBe(400);
+      }
+    });
+
+    it('HTTP restore route rejects stale baseRevision with 409 conflict and includes currentRevision', async () => {
+      const user = await db.createUser({ email: 'h_restore3@mit.edu', name: 'User H3' });
+      const proj = await db.createProject({ name: 'Proj H3', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.txt',
+        type: 'file',
+        initialContent: 'v1',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      // Update to rev 2, then rev 3
+      await db.saveWorkspaceFile(file.id, 'v2', 1, user.id, user.name);
+      await db.saveWorkspaceFile(file.id, 'v3', 2, user.id, user.name);
+
+      // Attempt restore of rev 1 using stale baseRevision 2 (current is 3) -> 409 Conflict
+      const req = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+        user.id,
+        {
+          method: 'POST',
+          body: JSON.stringify({ revisionNumber: 1, baseRevision: 2 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const res = await restoreRevisionHandler(req, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.conflict).toBe(true);
+      expect(body.currentRevision).toBe(3);
+    });
+
+    it('HTTP restore route succeeds with matching baseRevision, creates new revision, and preserves history', async () => {
+      const user = await db.createUser({ email: 'h_restore4@mit.edu', name: 'User H4' });
+      const proj = await db.createProject({ name: 'Proj H4', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.txt',
+        type: 'file',
+        initialContent: 'version 1 content',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      await db.saveWorkspaceFile(file.id, 'version 2 content', 1, user.id, user.name);
+      await db.saveWorkspaceFile(file.id, 'version 3 content', 2, user.id, user.name);
+
+      // Restore Rev 1 with current baseRevision 3 -> 200 OK
+      const req = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+        user.id,
+        {
+          method: 'POST',
+          body: JSON.stringify({ revisionNumber: 1, baseRevision: 3 }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const res = await restoreRevisionHandler(req, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.file.current_revision).toBe(4);
+      expect(body.file.content).toBe('version 1 content');
+
+      // Check all 4 revisions are intact
+      const revisions = await db.getWorkspaceFileRevisions(file.id);
+      expect(revisions).toHaveLength(4);
+      expect(revisions[0].revision_number).toBe(4);
+      expect(revisions[0].content).toBe('version 1 content');
+      expect(revisions[1].revision_number).toBe(3);
+      expect(revisions[1].content).toBe('version 3 content');
+    });
+
+    it('HTTP restore route permits separate deliberate forceOverwrite workflow without baseRevision', async () => {
+      const user = await db.createUser({ email: 'h_restore5@mit.edu', name: 'User H5' });
+      const proj = await db.createProject({ name: 'Proj H5', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.txt',
+        type: 'file',
+        initialContent: 'first',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      await db.saveWorkspaceFile(file.id, 'second', 1, user.id, user.name);
+
+      // Deliberate force restoration
+      const req = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+        user.id,
+        {
+          method: 'POST',
+          body: JSON.stringify({ revisionNumber: 1, forceOverwrite: true }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const res = await restoreRevisionHandler(req, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.file.current_revision).toBe(3);
+      expect(body.file.content).toBe('first');
+    });
+
+    it('SupabaseDatabaseAdapter.restoreWorkspaceRevision enforces baseRevision concurrency check', async () => {
+      let rpcCalls: any[] = [];
+      const mockFile = {
+        id: 'file-occ-1',
+        project_id: 'proj-1',
+        type: 'file',
+        name: 'doc.md',
+        current_revision: 2,
+      };
+
+      const mockClient: any = {
+        from: (table: string) => ({
+          select: () => ({
+            eq: () => ({
+              is: () => ({
+                single: async () => ({ data: mockFile, error: null }),
+              }),
+              eq: () => ({
+                single: async () => ({
+                  data: { node_id: 'file-occ-1', revision_number: 1, content: 'original' },
+                  error: null,
+                }),
+              }),
+              order: () => ({
+                eq: async () => ({ data: [{ revision_number: 2, content: 'v2' }], error: null }),
+              }),
+            }),
+          }),
+        }),
+        rpc: async (fn: string, args: any) => {
+          rpcCalls.push({ fn, args });
+          return { data: { conflict: false, currentRevision: 3, file: mockFile }, error: null };
+        },
+      };
+
+      const adapter = new SupabaseDatabaseAdapter(mockClient);
+
+      // Missing baseRevision without forceOverwrite throws error
+      await expect(
+        adapter.restoreWorkspaceRevision('file-occ-1', 1, 'user-1', 'User 1')
+      ).rejects.toThrow(/baseRevision must be specified/i);
+
+      // Stale baseRevision (passing 1 when current is 2) throws Conflict
+      await expect(
+        adapter.restoreWorkspaceRevision('file-occ-1', 1, 'user-1', 'User 1', 1)
+      ).rejects.toThrow(/Conflict.*updated to revision 2/i);
+
+      // Correct baseRevision passes baseRevision and forceOverwrite: false to saveWorkspaceFile
+      await adapter.restoreWorkspaceRevision('file-occ-1', 1, 'user-1', 'User 1', 2);
+      expect(rpcCalls.length).toBe(1);
+      expect(rpcCalls[0].args.p_base_revision).toBe(2);
+      expect(rpcCalls[0].args.p_force_overwrite).toBe(false);
+
+      // Force overwrite passes forceOverwrite: true
+      await adapter.restoreWorkspaceRevision('file-occ-1', 1, 'user-1', 'User 1', undefined, true);
+      expect(rpcCalls.length).toBe(2);
+      expect(rpcCalls[1].args.p_force_overwrite).toBe(true);
+    });
+  });
+
+  // =========================================================================
+  // AREA I: Wildcard-Safe Folder Hierarchy and Subtree Traversal
+  // =========================================================================
+  describe('Area I: Wildcard-Safe Folder Hierarchy and Subtree Traversal', () => {
+    it('renaming and soft-deleting folders with SQL wildcard characters (_ and %) does not affect sibling paths', async () => {
+      const user = await db.createUser({ email: 'wildcard_user@mit.edu', name: 'Wildcard User' });
+      const proj = await db.createProject({ name: 'WildcardProj', description: '', leader_id: user.id });
+
+      // Create folder /test_dir and its child /test_dir/nested.txt
+      const testDir = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test_dir',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const nestedFile = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: testDir.id,
+        name: 'nested.txt',
+        type: 'file',
+        initialContent: 'nested content',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      // Create sibling folder /test1dir and its child /test1dir/sibling.txt
+      const test1Dir = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test1dir',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const siblingFile = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: test1Dir.id,
+        name: 'sibling.txt',
+        type: 'file',
+        initialContent: 'sibling content',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      // Create folder /100%_docs and /1000docs
+      const percentDir = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: '100%_docs',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const percentFile = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: percentDir.id,
+        name: 'readme.md',
+        type: 'file',
+        initialContent: 'readme',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const thousandDir = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: '1000docs',
+        type: 'folder',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const thousandFile = await db.createWorkspaceNode({
+        project_id: proj.id,
+        parent_id: thousandDir.id,
+        name: 'spec.md',
+        type: 'file',
+        initialContent: 'spec',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      expect(testDir.path).toBe('/test_dir');
+      expect(nestedFile.path).toBe('/test_dir/nested.txt');
+      expect(test1Dir.path).toBe('/test1dir');
+      expect(siblingFile.path).toBe('/test1dir/sibling.txt');
+      expect(percentDir.path).toBe('/100%_docs');
+      expect(percentFile.path).toBe('/100%_docs/readme.md');
+      expect(thousandDir.path).toBe('/1000docs');
+      expect(thousandFile.path).toBe('/1000docs/spec.md');
+
+      // 1. Rename /test_dir -> /test_dir_renamed
+      await db.updateWorkspaceNode(testDir.id, { name: 'test_dir_renamed' }, user.id, user.name);
+
+      const updatedNested = await db.getWorkspaceNode(nestedFile.id);
+      expect(updatedNested?.path).toBe('/test_dir_renamed/nested.txt');
+
+      // Sibling /test1dir must be UNCHANGED
+      const checkTest1Dir = await db.getWorkspaceNode(test1Dir.id);
+      expect(checkTest1Dir?.path).toBe('/test1dir');
+      const checkSibling = await db.getWorkspaceNode(siblingFile.id);
+      expect(checkSibling?.path).toBe('/test1dir/sibling.txt');
+
+      // 2. Soft delete /test_dir_renamed
+      await db.deleteWorkspaceNode(testDir.id);
+
+      // Verify /test_dir_renamed and its child are deleted
+      expect(await db.getWorkspaceNode(testDir.id)).toBeNull();
+      expect(await db.getWorkspaceNode(nestedFile.id)).toBeNull();
+
+      // Sibling /test1dir and its child must remain ACTIVE
+      expect(await db.getWorkspaceNode(test1Dir.id)).not.toBeNull();
+      expect(await db.getWorkspaceNode(siblingFile.id)).not.toBeNull();
+
+      // 3. Rename /100%_docs -> /100%_archive
+      await db.updateWorkspaceNode(percentDir.id, { name: '100%_archive' }, user.id, user.name);
+
+      const updatedPercentFile = await db.getWorkspaceNode(percentFile.id);
+      expect(updatedPercentFile?.path).toBe('/100%_archive/readme.md');
+
+      // /1000docs and its child must remain completely UNCHANGED
+      const checkThousandDir = await db.getWorkspaceNode(thousandDir.id);
+      expect(checkThousandDir?.path).toBe('/1000docs');
+      const checkThousandFile = await db.getWorkspaceNode(thousandFile.id);
+      expect(checkThousandFile?.path).toBe('/1000docs/spec.md');
+    });
+  });
+
+  // =========================================================================
+  // AREA J: Security Definer Hardening, RPC Hygiene, and Caller Identity
+  // =========================================================================
+  describe('Area J: Security Definer RPC Hardening, Checksum Resolution, and Caller Identity', () => {
+    it('migration 20241011 and corrective migration 20241012 satisfy all architectural hardening requirements', () => {
+      const mig1Path = path.join(process.cwd(), 'supabase', 'migrations', '20241011_add_workspace.sql');
+      const mig2Path = path.join(process.cwd(), 'supabase', 'migrations', '20241012_harden_workspace_security_and_rpc.sql');
+
+      expect(fs.existsSync(mig1Path)).toBe(true);
+      expect(fs.existsSync(mig2Path)).toBe(true);
+
+      const m1 = fs.readFileSync(mig1Path, 'utf-8');
+      const m2 = fs.readFileSync(mig2Path, 'utf-8');
+
+      for (const [name, content] of [['20241011', m1], ['20241012', m2]]) {
+        // 1. Pinned empty search_path for SECURITY DEFINER hardening
+        expect(content).toContain("SET search_path = ''");
+
+        // 2. Schema-agnostic checksum calculation function
+        expect(content).toContain('CREATE OR REPLACE FUNCTION public.workspace_calculate_checksum');
+        expect(content).toContain('extensions.digest');
+        expect(content).toContain('public.digest');
+
+        // 3. Wildcard-safe recursive CTE subtree traversal
+        expect(content).toContain('WITH RECURSIVE descendants AS');
+
+        // 4. Stale overload removal
+        expect(content).toContain('DROP FUNCTION IF EXISTS public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT);');
+        expect(content).toContain('DROP FUNCTION IF EXISTS public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT);');
+        expect(content).toContain('DROP FUNCTION IF EXISTS public.delete_workspace_node_atomic(UUID, UUID);');
+
+        // 5. Caller identity handling checking JWT claims / session user instead of vulnerable current_user
+        expect(content).toContain("current_setting('request.jwt.claim.role', true)");
+        expect(content).toContain("session_user IN ('service_role', 'postgres')");
+        expect(content).toContain('p_author_id <> v_auth_uid');
+
+        // 6. Direct table writes revoked from PUBLIC, anon, authenticated
+        expect(content).toContain('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.workspace_nodes FROM PUBLIC, anon, authenticated;');
+        expect(content).toContain('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.workspace_revisions FROM PUBLIC, anon, authenticated;');
+
+        // 7. Explicit RPC privileges
+        expect(content).toContain('GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic');
+        expect(content).toContain('GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic');
+        expect(content).toContain('GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic');
+        expect(content).toContain('GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic');
+        expect(content).toContain('GRANT EXECUTE ON FUNCTION public.workspace_calculate_checksum');
+      }
+    });
+
+    it('SupabaseDatabaseAdapter.createWorkspaceNode computes sha256 checksum and passes it to atomic RPC', async () => {
+      let rpcArgs: any = null;
+      const mockClient: any = {
+        rpc: async (fn: string, args: any) => {
+          rpcArgs = args;
+          return {
+            data: {
+              id: 'node-chk-1',
+              name: 'index.ts',
+              type: 'file',
+              current_revision: 1,
+            },
+            error: null,
+          };
+        },
+      };
+
+      const adapter = new SupabaseDatabaseAdapter(mockClient);
+      await adapter.createWorkspaceNode({
+        project_id: 'proj-chk',
+        name: 'index.ts',
+        type: 'file',
+        initialContent: 'hello world',
+        author_id: 'user-chk',
+        author_name: 'Checksum User',
+      });
+
+      expect(rpcArgs).toBeDefined();
+      expect(rpcArgs.p_name).toBe('index.ts');
+      // sha256 of "hello world" is b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+      expect(rpcArgs.p_checksum).toBe('b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9');
     });
   });
 });

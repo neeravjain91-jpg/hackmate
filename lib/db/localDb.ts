@@ -1101,7 +1101,8 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     targetRevisionNumber: number,
     author_id: string,
     author_name: string,
-    baseRevision?: number
+    baseRevision?: number,
+    forceOverwrite?: boolean
   ): Promise<WorkspaceFileDetail> {
     return this.withLock(async (data) => {
       if (
@@ -1110,6 +1111,10 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         targetRevisionNumber < 1
       ) {
         throw new Error('Invalid target revision number. Must be a positive integer.');
+      }
+
+      if (!forceOverwrite && (baseRevision === undefined || typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)) {
+        throw new Error('Concurrency check required: baseRevision must be specified for workspace restoration.');
       }
 
       if (
@@ -1129,8 +1134,8 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         throw new Error('Forbidden. Only project members can restore workspace files.');
       }
 
-      // Concurrency check: Ensure no newer revision was saved if baseRevision is specified
-      if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+      // Concurrency check: Ensure no newer revision was saved unless forceOverwrite is enabled
+      if (!forceOverwrite && baseRevision !== undefined && node.current_revision !== baseRevision) {
         throw new Error(
           `Conflict: File has been updated to revision ${node.current_revision} by another teammate.`
         );

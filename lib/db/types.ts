@@ -125,7 +125,8 @@ export interface IDatabaseAdapter {
     targetRevisionNumber: number,
     author_id: string,
     author_name: string,
-    baseRevision?: number
+    baseRevision?: number,
+    forceOverwrite?: boolean
   ): Promise<import('../types').WorkspaceFileDetail>;
 }
 

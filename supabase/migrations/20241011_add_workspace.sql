@@ -63,14 +63,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS unique_project_active_path
 
 -- Prevent changing project_id of existing workspace nodes
 CREATE OR REPLACE FUNCTION public.prevent_workspace_node_project_transfer()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
 BEGIN
     IF NEW.project_id <> OLD.project_id THEN
         RAISE EXCEPTION 'Forbidden: Transferring workspace nodes across projects is prohibited.';
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 DROP TRIGGER IF EXISTS trigger_prevent_workspace_node_project_transfer ON public.workspace_nodes;
 CREATE TRIGGER trigger_prevent_workspace_node_project_transfer
@@ -143,11 +147,15 @@ GRANT SELECT ON TABLE public.workspace_revisions TO authenticated, service_role;
 
 -- Revision Immutability Protection: Historical records cannot be modified or deleted
 CREATE OR REPLACE FUNCTION public.prevent_workspace_revision_modification()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
 BEGIN
     RAISE EXCEPTION 'Workspace revisions are immutable historical records and cannot be updated or deleted.';
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 DROP TRIGGER IF EXISTS trigger_workspace_revisions_immutable ON public.workspace_revisions;
 CREATE TRIGGER trigger_workspace_revisions_immutable
@@ -160,53 +168,128 @@ CREATE INDEX IF NOT EXISTS idx_workspace_nodes_project ON public.workspace_nodes
 CREATE INDEX IF NOT EXISTS idx_workspace_nodes_parent ON public.workspace_nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_revisions_node ON public.workspace_revisions(node_id, revision_number DESC);
 
--- 3. ATOMIC FILE CREATION (Single Transaction for Node + Revision 1)
+-- 3. DROP OBSOLETE & AMBIGUOUS FUNCTION OVERLOADS
+DROP FUNCTION IF EXISTS public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT);
+DROP FUNCTION IF EXISTS public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN);
+DROP FUNCTION IF EXISTS public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT);
+DROP FUNCTION IF EXISTS public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID);
+DROP FUNCTION IF EXISTS public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN);
+DROP FUNCTION IF EXISTS public.delete_workspace_node_atomic(UUID, UUID);
+DROP FUNCTION IF EXISTS public.delete_workspace_node_atomic(UUID, UUID, UUID);
+DROP FUNCTION IF EXISTS public.create_workspace_node_atomic(UUID, UUID, TEXT, workspace_node_type, TEXT, UUID, TEXT);
+DROP FUNCTION IF EXISTS public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT);
+DROP FUNCTION IF EXISTS public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT, TEXT);
+
+-- 4. SCHEMA-AGNOSTIC CRYPTOGRAPHIC HASH RESOLUTION HELPER
+CREATE OR REPLACE FUNCTION public.workspace_calculate_checksum(p_content TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_digest BYTEA;
+BEGIN
+    -- Check 'extensions' schema (standard Supabase managed setup)
+    IF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'extensions' AND p.proname = 'digest'
+    ) THEN
+        EXECUTE 'SELECT extensions.digest(pg_catalog.convert_to(pg_catalog.coalesce($1, ''''), ''UTF8''), ''sha256'')'
+        INTO v_digest USING p_content;
+        RETURN pg_catalog.encode(v_digest, 'hex');
+    -- Check 'public' schema (local/custom PostgreSQL setup)
+    ELSIF EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'public' AND p.proname = 'digest'
+    ) THEN
+        EXECUTE 'SELECT public.digest(pg_catalog.convert_to(pg_catalog.coalesce($1, ''''), ''UTF8''), ''sha256'')'
+        INTO v_digest USING p_content;
+        RETURN pg_catalog.encode(v_digest, 'hex');
+    ELSE
+        -- Fallback to pg_catalog.sha256 if available in PostgreSQL 14+
+        BEGIN
+            EXECUTE 'SELECT pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.coalesce($1, ''''), ''UTF8''))'
+            INTO v_digest USING p_content;
+            RETURN pg_catalog.encode(v_digest, 'hex');
+        EXCEPTION WHEN OTHERS THEN
+            RAISE EXCEPTION 'Cryptographic hash provider (pgcrypto) not found in extensions or public schema.';
+        END;
+    END IF;
+END;
+$$;
+
+-- 5. ATOMIC FILE & FOLDER CREATION (SECURITY DEFINER, search_path = '')
 CREATE OR REPLACE FUNCTION public.create_workspace_node_atomic(
     p_project_id UUID,
     p_parent_id UUID,
     p_name TEXT,
-    p_type workspace_node_type,
+    p_type public.workspace_node_type,
     p_initial_content TEXT,
     p_author_id UUID DEFAULT NULL,
-    p_author_name TEXT DEFAULT NULL
+    p_author_name TEXT DEFAULT NULL,
+    p_checksum TEXT DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = ''
 AS $$
 DECLARE
-    v_caller_id UUID := auth.uid();
+    v_auth_uid UUID;
+    v_jwt_role TEXT;
+    v_is_service_role BOOLEAN := FALSE;
+    v_caller_id UUID;
     v_author_name TEXT;
     v_parent public.workspace_nodes%ROWTYPE;
     v_parent_path TEXT := '';
     v_node_path TEXT;
     v_new_node public.workspace_nodes%ROWTYPE;
-    v_now TIMESTAMPTZ := timezone('utc'::text, now());
-    v_size INTEGER;
-    v_checksum TEXT;
+    v_now TIMESTAMPTZ := pg_catalog.timezone('utc'::text, pg_catalog.now());
+    v_size INTEGER := 0;
+    v_checksum TEXT := p_checksum;
     v_clean_name TEXT;
 BEGIN
-    -- Authenticate caller
-    IF v_caller_id IS NULL THEN
-        IF current_user = 'service_role' OR current_user = 'postgres' THEN
-            v_caller_id := p_author_id;
-        END IF;
+    -- Resolve trustworthy auth context
+    BEGIN
+        v_auth_uid := auth.uid();
+    EXCEPTION WHEN OTHERS THEN
+        v_auth_uid := NULL;
+    END;
+
+    BEGIN
+        v_jwt_role := pg_catalog.coalesce(
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_jwt_role := NULL;
+    END;
+
+    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+        v_is_service_role := TRUE;
     END IF;
 
-    IF v_caller_id IS NULL THEN
+    IF v_auth_uid IS NOT NULL THEN
+        IF p_author_id IS NOT NULL AND p_author_id <> v_auth_uid THEN
+            RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
+        END IF;
+        v_caller_id := v_auth_uid;
+    ELSIF v_is_service_role THEN
+        IF p_author_id IS NULL THEN
+            RAISE EXCEPTION 'Unauthorized: Author ID is required for service-role workspace operations.';
+        END IF;
+        v_caller_id := p_author_id;
+    ELSE
         RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
     END IF;
 
-    -- Prevent contributor impersonation
-    IF p_author_id IS NOT NULL AND p_author_id <> v_caller_id THEN
-        RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
-    END IF;
-
-    -- Resolve author name from profiles if available
+    -- Lookup author name from profiles if available
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
     IF v_author_name IS NULL OR v_author_name = '' THEN
-        v_author_name := COALESCE(p_author_name, 'Anonymous');
+        v_author_name := pg_catalog.coalesce(p_author_name, 'Anonymous');
     END IF;
 
     -- Verify project membership
@@ -214,12 +297,15 @@ BEGIN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
-    v_clean_name := trim(p_name);
-    IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR v_clean_name LIKE '%/%' OR v_clean_name LIKE '%\%' OR position(E'\0' in v_clean_name) > 0 THEN
+    v_clean_name := pg_catalog.trim(p_name);
+    IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR
+       pg_catalog.position('/' in v_clean_name) > 0 OR
+       pg_catalog.position('\' in v_clean_name) > 0 OR
+       pg_catalog.position(E'\0' in v_clean_name) > 0 THEN
         RAISE EXCEPTION 'Invalid file or folder name. Name cannot be empty or contain path separators.';
     END IF;
 
-    -- Validate parent if supplied
+    -- Validate parent folder if specified
     IF p_parent_id IS NOT NULL THEN
         SELECT * INTO v_parent
         FROM public.workspace_nodes
@@ -243,15 +329,19 @@ BEGIN
     END IF;
 
     IF p_type = 'file' THEN
-        v_size := octet_length(COALESCE(p_initial_content, ''));
+        v_size := pg_catalog.octet_length(pg_catalog.coalesce(p_initial_content, ''));
         IF v_size > 10 * 1024 * 1024 THEN
             RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
         END IF;
+        IF v_checksum IS NULL OR v_checksum = '' THEN
+            v_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_initial_content, ''));
+        END IF;
     ELSE
         v_size := 0;
+        v_checksum := NULL;
     END IF;
 
-    -- 1. Insert file node
+    -- 1. Insert workspace node
     INSERT INTO public.workspace_nodes (
         project_id,
         parent_id,
@@ -278,10 +368,8 @@ BEGIN
         v_now
     ) RETURNING * INTO v_new_node;
 
-    -- 2. If file, insert initial revision atomically in the SAME transaction
+    -- 2. If file, insert initial revision atomically in the same transaction
     IF p_type = 'file' THEN
-        v_checksum := encode(public.digest(COALESCE(p_initial_content, ''), 'sha256'), 'hex');
-
         INSERT INTO public.workspace_revisions (
             node_id,
             project_id,
@@ -295,7 +383,7 @@ BEGIN
             v_new_node.id,
             p_project_id,
             1,
-            COALESCE(p_initial_content, ''),
+            pg_catalog.coalesce(p_initial_content, ''),
             v_caller_id,
             v_author_name,
             v_checksum,
@@ -303,11 +391,11 @@ BEGIN
         );
     END IF;
 
-    RETURN to_jsonb(v_new_node);
+    RETURN pg_catalog.to_jsonb(v_new_node);
 END;
 $$;
 
--- 4. ATOMIC FILE SAVE WITH OPTIMISTIC CONCURRENCY CONTROL & AUTH VERIFICATION
+-- 6. ATOMIC FILE SAVE WITH OPTIMISTIC CONCURRENCY CONTROL (SECURITY DEFINER, search_path = '')
 CREATE OR REPLACE FUNCTION public.save_workspace_file_atomic(
     p_file_id UUID,
     p_content TEXT,
@@ -321,40 +409,61 @@ CREATE OR REPLACE FUNCTION public.save_workspace_file_atomic(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = ''
 AS $$
 DECLARE
-    v_caller_id UUID := auth.uid();
+    v_auth_uid UUID;
+    v_jwt_role TEXT;
+    v_is_service_role BOOLEAN := FALSE;
+    v_caller_id UUID;
     v_author_name TEXT;
     v_node public.workspace_nodes%ROWTYPE;
     v_next_rev INTEGER;
-    v_now TIMESTAMPTZ := timezone('utc'::text, now());
+    v_now TIMESTAMPTZ := pg_catalog.timezone('utc'::text, pg_catalog.now());
     v_content_size INTEGER;
     v_checksum TEXT := p_checksum;
 BEGIN
-    -- Authenticate caller
-    IF v_caller_id IS NULL THEN
-        IF current_user = 'service_role' OR current_user = 'postgres' THEN
-            v_caller_id := p_author_id;
-        END IF;
+    -- Resolve trustworthy auth context
+    BEGIN
+        v_auth_uid := auth.uid();
+    EXCEPTION WHEN OTHERS THEN
+        v_auth_uid := NULL;
+    END;
+
+    BEGIN
+        v_jwt_role := pg_catalog.coalesce(
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_jwt_role := NULL;
+    END;
+
+    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+        v_is_service_role := TRUE;
     END IF;
 
-    IF v_caller_id IS NULL THEN
+    IF v_auth_uid IS NOT NULL THEN
+        IF p_author_id IS NOT NULL AND p_author_id <> v_auth_uid THEN
+            RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
+        END IF;
+        v_caller_id := v_auth_uid;
+    ELSIF v_is_service_role THEN
+        IF p_author_id IS NULL THEN
+            RAISE EXCEPTION 'Unauthorized: Author ID is required for service-role workspace operations.';
+        END IF;
+        v_caller_id := p_author_id;
+    ELSE
         RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
     END IF;
 
-    -- Prevent contributor impersonation
-    IF p_author_id IS NOT NULL AND p_author_id <> v_caller_id THEN
-        RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
-    END IF;
-
-    -- Resolve author name from profiles if available
+    -- Lookup author name from profiles if available
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
     IF v_author_name IS NULL OR v_author_name = '' THEN
-        v_author_name := COALESCE(p_author_name, 'Anonymous');
+        v_author_name := pg_catalog.coalesce(p_author_name, 'Anonymous');
     END IF;
 
-    -- Row-level exclusive lock prevents concurrent race conditions
+    -- Row-level exclusive lock on file
     SELECT * INTO v_node
     FROM public.workspace_nodes
     WHERE id = p_file_id AND type = 'file' AND deleted_at IS NULL
@@ -369,7 +478,7 @@ BEGIN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
-    -- Verify target file belongs to requested project if supplied
+    -- Verify project isolation
     IF p_project_id IS NOT NULL AND v_node.project_id <> p_project_id THEN
         RAISE EXCEPTION 'Forbidden: File does not belong to the specified project.';
     END IF;
@@ -380,20 +489,20 @@ BEGIN
     END IF;
 
     IF p_base_revision IS NOT NULL AND v_node.current_revision <> p_base_revision THEN
-        RETURN jsonb_build_object(
+        RETURN pg_catalog.jsonb_build_object(
             'conflict', true,
             'currentRevision', v_node.current_revision,
-            'file', to_jsonb(v_node)
+            'file', pg_catalog.to_jsonb(v_node)
         );
     END IF;
 
-    v_content_size := octet_length(COALESCE(p_content, ''));
+    v_content_size := pg_catalog.octet_length(pg_catalog.coalesce(p_content, ''));
     IF v_content_size > 10 * 1024 * 1024 THEN
         RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
     END IF;
 
     IF v_checksum IS NULL OR v_checksum = '' THEN
-        v_checksum := encode(public.digest(COALESCE(p_content, ''), 'sha256'), 'hex');
+        v_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_content, ''));
     END IF;
 
     v_next_rev := v_node.current_revision + 1;
@@ -412,14 +521,14 @@ BEGIN
         p_file_id,
         v_node.project_id,
         v_next_rev,
-        COALESCE(p_content, ''),
+        pg_catalog.coalesce(p_content, ''),
         v_caller_id,
         v_author_name,
         v_checksum,
         v_now
     );
 
-    -- Atomically update file metadata
+    -- Update node metadata
     UPDATE public.workspace_nodes
     SET
         current_revision = v_next_rev,
@@ -430,15 +539,15 @@ BEGIN
     WHERE id = p_file_id
     RETURNING * INTO v_node;
 
-    RETURN jsonb_build_object(
+    RETURN pg_catalog.jsonb_build_object(
         'conflict', false,
         'currentRevision', v_next_rev,
-        'file', to_jsonb(v_node)
+        'file', pg_catalog.to_jsonb(v_node)
     );
 END;
 $$;
 
--- 5. ATOMIC FOLDER MOVE / RENAME WITH CYCLE PREVENTION AND PATH CASCADE
+-- 7. ATOMIC FOLDER MOVE / RENAME WITH WILDCARD-SAFE RECURSIVE TRAVERSAL (SECURITY DEFINER, search_path = '')
 CREATE OR REPLACE FUNCTION public.update_workspace_node_atomic(
     p_node_id UUID,
     p_name TEXT DEFAULT NULL,
@@ -451,10 +560,13 @@ CREATE OR REPLACE FUNCTION public.update_workspace_node_atomic(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = ''
 AS $$
 DECLARE
-    v_caller_id UUID := auth.uid();
+    v_auth_uid UUID;
+    v_jwt_role TEXT;
+    v_is_service_role BOOLEAN := FALSE;
+    v_caller_id UUID;
     v_author_name TEXT;
     v_node public.workspace_nodes%ROWTYPE;
     v_parent public.workspace_nodes%ROWTYPE;
@@ -462,27 +574,48 @@ DECLARE
     v_new_path TEXT;
     v_new_parent_id UUID;
     v_parent_path TEXT := '';
-    v_now TIMESTAMPTZ := timezone('utc'::text, now());
+    v_now TIMESTAMPTZ := pg_catalog.timezone('utc'::text, pg_catalog.now());
     v_clean_name TEXT;
     v_curr_parent UUID;
 BEGIN
-    IF v_caller_id IS NULL THEN
-        IF current_user = 'service_role' OR current_user = 'postgres' THEN
-            v_caller_id := p_author_id;
-        END IF;
+    -- Resolve trustworthy auth context
+    BEGIN
+        v_auth_uid := auth.uid();
+    EXCEPTION WHEN OTHERS THEN
+        v_auth_uid := NULL;
+    END;
+
+    BEGIN
+        v_jwt_role := pg_catalog.coalesce(
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_jwt_role := NULL;
+    END;
+
+    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+        v_is_service_role := TRUE;
     END IF;
 
-    IF v_caller_id IS NULL THEN
+    IF v_auth_uid IS NOT NULL THEN
+        IF p_author_id IS NOT NULL AND p_author_id <> v_auth_uid THEN
+            RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
+        END IF;
+        v_caller_id := v_auth_uid;
+    ELSIF v_is_service_role THEN
+        IF p_author_id IS NULL THEN
+            RAISE EXCEPTION 'Unauthorized: Author ID is required for service-role workspace operations.';
+        END IF;
+        v_caller_id := p_author_id;
+    ELSE
         RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
     END IF;
 
-    IF p_author_id IS NOT NULL AND p_author_id <> v_caller_id THEN
-        RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
-    END IF;
-
+    -- Lookup author name from profiles if available
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
     IF v_author_name IS NULL OR v_author_name = '' THEN
-        v_author_name := COALESCE(p_author_name, 'Anonymous');
+        v_author_name := pg_catalog.coalesce(p_author_name, 'Anonymous');
     END IF;
 
     SELECT * INTO v_node
@@ -503,13 +636,16 @@ BEGIN
     END IF;
 
     v_old_path := v_node.path;
-    v_clean_name := COALESCE(trim(p_name), v_node.name);
+    v_clean_name := pg_catalog.coalesce(pg_catalog.trim(p_name), v_node.name);
 
-    IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR v_clean_name LIKE '%/%' OR v_clean_name LIKE '%\%' OR position(E'\0' in v_clean_name) > 0 THEN
+    IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR
+       pg_catalog.position('/' in v_clean_name) > 0 OR
+       pg_catalog.position('\' in v_clean_name) > 0 OR
+       pg_catalog.position(E'\0' in v_clean_name) > 0 THEN
         RAISE EXCEPTION 'Invalid file or folder name. Name cannot be empty or contain path separators.';
     END IF;
 
-    -- Handle parent updates vs preserving existing parent (Task 1)
+    -- Handle parent updates vs preserving existing parent
     IF p_update_parent IS TRUE THEN
         IF p_parent_id IS NOT NULL THEN
             IF p_parent_id = p_node_id THEN
@@ -524,17 +660,16 @@ BEGIN
                 RAISE EXCEPTION 'Target parent folder not found or belongs to another project.';
             END IF;
 
+            -- Prevent directory cycles strictly by checking ancestor tree hierarchy (no LIKE)
             IF v_node.type = 'folder' THEN
-                IF v_parent.path = v_old_path OR v_parent.path LIKE (v_old_path || '/%') THEN
-                    RAISE EXCEPTION 'Cannot move a folder into one of its descendants.';
-                END IF;
-
-                v_curr_parent := v_parent.parent_id;
+                v_curr_parent := v_parent.id;
                 WHILE v_curr_parent IS NOT NULL LOOP
                     IF v_curr_parent = p_node_id THEN
                         RAISE EXCEPTION 'Cannot move a folder into one of its descendants.';
                     END IF;
-                    SELECT parent_id INTO v_curr_parent FROM public.workspace_nodes WHERE id = v_curr_parent AND deleted_at IS NULL;
+                    SELECT parent_id INTO v_curr_parent
+                    FROM public.workspace_nodes
+                    WHERE id = v_curr_parent AND deleted_at IS NULL;
                 END LOOP;
             END IF;
 
@@ -585,21 +720,32 @@ BEGIN
     WHERE id = p_node_id
     RETURNING * INTO v_node;
 
-    -- If folder, update descendant paths consistently
+    -- If folder, update descendant paths using WILDCARD-SAFE RECURSIVE CTE (no LIKE patterns)
     IF v_node.type = 'folder' AND v_old_path <> v_new_path THEN
+        WITH RECURSIVE descendants AS (
+            SELECT id, 1 AS depth
+            FROM public.workspace_nodes
+            WHERE parent_id = p_node_id
+              AND project_id = v_node.project_id
+              AND deleted_at IS NULL
+            UNION ALL
+            SELECT c.id, d.depth + 1
+            FROM public.workspace_nodes c
+            JOIN descendants d ON c.parent_id = d.id
+            WHERE c.project_id = v_node.project_id
+              AND c.deleted_at IS NULL
+        )
         UPDATE public.workspace_nodes
-        SET path = v_new_path || substring(path from length(v_old_path) + 1),
+        SET path = v_new_path || pg_catalog.substring(path from (pg_catalog.length(v_old_path) + 1)),
             updated_at = v_now
-        WHERE project_id = v_node.project_id
-          AND deleted_at IS NULL
-          AND path LIKE (v_old_path || '/%');
+        WHERE id IN (SELECT id FROM descendants);
     END IF;
 
-    RETURN to_jsonb(v_node);
+    RETURN pg_catalog.to_jsonb(v_node);
 END;
 $$;
 
--- 6. ATOMIC FOLDER & FILE DELETION (Soft-deletes target & all descendants in one transaction)
+-- 8. ATOMIC FOLDER & FILE DELETION WITH WILDCARD-SAFE RECURSIVE TRAVERSAL (SECURITY DEFINER, search_path = '')
 CREATE OR REPLACE FUNCTION public.delete_workspace_node_atomic(
     p_node_id UUID,
     p_author_id UUID DEFAULT NULL,
@@ -608,13 +754,16 @@ CREATE OR REPLACE FUNCTION public.delete_workspace_node_atomic(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = ''
 AS $$
 DECLARE
-    v_caller_id UUID := auth.uid();
-    v_node public.workspace_nodes%ROWTYPE;
+    v_auth_uid UUID;
+    v_jwt_role TEXT;
+    v_is_service_role BOOLEAN := FALSE;
+    v_caller_id UUID;
     v_author_name TEXT;
-    v_now TIMESTAMPTZ := timezone('utc'::text, now());
+    v_node public.workspace_nodes%ROWTYPE;
+    v_now TIMESTAMPTZ := pg_catalog.timezone('utc'::text, pg_catalog.now());
 BEGIN
     SELECT * INTO v_node
     FROM public.workspace_nodes
@@ -622,19 +771,38 @@ BEGIN
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        RETURN jsonb_build_object('success', false);
+        RETURN pg_catalog.jsonb_build_object('success', false);
     END IF;
 
-    IF v_caller_id IS NULL THEN
-        IF current_user = 'service_role' OR current_user = 'postgres' THEN
-            v_caller_id := COALESCE(p_author_id, v_node.last_modified_by);
-        ELSE
-            RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
+    -- Resolve trustworthy auth context
+    BEGIN
+        v_auth_uid := auth.uid();
+    EXCEPTION WHEN OTHERS THEN
+        v_auth_uid := NULL;
+    END;
+
+    BEGIN
+        v_jwt_role := pg_catalog.coalesce(
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        );
+    EXCEPTION WHEN OTHERS THEN
+        v_jwt_role := NULL;
+    END;
+
+    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+        v_is_service_role := TRUE;
+    END IF;
+
+    IF v_auth_uid IS NOT NULL THEN
+        IF p_author_id IS NOT NULL AND p_author_id <> v_auth_uid THEN
+            RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
         END IF;
-    END IF;
-
-    IF p_author_id IS NOT NULL AND p_author_id <> v_caller_id THEN
-        RAISE EXCEPTION 'Forbidden: Impersonation of other contributors is not permitted.';
+        v_caller_id := v_auth_uid;
+    ELSIF v_is_service_role THEN
+        v_caller_id := pg_catalog.coalesce(p_author_id, v_node.last_modified_by);
+    ELSE
+        RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
     END IF;
 
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
@@ -658,39 +826,50 @@ BEGIN
         updated_at = v_now
     WHERE id = p_node_id;
 
-    -- If folder, soft delete all descendants in the same transaction
+    -- If folder, soft delete all descendants using WILDCARD-SAFE RECURSIVE CTE (no LIKE patterns)
     IF v_node.type = 'folder' THEN
+        WITH RECURSIVE descendants AS (
+            SELECT id
+            FROM public.workspace_nodes
+            WHERE parent_id = p_node_id
+              AND project_id = v_node.project_id
+              AND deleted_at IS NULL
+            UNION ALL
+            SELECT c.id
+            FROM public.workspace_nodes c
+            JOIN descendants d ON c.parent_id = d.id
+            WHERE c.project_id = v_node.project_id
+              AND c.deleted_at IS NULL
+        )
         UPDATE public.workspace_nodes
         SET deleted_at = v_now,
             last_modified_by = v_caller_id,
             last_modified_name = v_author_name,
             updated_at = v_now
-        WHERE project_id = v_node.project_id
-          AND deleted_at IS NULL
-          AND path LIKE (v_node.path || '/%');
+        WHERE id IN (SELECT id FROM descendants);
     END IF;
 
-    RETURN jsonb_build_object('success', true);
+    RETURN pg_catalog.jsonb_build_object('success', true);
 END;
 $$;
 
--- 7. EXPLICIT PRIVILEGE RESTRICTIONS (Principle of Least Privilege)
-REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) FROM anon;
-GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT) TO service_role;
+-- 9. EXPLICIT PRIVILEGE RESTRICTIONS
+REVOKE ALL ON FUNCTION public.workspace_calculate_checksum(TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.workspace_calculate_checksum(TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.workspace_calculate_checksum(TEXT) TO authenticated, service_role;
+
+REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.create_workspace_node_atomic(UUID, UUID, TEXT, public.workspace_node_type, TEXT, UUID, TEXT, TEXT) TO authenticated, service_role;
 
 REVOKE ALL ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) FROM anon;
-GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) TO service_role;
+GRANT EXECUTE ON FUNCTION public.save_workspace_file_atomic(UUID, TEXT, INTEGER, UUID, TEXT, TEXT, UUID, BOOLEAN) TO authenticated, service_role;
 
 REVOKE ALL ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) FROM anon;
-GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) TO service_role;
+GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT, UUID, BOOLEAN) TO authenticated, service_role;
 
 REVOKE ALL ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) FROM anon;
-GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) TO authenticated;
-GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic(UUID, UUID, UUID) TO authenticated, service_role;

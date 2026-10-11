@@ -6,14 +6,14 @@ export async function POST(
   request: NextRequest,
   { params }: { params: { id: string; fileId: string } }
 ) {
+  const { id: projectId, fileId } = params;
+  const db = getDatabaseAdapter();
+
   try {
     const user = await getCurrentUserFromRequest(request);
     if (!user) {
       return NextResponse.json({ error: 'Unauthorized. Please sign in.' }, { status: 401 });
     }
-
-    const { id: projectId, fileId } = params;
-    const db = getDatabaseAdapter();
 
     const isMember = await db.isProjectMember(projectId, user.id);
     if (!isMember) {
@@ -32,7 +32,7 @@ export async function POST(
       return NextResponse.json({ error: 'Malformed JSON payload.' }, { status: 400 });
     }
 
-    const { revisionNumber, baseRevision } = body || {};
+    const { revisionNumber, baseRevision, forceOverwrite } = body || {};
 
     if (
       revisionNumber === undefined ||
@@ -46,7 +46,19 @@ export async function POST(
       );
     }
 
-    if (
+    if (!forceOverwrite) {
+      if (
+        baseRevision === undefined ||
+        typeof baseRevision !== 'number' ||
+        !Number.isInteger(baseRevision) ||
+        baseRevision < 1
+      ) {
+        return NextResponse.json(
+          { error: 'Concurrency check required: Valid positive integer baseRevision is required for workspace restoration.' },
+          { status: 400 }
+        );
+      }
+    } else if (
       baseRevision !== undefined &&
       (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
     ) {
@@ -61,15 +73,29 @@ export async function POST(
       revisionNumber,
       user.id,
       user.name,
-      baseRevision
+      baseRevision,
+      Boolean(forceOverwrite)
     );
 
     return NextResponse.json({ file: restoredFile });
   } catch (err: any) {
     const isConflict = err.message?.includes('Conflict');
     const status = isConflict ? 409 : 400;
+    let currentRevision: number | undefined;
+    if (isConflict) {
+      try {
+        const currentFile = await db.getWorkspaceFile(fileId);
+        currentRevision = currentFile?.current_revision;
+      } catch {
+        // ignore
+      }
+    }
     return NextResponse.json(
-      { error: err.message || 'Failed to restore revision.', conflict: isConflict },
+      {
+        error: err.message || 'Failed to restore revision.',
+        conflict: isConflict,
+        ...(currentRevision !== undefined ? { currentRevision } : {}),
+      },
       { status }
     );
   }

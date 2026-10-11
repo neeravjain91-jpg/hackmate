@@ -578,6 +578,10 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       throw new Error('File content exceeds the maximum size limit of 10MB.');
     }
 
+    const checksum = input.type === 'file'
+      ? crypto.createHash('sha256').update(input.initialContent ?? '').digest('hex')
+      : null;
+
     const { data, error } = await this.client.rpc('create_workspace_node_atomic', {
       p_project_id: input.project_id,
       p_parent_id: input.parent_id || null,
@@ -586,6 +590,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       p_initial_content: input.initialContent ?? '',
       p_author_id: input.author_id,
       p_author_name: input.author_name,
+      p_checksum: checksum,
     });
 
     if (error || !data) {
@@ -739,7 +744,8 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     targetRevisionNumber: number,
     author_id: string,
     author_name: string,
-    baseRevision?: number
+    baseRevision?: number,
+    forceOverwrite?: boolean
   ): Promise<WorkspaceFileDetail> {
     if (
       typeof targetRevisionNumber !== 'number' ||
@@ -747,6 +753,10 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       targetRevisionNumber < 1
     ) {
       throw new Error('Invalid target revision number. Must be a positive integer.');
+    }
+
+    if (!forceOverwrite && (baseRevision === undefined || typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)) {
+      throw new Error('Concurrency check required: baseRevision must be specified for workspace restoration.');
     }
 
     if (
@@ -759,7 +769,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     const node = await this.getWorkspaceNode(fileId);
     if (!node || node.type !== 'file') throw new Error('Workspace file not found.');
 
-    if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+    if (!forceOverwrite && baseRevision !== undefined && node.current_revision !== baseRevision) {
       throw new Error(`Conflict: File has been updated to revision ${node.current_revision} by another teammate.`);
     }
 
@@ -780,7 +790,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       baseRevision,
       author_id,
       `${author_name} (Restored Rev #${targetRevisionNumber})`,
-      baseRevision === undefined ? true : false
+      forceOverwrite ?? false
     );
 
     if (saved.conflict) {

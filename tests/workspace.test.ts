@@ -135,7 +135,7 @@ describe('Milestone: Common Development Workspace — Acceptance Test Suite', ()
     expect(revisions[2].revision_number).toBe(1);
 
     // Restore Rev 1 -> creates Rev 4 with Rev 1 content
-    const restored = await db.restoreWorkspaceRevision(file.id, 1, alice.id, alice.name);
+    const restored = await db.restoreWorkspaceRevision(file.id, 1, alice.id, alice.name, 3);
     expect(restored.current_revision).toBe(4);
     expect(restored.content).toBe('{"version": 1}');
 
