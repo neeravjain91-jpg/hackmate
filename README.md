@@ -143,7 +143,7 @@ AUTH_SECRET=hackmate-local-session-secret-change-in-production
 ```
 
 > [!NOTE]
-> For production deployments (`NODE_ENV=production`), `AUTH_SECRET` must be at least 32 bytes and cannot use default or placeholder values. Generate a cryptographically secure random secret using:
+> For production deployments (`NODE_ENV=production`), `AUTH_SECRET` must be at least 32 bytes and cannot use default, placeholder, single-character, or predictable repeating patterns. Note that string validation enforces minimum length and rejects obvious weak patterns but cannot prove cryptographic entropy; operators must generate a cryptographically random secret using:
 > ```bash
 > openssl rand -base64 32
 > ```
@@ -185,30 +185,33 @@ HackMate defaults to the zero-config **Local Persistent Driver** (`STORAGE_DRIVE
 If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=supabase`):
 
 > [!IMPORTANT]
-> The database migrations **must be applied sequentially in the exact order below** via the Supabase SQL Editor (or Supabase CLI) before using the Common Development Workspace. The final migration contains critical database security and atomic RPC hardening; omitting migrations or applying them out of order will leave a deployment without the complete workspace schema and required security functions.
+> The database migrations **must be applied sequentially in the exact order below** before using the Common Development Workspace with Supabase. The final migration contains critical database security policies and atomic stored procedures. Omitting migrations or applying them out of order will leave a deployment without the complete workspace schema and required security functions.
 
 1. **Create Supabase Project & Storage Bucket**:
    - Create a new project at [https://supabase.com](https://supabase.com).
-   - In Supabase Storage, create a private bucket named `hackmate-contributions`.
+   - In the Supabase Storage dashboard, create a private bucket named `hackmate-contributions`.
 
-2. **Apply Database Migrations (in exact sequential order)**:
-   - **Step 1 — Initial HackMate database schema**:
-     ```bash
-     supabase/migrations/20241010_init_hackmate.sql
-     ```
+2. **Execute Database Migrations in the Supabase SQL Editor**:
+   In your browser, open the Supabase dashboard for your project, navigate to the **SQL Editor**, and execute the full contents of each file in this exact sequential order:
+
+   * **Step 1 — Initial HackMate database schema**:
+     Open [`supabase/migrations/20241010_init_hackmate.sql`](supabase/migrations/20241010_init_hackmate.sql), copy its SQL contents, and run them in the SQL Editor.  
      Provisions foundational schemas (`users`, `projects`, `project_members`, `tasks`, `contributions`, `contribution_files`), membership triggers, storage metadata, and Row Level Security (RLS) policies.
 
-   - **Step 2 — Common Development Workspace schema**:
-     ```bash
-     supabase/migrations/20241011_add_workspace.sql
-     ```
+   * **Step 2 — Common Development Workspace schema**:
+     Open [`supabase/migrations/20241011_add_workspace.sql`](supabase/migrations/20241011_add_workspace.sql), copy its SQL contents, and run them in the SQL Editor.  
      Creates hierarchical workspace file tree nodes (`workspace_nodes`), immutable file revisions (`workspace_revisions`), and project workspace constraints.
 
-   - **Step 3 — Workspace security and atomic RPC hardening**:
-     ```bash
-     supabase/migrations/20241012_harden_workspace_security_and_rpc.sql
-     ```
-     Applies critical security hardening and atomic stored procedures (`create_workspace_node_atomic`, `save_workspace_file_atomic`, `restore_workspace_file_atomic`) with transaction isolation, advisory concurrency locking, checksum validation, project membership verification, and hardened RLS policies.
+   * **Step 3 — Workspace security and atomic RPC hardening**:
+     Open [`supabase/migrations/20241012_harden_workspace_security_and_rpc.sql`](supabase/migrations/20241012_harden_workspace_security_and_rpc.sql), copy its SQL contents, and run them in the SQL Editor.  
+     Defines the hardened workspace database functions:
+     * `workspace_calculate_checksum(p_content TEXT)` — SHA-256 content digest verification.
+     * `create_workspace_node_atomic(...)` — Atomic file/folder node creation with path validation and initial revision generation.
+     * `save_workspace_file_atomic(...)` — Atomic file saving with row-level locking (`SELECT ... FOR UPDATE` on `workspace_nodes`), optimistic concurrency control (`p_base_revision`), and revision insertion.
+     * `update_workspace_node_atomic(...)` — Atomic node rename and recursive path propagation.
+     * `delete_workspace_node_atomic(...)` — Atomic soft deletion with recursive descendant traversal.
+
+     *(Note: File revision restoration is handled at the application adapter level: `SupabaseDatabaseAdapter.restoreWorkspaceRevision()` retrieves the historical revision from `workspace_revisions` and calls `saveWorkspaceFile()`, which executes `save_workspace_file_atomic` to create a new revision non-destructively.)*
 
 3. **Configure Environment Variables in `.env.local`**:
    ```env
@@ -219,6 +222,7 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
    SUPABASE_STORAGE_BUCKET=hackmate-contributions
 
    # Production Authentication Secret (minimum 32 bytes)
+   # Must be a cryptographically random secret; string validation rejects short, placeholder, and repeating patterns.
    # Generate using: openssl rand -base64 32
    AUTH_SECRET=<your-production-auth-secret>
    ```

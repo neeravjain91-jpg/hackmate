@@ -30,15 +30,88 @@ const KNOWN_PLACEHOLDER_SECRETS: readonly string[] = [
 ];
 
 /**
+ * Known weak base words that must not be repeated or used as trivial secrets.
+ */
+const KNOWN_WEAK_WORDS: readonly string[] = [
+  'password',
+  'secret',
+  'admin',
+  'hackmate',
+  'changeme',
+  'qwerty',
+  '12345678',
+  'test',
+  'letmein',
+  'default',
+];
+
+/**
+ * Checks for obvious low-complexity patterns:
+ * 1. Single repeated character across the entire secret (e.g. "!" x 32, "a" x 32).
+ * 2. Entire secret formed by repeating a known weak word (e.g. "password" x 4, with or without delimiters).
+ * 3. Obvious repetition of a short predictable unit (period 1..16 characters repeating across the entire secret).
+ */
+function isLowComplexitySecret(str: string): boolean {
+  // 1. Secret made entirely from the same repeated character
+  if (new Set(str).size <= 1) {
+    return true;
+  }
+
+  // 2. Secret formed by repeating a known weak word (case-insensitive, ignoring common delimiters)
+  const normalized = str.toLowerCase().replace(/[-_.\s]/g, '');
+  for (const word of KNOWN_WEAK_WORDS) {
+    const regex = new RegExp(`^(?:${word})+$`, 'i');
+    if (regex.test(normalized)) {
+      return true;
+    }
+  }
+
+  // 3. Obvious periodic repetition of short chunks (chunk size 1 to 16)
+  const len = str.length;
+  for (let period = 1; period <= 16; period++) {
+    if (len >= period * 2) {
+      const unit = str.slice(0, period);
+      const repetitions = Math.floor(len / period);
+      const remainder = str.slice(repetitions * period);
+      if (unit.repeat(repetitions) + unit.slice(0, remainder.length) === str) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Rejects specific placeholder phrases without using an overly broad substring
+ * blacklist that could reject valid random tokens.
+ */
+function isKnownPlaceholder(str: string): boolean {
+  if (KNOWN_PLACEHOLDER_SECRETS.includes(str)) {
+    return true;
+  }
+  const lower = str.toLowerCase();
+  return (
+    lower.includes('change-in-production') ||
+    lower.includes('change-this-in-production') ||
+    lower.includes('your-super-secret') ||
+    lower.includes('placeholder')
+  );
+}
+
+/**
  * Retrieves and validates the authentication secret used for HMAC-SHA256 session tokens.
  *
- * Requirements:
- * - Production (`NODE_ENV === 'production'`) requires an explicitly set, non-empty secret.
- * - Production secrets must be at least 32 bytes (`Buffer.byteLength(secret, 'utf8') >= 32`).
- * - Production rejects default development, placeholder, and example secrets.
- * - Production fails closed immediately rather than falling back to the development secret.
- * - Secret values or substrings are never logged or leaked in error messages.
- * - Local development remains zero-config and functional with the default development secret.
+ * Security Model & Guarantees:
+ * - String validation alone cannot prove cryptographic entropy. The actual guarantee
+ *   provided by this validator is strict minimum-length enforcement (>= 32 bytes)
+ *   combined with active rejection of known weak, placeholder, single-character, and
+ *   predictable repeating patterns.
+ * - The operator must still generate a cryptographically random secret (e.g., using `openssl rand -base64 32`).
+ * - In production (`NODE_ENV === 'production'`), validation fails closed immediately rather than
+ *   falling back to development secrets.
+ * - Secret values or substrings are never logged or included in thrown error messages.
+ * - Local development and test environments remain zero-config with the default development secret.
  *
  * To generate a cryptographically secure random 32-byte secret for production:
  * ```bash
@@ -57,18 +130,8 @@ export function getAuthSecret(): string {
     }
 
     const trimmed = secret.trim();
-    const lower = trimmed.toLowerCase();
 
-    const isPlaceholder =
-      KNOWN_PLACEHOLDER_SECRETS.includes(trimmed) ||
-      lower.includes('change-in-production') ||
-      lower.includes('change-this-in-production') ||
-      lower.includes('your-super-secret') ||
-      lower.includes('placeholder') ||
-      lower === 'secret' ||
-      lower === 'password';
-
-    if (isPlaceholder) {
+    if (isKnownPlaceholder(trimmed)) {
       throw new Error(
         'SECURITY VIOLATION: AUTH_SECRET cannot use default, placeholder, or example secrets in production. Generate a strong secret of at least 32 bytes using: openssl rand -base64 32'
       );
@@ -80,6 +143,12 @@ export function getAuthSecret(): string {
       );
     }
 
+    if (isLowComplexitySecret(trimmed)) {
+      throw new Error(
+        'SECURITY VIOLATION: AUTH_SECRET contains an obvious weak, repeated, or predictable pattern. Operators must configure a cryptographically random secret of at least 32 bytes (e.g. openssl rand -base64 32).'
+      );
+    }
+
     return trimmed;
   }
 
@@ -87,6 +156,7 @@ export function getAuthSecret(): string {
     ? secret.trim()
     : DEFAULT_DEV_AUTH_SECRET;
 }
+
 
 
 export function createSessionToken(userId: string): string {
