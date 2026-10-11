@@ -41,6 +41,8 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     delete process.env.DATABASE_URL;
     delete process.env.TEST_DATABASE_URL;
     delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
+    delete process.env.PGHOST;
+    delete process.env.PGPORT;
   });
 
   afterEach(() => {
