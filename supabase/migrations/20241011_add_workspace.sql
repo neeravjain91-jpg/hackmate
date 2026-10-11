@@ -196,7 +196,7 @@ BEGIN
         JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
         WHERE n.nspname = 'extensions' AND p.proname = 'digest'
     ) THEN
-        EXECUTE 'SELECT extensions.digest(pg_catalog.convert_to(pg_catalog.coalesce($1, ''''), ''UTF8''), ''sha256'')'
+        EXECUTE 'SELECT extensions.digest(pg_catalog.convert_to(COALESCE($1, ''''), ''UTF8''), ''sha256'')'
         INTO v_digest USING p_content;
         RETURN pg_catalog.encode(v_digest, 'hex');
     -- Check 'public' schema (local/custom PostgreSQL setup)
@@ -205,13 +205,13 @@ BEGIN
         JOIN pg_catalog.pg_namespace n ON p.pronamespace = n.oid
         WHERE n.nspname = 'public' AND p.proname = 'digest'
     ) THEN
-        EXECUTE 'SELECT public.digest(pg_catalog.convert_to(pg_catalog.coalesce($1, ''''), ''UTF8''), ''sha256'')'
+        EXECUTE 'SELECT public.digest(pg_catalog.convert_to(COALESCE($1, ''''), ''UTF8''), ''sha256'')'
         INTO v_digest USING p_content;
         RETURN pg_catalog.encode(v_digest, 'hex');
     ELSE
         -- Fallback to pg_catalog.sha256 if available in PostgreSQL 14+
         BEGIN
-            EXECUTE 'SELECT pg_catalog.sha256(pg_catalog.convert_to(pg_catalog.coalesce($1, ''''), ''UTF8''))'
+            EXECUTE 'SELECT pg_catalog.sha256(pg_catalog.convert_to(COALESCE($1, ''''), ''UTF8''))'
             INTO v_digest USING p_content;
             RETURN pg_catalog.encode(v_digest, 'hex');
         EXCEPTION WHEN OTHERS THEN
@@ -261,9 +261,9 @@ BEGIN
     END;
 
     BEGIN
-        v_jwt_role := pg_catalog.coalesce(
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        v_jwt_role := COALESCE(
+            NULLIF(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
         );
     EXCEPTION WHEN OTHERS THEN
         v_jwt_role := NULL;
@@ -290,7 +290,7 @@ BEGIN
     -- Lookup author name from profiles if available
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
     IF v_author_name IS NULL OR v_author_name = '' THEN
-        v_author_name := pg_catalog.coalesce(p_author_name, 'Anonymous');
+        v_author_name := COALESCE(p_author_name, 'Anonymous');
     END IF;
 
     -- Verify project membership
@@ -298,7 +298,7 @@ BEGIN
         RAISE EXCEPTION 'Forbidden: You are not an authorized member of this project.';
     END IF;
 
-    v_clean_name := pg_catalog.trim(p_name);
+    v_clean_name := pg_catalog.btrim(p_name);
     -- Filenames cannot be empty, '.' or '..', or contain forward or backward slashes.
     -- PostgreSQL text types cannot store NUL (0x00) bytes; backslashes (including literal \0) are rejected via chr(92).
     IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR
@@ -331,15 +331,15 @@ BEGIN
     END IF;
 
     IF p_type = 'file' THEN
-        v_size := pg_catalog.octet_length(pg_catalog.coalesce(p_initial_content, ''));
+        v_size := pg_catalog.octet_length(COALESCE(p_initial_content, ''));
         IF v_size > 10 * 1024 * 1024 THEN
             RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
         END IF;
 
         -- Authoritative checksum computation and integrity verification
-        v_computed_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_initial_content, ''));
-        IF p_checksum IS NOT NULL AND pg_catalog.trim(p_checksum) <> '' THEN
-            IF pg_catalog.lower(pg_catalog.trim(p_checksum)) <> v_computed_checksum THEN
+        v_computed_checksum := public.workspace_calculate_checksum(COALESCE(p_initial_content, ''));
+        IF p_checksum IS NOT NULL AND pg_catalog.btrim(p_checksum) <> '' THEN
+            IF pg_catalog.lower(pg_catalog.btrim(p_checksum)) <> v_computed_checksum THEN
                 RAISE EXCEPTION 'Checksum mismatch: Supplied checksum does not match computed content hash.';
             END IF;
         END IF;
@@ -391,7 +391,7 @@ BEGIN
             v_new_node.id,
             p_project_id,
             1,
-            pg_catalog.coalesce(p_initial_content, ''),
+            COALESCE(p_initial_content, ''),
             v_caller_id,
             v_author_name,
             v_checksum,
@@ -440,9 +440,9 @@ BEGIN
     END;
 
     BEGIN
-        v_jwt_role := pg_catalog.coalesce(
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        v_jwt_role := COALESCE(
+            NULLIF(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
         );
     EXCEPTION WHEN OTHERS THEN
         v_jwt_role := NULL;
@@ -469,7 +469,7 @@ BEGIN
     -- Lookup author name from profiles if available
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
     IF v_author_name IS NULL OR v_author_name = '' THEN
-        v_author_name := pg_catalog.coalesce(p_author_name, 'Anonymous');
+        v_author_name := COALESCE(p_author_name, 'Anonymous');
     END IF;
 
     -- Row-level exclusive lock on file
@@ -505,15 +505,15 @@ BEGIN
         );
     END IF;
 
-    v_content_size := pg_catalog.octet_length(pg_catalog.coalesce(p_content, ''));
+    v_content_size := pg_catalog.octet_length(COALESCE(p_content, ''));
     IF v_content_size > 10 * 1024 * 1024 THEN
         RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
     END IF;
 
     -- Authoritative checksum computation and integrity verification
-    v_computed_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_content, ''));
-    IF p_checksum IS NOT NULL AND pg_catalog.trim(p_checksum) <> '' THEN
-        IF pg_catalog.lower(pg_catalog.trim(p_checksum)) <> v_computed_checksum THEN
+    v_computed_checksum := public.workspace_calculate_checksum(COALESCE(p_content, ''));
+    IF p_checksum IS NOT NULL AND pg_catalog.btrim(p_checksum) <> '' THEN
+        IF pg_catalog.lower(pg_catalog.btrim(p_checksum)) <> v_computed_checksum THEN
             RAISE EXCEPTION 'Checksum mismatch: Supplied checksum does not match computed content hash.';
         END IF;
     END IF;
@@ -535,7 +535,7 @@ BEGIN
         p_file_id,
         v_node.project_id,
         v_next_rev,
-        pg_catalog.coalesce(p_content, ''),
+        COALESCE(p_content, ''),
         v_caller_id,
         v_author_name,
         v_checksum,
@@ -600,9 +600,9 @@ BEGIN
     END;
 
     BEGIN
-        v_jwt_role := pg_catalog.coalesce(
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        v_jwt_role := COALESCE(
+            NULLIF(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
         );
     EXCEPTION WHEN OTHERS THEN
         v_jwt_role := NULL;
@@ -629,7 +629,7 @@ BEGIN
     -- Lookup author name from profiles if available
     SELECT name INTO v_author_name FROM public.profiles WHERE id = v_caller_id;
     IF v_author_name IS NULL OR v_author_name = '' THEN
-        v_author_name := pg_catalog.coalesce(p_author_name, 'Anonymous');
+        v_author_name := COALESCE(p_author_name, 'Anonymous');
     END IF;
 
     SELECT * INTO v_node
@@ -650,7 +650,7 @@ BEGIN
     END IF;
 
     v_old_path := v_node.path;
-    v_clean_name := pg_catalog.coalesce(pg_catalog.trim(p_name), v_node.name);
+    v_clean_name := COALESCE(pg_catalog.btrim(p_name), v_node.name);
 
     -- Filenames cannot be empty, '.' or '..', or contain forward or backward slashes.
     -- PostgreSQL text types cannot store NUL (0x00) bytes; backslashes (including literal \0) are rejected via chr(92).
@@ -751,7 +751,7 @@ BEGIN
               AND c.deleted_at IS NULL
         )
         UPDATE public.workspace_nodes
-        SET path = v_new_path || pg_catalog.substring(path from (pg_catalog.length(v_old_path) + 1)),
+        SET path = v_new_path || pg_catalog.substr(path, (pg_catalog.length(v_old_path) + 1)),
             updated_at = v_now
         WHERE id IN (SELECT id FROM descendants);
     END IF;
@@ -797,9 +797,9 @@ BEGIN
     END;
 
     BEGIN
-        v_jwt_role := pg_catalog.coalesce(
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
-            pg_catalog.nullif(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+        v_jwt_role := COALESCE(
+            NULLIF(pg_catalog.current_setting('request.jwt.claim.role', true), ''),
+            NULLIF(pg_catalog.current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
         );
     EXCEPTION WHEN OTHERS THEN
         v_jwt_role := NULL;
@@ -815,7 +815,7 @@ BEGIN
         END IF;
         v_caller_id := v_auth_uid;
     ELSIF v_is_service_role THEN
-        v_caller_id := pg_catalog.coalesce(p_author_id, v_node.last_modified_by);
+        v_caller_id := COALESCE(p_author_id, v_node.last_modified_by);
     ELSE
         RAISE EXCEPTION 'Unauthorized: Authenticated user required.';
     END IF;

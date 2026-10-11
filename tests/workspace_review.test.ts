@@ -2164,4 +2164,215 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       });
     });
   });
+
+  // =========================================================================
+  // AREA N: SQL Special-Form Audit & Comprehensive Lifecycle Verification
+  // =========================================================================
+  describe('Area N: SQL Special-Form Audit & Comprehensive Lifecycle Verification', () => {
+    describe('[Static Migration SQL Audit]', () => {
+      it('both migrations completely eliminate schema-qualified special forms and dynamic SQL calls', () => {
+        const migrations = [
+          path.join(process.cwd(), 'supabase', 'migrations', '20241011_add_workspace.sql'),
+          path.join(process.cwd(), 'supabase', 'migrations', '20241012_harden_workspace_security_and_rpc.sql'),
+        ];
+
+        for (const migPath of migrations) {
+          expect(fs.existsSync(migPath)).toBe(true);
+          const sql = fs.readFileSync(migPath, 'utf-8');
+
+          // Prohibited special forms:
+          expect(sql).not.toMatch(/pg_catalog\.coalesce\b/i);
+          expect(sql).not.toMatch(/pg_catalog\.nullif\b/i);
+          expect(sql).not.toMatch(/pg_catalog\.trim\b/i);
+          expect(sql).not.toMatch(/pg_catalog\.substring\b/i);
+          expect(sql).not.toMatch(/pg_catalog\.position\b/i);
+
+          // Allowed and required replacements:
+          expect(sql).toMatch(/\bCOALESCE\s*\(/);
+          expect(sql).toMatch(/\bNULLIF\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.btrim\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.substr\s*\(/);
+
+          // Valid ordinary functions must still be explicitly schema-qualified where appropriate:
+          expect(sql).toMatch(/pg_catalog\.length\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.lower\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.octet_length\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.encode\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.to_jsonb\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.jsonb_build_object\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.timezone\s*\(/);
+          expect(sql).toMatch(/pg_catalog\.now\s*\(/);
+        }
+      });
+    });
+
+    describe('[Observable JWT Identity & Role Claims Simulation]', () => {
+      it('correctly simulates COALESCE and NULLIF precedence for JWT claim resolution', () => {
+        const simulateJwtRoleExtraction = (
+          directClaimRole: string | null | undefined,
+          claimsJsonStr: string | null | undefined
+        ): string | null => {
+          // Emulates:
+          // COALESCE(
+          //     NULLIF(current_setting('request.jwt.claim.role', true), ''),
+          //     NULLIF(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+          // )
+          const nullif = (val: string | null | undefined): string | null => {
+            if (val === null || val === undefined || val === '') return null;
+            return val;
+          };
+
+          const fromDirect = nullif(directClaimRole);
+          if (fromDirect !== null) {
+            return fromDirect;
+          }
+
+          const fromJson = nullif(claimsJsonStr);
+          if (fromJson !== null) {
+            try {
+              const parsed = JSON.parse(fromJson);
+              if (parsed && typeof parsed.role === 'string' && parsed.role !== '') {
+                return parsed.role;
+              }
+            } catch {
+              return null;
+            }
+          }
+
+          return null;
+        };
+
+        // 1. Direct claim present
+        expect(simulateJwtRoleExtraction('service_role', '{"role":"authenticated"}')).toBe('service_role');
+        expect(simulateJwtRoleExtraction('authenticated', null)).toBe('authenticated');
+
+        // 2. Direct claim empty string -> falls back to claims JSON
+        expect(simulateJwtRoleExtraction('', '{"role":"service_role"}')).toBe('service_role');
+
+        // 3. Direct claim null/undefined -> falls back to claims JSON
+        expect(simulateJwtRoleExtraction(null, '{"role":"service_role"}')).toBe('service_role');
+        expect(simulateJwtRoleExtraction(undefined, '{"role":"editor"}')).toBe('editor');
+
+        // 4. Both empty/null -> returns null
+        expect(simulateJwtRoleExtraction('', '')).toBeNull();
+        expect(simulateJwtRoleExtraction(null, null)).toBeNull();
+        expect(simulateJwtRoleExtraction('', '{}')).toBeNull();
+      });
+    });
+
+    describe('[Observable Full Workspace Lifecycle Tests]', () => {
+      it('performs full lifecycle: multi-level directory creation, saves, renames, moves, and deletions', async () => {
+        const user = await db.createUser({ email: 'lifecycle@mit.edu', name: 'Lifecycle User' });
+        const proj = await db.createProject({ name: 'Lifecycle Project', description: '', leader_id: user.id });
+
+        // 1. Create directory structure: /docs, /docs/specs, /docs/specs/v1.md
+        const docsFolder = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'docs',
+          type: 'folder',
+          author_id: user.id,
+          author_name: user.name,
+        });
+        expect(docsFolder.path).toBe('/docs');
+
+        const specsFolder = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'specs',
+          type: 'folder',
+          parent_id: docsFolder.id,
+          author_id: user.id,
+          author_name: user.name,
+        });
+        expect(specsFolder.path).toBe('/docs/specs');
+
+        const v1File = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'v1.md',
+          type: 'file',
+          parent_id: specsFolder.id,
+          initialContent: '# Specification V1',
+          author_id: user.id,
+          author_name: user.name,
+        });
+        expect(v1File.path).toBe('/docs/specs/v1.md');
+        expect(v1File.current_revision).toBe(1);
+
+        // 2. Save file with checksum and OCC
+        const saveRes = await db.saveWorkspaceFile(
+          v1File.id,
+          '# Specification V1 - Updated',
+          1,
+          user.id,
+          user.name
+        );
+        expect(saveRes.file.current_revision).toBe(2);
+        expect(saveRes.file.content).toBe('# Specification V1 - Updated');
+
+        const revs = await db.getWorkspaceFileRevisions(v1File.id);
+        expect(revs).toHaveLength(2);
+        expect(revs[0].revision_number).toBe(2);
+        expect(revs[1].revision_number).toBe(1);
+
+        // 3. Rename parent folder -> updates /docs/specs to /documentation/specs and /documentation/specs/v1.md
+        const renamedDocs = await db.updateWorkspaceNode(
+          docsFolder.id,
+          { name: 'documentation' },
+          user.id,
+          user.name
+        );
+        expect(renamedDocs.name).toBe('documentation');
+        expect(renamedDocs.path).toBe('/documentation');
+
+        const specsAfterRename = await db.getWorkspaceNode(specsFolder.id);
+        const v1AfterRename = await db.getWorkspaceNode(v1File.id);
+        expect(specsAfterRename?.path).toBe('/documentation/specs');
+        expect(v1AfterRename?.path).toBe('/documentation/specs/v1.md');
+
+        // 4. Move specs folder to root -> updates /documentation/specs to /specs and /specs/v1.md
+        const movedToRoot = await db.updateWorkspaceNode(
+          specsFolder.id,
+          { parent_id: null },
+          user.id,
+          user.name
+        );
+        expect(movedToRoot.parent_id).toBeNull();
+        expect(movedToRoot.path).toBe('/specs');
+
+        const v1AfterRootMove = await db.getWorkspaceNode(v1File.id);
+        expect(v1AfterRootMove?.path).toBe('/specs/v1.md');
+
+        // 5. Move specs folder back into documentation -> updates to /documentation/specs and /documentation/specs/v1.md
+        const movedBack = await db.updateWorkspaceNode(
+          specsFolder.id,
+          { parent_id: docsFolder.id },
+          user.id,
+          user.name
+        );
+        expect(movedBack.parent_id).toBe(docsFolder.id);
+        expect(movedBack.path).toBe('/documentation/specs');
+
+        const v1AfterNestedMove = await db.getWorkspaceNode(v1File.id);
+        expect(v1AfterNestedMove?.path).toBe('/documentation/specs/v1.md');
+
+        // 6. Delete specs folder -> soft-deletes both specs and v1.md
+        const deletedSpecs = await db.deleteWorkspaceNode(specsFolder.id);
+        expect(deletedSpecs).toBe(true);
+
+        const specsAfterDelete = await db.getWorkspaceNode(specsFolder.id);
+        const v1AfterDelete = await db.getWorkspaceNode(v1File.id);
+        expect(specsAfterDelete).toBeNull();
+        expect(v1AfterDelete).toBeNull();
+
+        // 7. Verify revisions are strictly preserved after deletion
+        const revsAfterDelete = await db.getWorkspaceFileRevisions(v1File.id);
+        expect(revsAfterDelete).toHaveLength(2);
+
+        // 8. Active tree excludes deleted folder and file
+        const activeTree = await db.getWorkspaceTree(proj.id);
+        expect(activeTree).toHaveLength(1);
+        expect(activeTree[0].id).toBe(docsFolder.id);
+        expect(activeTree[0].children).toHaveLength(0);
+      });
+    });
+  });
 });
