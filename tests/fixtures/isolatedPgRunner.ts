@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from 'child_process';
+import childProcess, { execFileSync, execSync } from 'child_process';
 import net from 'net';
 import fs from 'fs';
 import path from 'path';
@@ -74,8 +74,14 @@ export interface ProvisionOptions {
   readinessIntervalMs?: number;
 }
 
+export interface EmergencyCleanupFailure {
+  dataDir: string;
+  error: string;
+  stage?: ProvisioningStage;
+}
+
 export interface EmergencyCleanupSyncOptions {
-  confirmStoppedSync?: (dataDir: string, isWsl: boolean) => boolean;
+  confirmStoppedSync?: (dataDir: string, isWsl: boolean, port?: number) => boolean;
   stopServerSync?: (pgCtlPath: string, dataDir: string, isWsl: boolean) => void;
   removeDirSync?: (dataDir: string, isWsl: boolean) => void;
   tryKillPostmasterSync?: (dataDir: string, isWsl: boolean) => boolean;
@@ -85,20 +91,91 @@ export interface EmergencyCleanupSyncOptions {
 export const activeInstanceRecords = new Set<ActiveInstanceRecord>();
 
 /**
- * Synchronously checks whether postmaster.pid exists in the data directory.
- * If the file exists, the server cannot be confirmed as stopped.
+ * Synchronously checks whether a local TCP port is open.
+ * Uses child process TCP probe without depending on asynchronous callbacks.
  */
-export function confirmStoppedSync(dataDir: string, isWsl: boolean): boolean {
+export function checkPortOpenSync(port: number, isWsl: boolean): boolean {
   if (isWsl) {
     try {
-      execFileSync('wsl', ['test', '-f', `${dataDir}/postmaster.pid`], { stdio: 'ignore' });
-      return false; // File exists => not stopped
-    } catch {
-      return true; // File does not exist => stopped
+      childProcess.execFileSync(
+        'wsl',
+        ['sh', '-c', `(ss -tln "sport = :${port}" 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":${port} "`],
+        { stdio: 'ignore' }
+      );
+      return true; // Exit 0 => port is listening
+    } catch (err: any) {
+      if (err && typeof err.status === 'number' && err.status === 1) {
+        return false; // Exit 1 => port is not listening
+      }
+      return false;
     }
   } else {
-    return !fs.existsSync(path.join(dataDir, 'postmaster.pid'));
+    try {
+      childProcess.execFileSync(
+        process.execPath,
+        [
+          '-e',
+          `const net = require('net');
+           const s = net.createConnection({ port: ${port}, host: '127.0.0.1' }, () => { process.exit(0); });
+           s.on('error', () => process.exit(1));
+           setTimeout(() => process.exit(1), 300);`,
+        ],
+        { stdio: 'ignore', timeout: 1000 }
+      );
+      return true; // Connected => port open
+    } catch {
+      return false; // Error or timeout => port closed
+    }
   }
+}
+
+/**
+ * Synchronously checks whether a postmaster process has fully stopped.
+ * Confirms both absence of postmaster.pid AND (where port is specified) closed port status.
+ * Fails closed: treats command-execution errors or inability to inspect as UNVERIFIED (false).
+ */
+export function confirmStoppedSync(dataDir: string, isWsl: boolean, port?: number): boolean {
+  let pidExists = false;
+
+  if (isWsl) {
+    try {
+      childProcess.execFileSync('wsl', ['test', '-f', `${dataDir}/postmaster.pid`], { stdio: 'ignore' });
+      // Exit 0 means file exists => server not stopped
+      pidExists = true;
+    } catch (err: any) {
+      if (err && typeof err.status === 'number' && err.status === 1) {
+        // Exit 1 means file does not exist
+        pidExists = false;
+      } else {
+        // Any other exit code or process error is an execution failure.
+        // Treat inability to inspect as unverified => fail closed
+        return false;
+      }
+    }
+  } else {
+    try {
+      pidExists = fs.existsSync(path.join(dataDir, 'postmaster.pid'));
+    } catch {
+      // Filesystem inspection error => fail closed
+      return false;
+    }
+  }
+
+  // If postmaster.pid still exists, server is definitely not stopped
+  if (pidExists) {
+    return false;
+  }
+
+  // If port is specified, verify port is also closed
+  if (port && port > 0) {
+    const isPortOpen = checkPortOpenSync(port, isWsl);
+    if (isPortOpen) {
+      // Port is still open even though PID file is absent => server not stopped!
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /**
@@ -110,9 +187,9 @@ export function confirmStoppedSync(dataDir: string, isWsl: boolean): boolean {
 export function performEmergencyCleanupSync(
   records: Set<ActiveInstanceRecord> = activeInstanceRecords,
   options?: EmergencyCleanupSyncOptions
-): { succeeded: string[]; failed: string[] } {
+): { succeeded: string[]; failed: EmergencyCleanupFailure[] } {
   const succeeded: string[] = [];
-  const failed: string[] = [];
+  const failed: EmergencyCleanupFailure[] = [];
 
   records.forEach((record) => {
     if (record.stopped || record.lifecycleState === 'stopped') return;
@@ -128,34 +205,54 @@ export function performEmergencyCleanupSync(
           options.stopServerSync(record.pgCtlPath, record.dataDir, record.isWsl);
         } else {
           if (record.isWsl) {
-            execFileSync('wsl', [record.pgCtlPath, '-D', record.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
+            childProcess.execFileSync('wsl', [record.pgCtlPath, '-D', record.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
           } else {
-            execFileSync(record.pgCtlPath, ['-D', record.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
+            childProcess.execFileSync(record.pgCtlPath, ['-D', record.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
           }
         }
       } catch {
-        // Stop might fail; proceed to confirmation and guarded kill
+        // Orderly stop might fail
       }
 
-      const isStopped = options?.confirmStoppedSync
-        ? options.confirmStoppedSync(record.dataDir, record.isWsl)
-        : confirmStoppedSync(record.dataDir, record.isWsl);
+      let isStopped = false;
+      try {
+        isStopped = options?.confirmStoppedSync
+          ? options.confirmStoppedSync(record.dataDir, record.isWsl, record.port)
+          : confirmStoppedSync(record.dataDir, record.isWsl, record.port);
+      } catch {
+        isStopped = false;
+      }
 
       if (!isStopped) {
-        if (options?.tryKillPostmasterSync) {
-          options.tryKillPostmasterSync(record.dataDir, record.isWsl);
-        } else {
-          tryKillPostmaster(record.dataDir, record.isWsl);
+        // Guarded force-kill attempt
+        let killResult = false;
+        try {
+          if (options?.tryKillPostmasterSync) {
+            killResult = options.tryKillPostmasterSync(record.dataDir, record.isWsl);
+          } else {
+            killResult = tryKillPostmaster(record.dataDir, record.isWsl);
+          }
+        } catch {
+          killResult = false;
         }
 
-        const isStoppedAfterKill = options?.confirmStoppedSync
-          ? options.confirmStoppedSync(record.dataDir, record.isWsl)
-          : confirmStoppedSync(record.dataDir, record.isWsl);
+        // Re-confirm shutdown. Do not treat killResult alone as proof that server stopped!
+        let isStoppedAfterKill = false;
+        try {
+          isStoppedAfterKill = options?.confirmStoppedSync
+            ? options.confirmStoppedSync(record.dataDir, record.isWsl, record.port)
+            : confirmStoppedSync(record.dataDir, record.isWsl, record.port);
+        } catch {
+          isStoppedAfterKill = false;
+        }
 
         if (!isStoppedAfterKill) {
           record.lifecycleState = 'cleanup_failed';
-          failed.push(record.dataDir);
-          return;
+          const reason = !killResult
+            ? 'PostgreSQL server failed to stop and force-kill was refused (unverifiable PID) or failed'
+            : 'PostgreSQL server process could not be confirmed as terminated after force-kill';
+          failed.push({ dataDir: record.dataDir, error: reason, stage: record.stage });
+          return; // Abort directory removal to protect running server!
         }
       }
 
@@ -168,7 +265,7 @@ export function performEmergencyCleanupSync(
         options.removeDirSync(record.dataDir, record.isWsl);
       } else {
         if (record.isWsl) {
-          execFileSync('wsl', ['rm', '-rf', record.dataDir], { stdio: 'ignore' });
+          childProcess.execFileSync('wsl', ['rm', '-rf', record.dataDir], { stdio: 'ignore' });
         } else {
           if (fs.existsSync(record.dataDir)) {
             fs.rmSync(record.dataDir, { recursive: true, force: true });
@@ -183,27 +280,64 @@ export function performEmergencyCleanupSync(
     } catch (err: any) {
       record.lifecycleState = 'cleanup_failed';
       record.lastCleanupError = err;
-      failed.push(record.dataDir);
+      failed.push({
+        dataDir: record.dataDir,
+        error: `Data directory removal failed: ${err.message}`,
+        stage: record.stage,
+      });
     }
   });
 
   return { succeeded, failed };
 }
 
+/**
+ * Reports emergency cleanup failures synchronously to stderr.
+ * Never outputs sensitive credentials or connection URLs.
+ */
+export function reportEmergencyCleanupFailures(failed: EmergencyCleanupFailure[]): void {
+  if (!failed || failed.length === 0) return;
+  const lines = [
+    `\n[isolatedPgRunner] EMERGENCY CLEANUP FAILURE: ${failed.length} temporary PostgreSQL instance(s) could not be cleaned up:`,
+    ...failed.map((f) => `  - Data directory: "${f.dataDir}" | Error: ${f.error}`),
+    `Data directories have been preserved to avoid deleting data belonging to active postmaster processes. Please inspect and clean up manually.\n`,
+  ];
+  try {
+    process.stderr.write(lines.join('\n'));
+  } catch {
+    // Best effort on stderr write
+  }
+}
+
 let cleanupHooksRegistered = false;
+let emergencyReporter: ((failed: EmergencyCleanupFailure[]) => void) | null = null;
+
+export function setEmergencyFailureReporter(reporter: ((failed: EmergencyCleanupFailure[]) => void) | null): void {
+  emergencyReporter = reporter;
+}
+
 export function registerCleanupHooks(): void {
   if (cleanupHooksRegistered) return;
   cleanupHooksRegistered = true;
 
-  process.once('exit', () => {
-    performEmergencyCleanupSync();
-  });
+  const handleExitCleanup = () => {
+    const result = performEmergencyCleanupSync();
+    if (result.failed.length > 0) {
+      if (emergencyReporter) {
+        emergencyReporter(result.failed);
+      } else {
+        reportEmergencyCleanupFailures(result.failed);
+      }
+    }
+  };
+
+  process.once('exit', handleExitCleanup);
   process.once('SIGINT', () => {
-    performEmergencyCleanupSync();
+    handleExitCleanup();
     process.exit(130);
   });
   process.once('SIGTERM', () => {
-    performEmergencyCleanupSync();
+    handleExitCleanup();
     process.exit(143);
   });
 }
@@ -456,15 +590,31 @@ export const defaultProcessExecutor: ProcessExecutor = {
     const start = Date.now();
     while (Date.now() - start < maxWaitMs) {
       let pidExists = false;
+      let inspectionFailed = false;
+
       if (isWsl) {
         try {
           execFileSync('wsl', ['test', '-f', `${dataDir}/postmaster.pid`], { stdio: 'ignore' });
           pidExists = true;
-        } catch {
-          pidExists = false;
+        } catch (err: any) {
+          if (err && typeof err.status === 'number' && err.status === 1) {
+            pidExists = false;
+          } else {
+            // Inspection error: cannot confirm stopped, keep polling
+            inspectionFailed = true;
+          }
         }
       } else {
-        pidExists = fs.existsSync(path.join(dataDir, 'postmaster.pid'));
+        try {
+          pidExists = fs.existsSync(path.join(dataDir, 'postmaster.pid'));
+        } catch {
+          inspectionFailed = true;
+        }
+      }
+
+      if (inspectionFailed) {
+        await new Promise((r) => setTimeout(r, 150));
+        continue;
       }
 
       const isPortOpen = await checkPortOpen(port);
@@ -538,7 +688,7 @@ export async function performTeardown(params: {
 
     if (!isStopped) {
       // Guarded force-kill attempt with process identity validation
-      tryKillPostmaster(params.dataDir, params.isWsl, params.verifier);
+      const killSucceeded = tryKillPostmaster(params.dataDir, params.isWsl, params.verifier);
       const isStoppedAfterKill = await executor.confirmStopped(
         params.dataDir,
         params.port,
@@ -548,8 +698,11 @@ export async function performTeardown(params: {
       );
 
       if (!isStoppedAfterKill) {
+        const killNote = !killSucceeded
+          ? ' (Guarded force-kill was refused due to unverifiable PID or missing process)'
+          : ' (Process remained active despite kill signal)';
         throw new Error(
-          `Cleanup failure: PostgreSQL server in "${params.dataDir}" failed to shut down within timeout. ` +
+          `Cleanup failure: PostgreSQL server in "${params.dataDir}" failed to shut down within timeout.${killNote} ` +
           `Data directory removal aborted to prevent running rogue postmaster process.` +
           (stopCmdError ? ` Underlying stop error: ${stopCmdError.message}` : '')
         );

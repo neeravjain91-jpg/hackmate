@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import net from 'net';
-import { execSync } from 'child_process';
+import childProcess, { execSync } from 'child_process';
 import { Client } from 'pg';
 import {
   validateDbTarget,
@@ -13,7 +14,6 @@ import {
   isVerifiedGitHubActionsService,
   EXPECTED_TEST_DATABASE,
   ALLOWED_LOCAL_HOSTS,
-  ALLOWED_CI_SERVICE_HOSTS,
 } from './fixtures/pgHarness';
 import {
   provisionIsolatedPostgres,
@@ -27,6 +27,10 @@ import {
   verifyPostmasterIdentity,
   tryKillPostmaster,
   confirmStoppedSync,
+  checkPortOpenSync,
+  setEmergencyFailureReporter,
+  reportEmergencyCleanupFailures,
+  EmergencyCleanupFailure,
   ActiveInstanceRecord,
 } from './fixtures/isolatedPgRunner';
 
@@ -246,105 +250,54 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     });
   });
 
-  describe('5. Verified GitHub Actions Environment & CI Bypass Prevention', () => {
-    it('proves a local process with CI=true alone cannot bypass ephemeral provisioning', () => {
+  describe('5. Pure Isolated PostgreSQL Instances & Elimination of Shared CI Bypass', () => {
+    it('proves ordinary execution requires an isolated instance even when CI=true is set', () => {
       process.env.CI = 'true';
       delete process.env.GITHUB_ACTIONS;
       delete process.env.HACKMATE_CI_SERVICE_CONTAINER;
       delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
-
-      expect(isVerifiedGitHubActionsService()).toBe(false);
 
       expect(() => {
         validateDbTarget({ host: '127.0.0.1', database: 'hackmate_test' });
       }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
     });
 
-    it('requires all GitHub Actions markers to recognize disposable CI container', () => {
-      process.env.CI = 'true';
-      process.env.GITHUB_ACTIONS = 'true';
-      delete process.env.HACKMATE_CI_SERVICE_CONTAINER;
-      expect(isVerifiedGitHubActionsService('postgres')).toBe(false);
-
-      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
-      process.env.PGDATABASE = 'wrong_database';
-      expect(isVerifiedGitHubActionsService('postgres')).toBe(false);
-
-      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
-      expect(isVerifiedGitHubActionsService('postgres')).toBe(true);
-      expect(isVerifiedGitHubActionsService('127.0.0.1')).toBe(false);
-      expect(isVerifiedGitHubActionsService('localhost')).toBe(false);
-      expect(isVerifiedGitHubActionsService('::1')).toBe(false);
-    });
-
-    it('validates verified GitHub Actions service container configuration', () => {
-      process.env.CI = 'true';
-      process.env.GITHUB_ACTIONS = 'true';
-      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
-      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
-
-      const ciConfig = {
-        host: 'postgres',
-        port: 5432,
-        database: 'hackmate_test',
-        user: 'postgres',
-        password: 'testpassword',
-      };
-
-      const validated = validateDbTarget(ciConfig);
-      expect(validated.host).toBe('postgres');
-      expect(validated.database).toBe('hackmate_test');
-      expect(validated.port).toBe(5432);
-      expect(validated.user).toBe('postgres');
-    });
-
-    it('allows container service host "postgres" in verified GitHub Actions environment', () => {
-      process.env.CI = 'true';
-      process.env.GITHUB_ACTIONS = 'true';
-      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
-      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
-
-      const validated = validateDbTarget({
-        host: 'postgres',
-        port: 5432,
-        database: 'hackmate_test',
-      });
-      expect(validated.host).toBe('postgres');
-      expect(validated.database).toBe('hackmate_test');
-    });
-
-    it('proves setting all four CI markers locally with 127.0.0.1:5432 cannot bypass isolated provisioning or reach shared-cluster path', () => {
+    it('proves setting all existing CI markers locally does not permit connecting to an ordinary shared local PostgreSQL service', () => {
       process.env.CI = 'true';
       process.env.GITHUB_ACTIONS = 'true';
       process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
       process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
       delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
 
-      // Loopback targets must NEVER be recognized as the CI service container
-      expect(isVerifiedGitHubActionsService('127.0.0.1')).toBe(false);
-      expect(isVerifiedGitHubActionsService('localhost')).toBe(false);
-      expect(isVerifiedGitHubActionsService('::1')).toBe(false);
-
-      // validateDbTarget must reject loopback 127.0.0.1:5432 without disposable flag
+      // Even with all CI markers set, connecting to loopback 127.0.0.1:5432 without disposable flag fails closed
       expect(() => {
         validateDbTarget({ host: '127.0.0.1', port: 5432, database: 'hackmate_test' });
       }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
-    });
-
-    it('rejects CI service container host "postgres" when not in a verified GitHub Actions environment', () => {
-      delete process.env.CI;
-      delete process.env.GITHUB_ACTIONS;
 
       expect(() => {
-        validateDbTarget({ host: 'postgres', port: 5432, database: 'hackmate_test' });
-      }).toThrow(/Safety violation: CI service container host "postgres" is only permitted within a verified GitHub Actions/);
+        validateDbTarget({ host: 'localhost', port: 5432, database: 'hackmate_test' });
+      }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
     });
 
-    it('rejects remote hosts even in verified GitHub Actions environment', () => {
+    it('proves a configured shared hostname (such as postgres) does not bypass the isolation requirement', () => {
       process.env.CI = 'true';
       process.env.GITHUB_ACTIONS = 'true';
       process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
       process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
+
+      // Shared hostname aliases are strictly rejected; only loopback is permitted
+      expect(() => {
+        validateDbTarget({ host: 'postgres', port: 5432, database: 'hackmate_test' });
+      }).toThrow(/Safety violation: Target host must be a loopback address/);
+    });
+
+    it('rejects remote databases even if all CI markers are present', () => {
+      process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
+      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
+      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
 
       expect(() => {
         validateDbTarget({
@@ -353,6 +306,24 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
           database: 'hackmate_test',
         });
       }).toThrow(/Safety violation: Target host must be a loopback address/);
+    });
+
+    it('accepts strictly validated isolated ephemeral loopback instances', () => {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
+
+      const validConfig = {
+        host: '127.0.0.1',
+        port: 54321,
+        database: 'hackmate_test',
+        user: 'postgres',
+        password: 'testpassword',
+      };
+
+      const validated = validateDbTarget(validConfig);
+      expect(validated.host).toBe('127.0.0.1');
+      expect(validated.database).toBe('hackmate_test');
+      expect(validated.port).toBe(54321);
+      expect(validated.user).toBe('postgres');
     });
 
     it('verifies that environment variables modified by integration harness are restored after teardown', async () => {
@@ -948,7 +919,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
   });
 
   describe('10. Synchronous Emergency Cleanup Safeguards', () => {
-    it('successfully stops running server, confirms stopped, removes directory, and unregisters', () => {
+    it('1. successfully stops running server, confirms stopped, removes directory, and unregisters', () => {
       const records = new Set<ActiveInstanceRecord>();
       let stopCalled = false;
       let removeCalled = false;
@@ -982,14 +953,159 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(testRecord.lifecycleState).toBe('stopped');
       expect(records.has(testRecord)).toBe(false);
       expect(res.succeeded).toContain('/tmp/test_emergency_success');
+      expect(res.failed).toHaveLength(0);
     });
 
-    it('failed stop does not remove directory and retains record in cleanup_failed state', () => {
+    it('2. confirms stopped when PID file is absent and port is closed (native and WSL)', () => {
+      // 2a. Native: non-existent PID file and closed port
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_stopped_'));
+      try {
+        const closedPort = 59998;
+        const stoppedNative = confirmStoppedSync(tempDir, false, closedPort);
+        expect(stoppedNative).toBe(true);
+
+        // If postmaster.pid is present, confirmStoppedSync must return false
+        fs.writeFileSync(path.join(tempDir, 'postmaster.pid'), '12345\n/tmp\n');
+        expect(confirmStoppedSync(tempDir, false, closedPort)).toBe(false);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+
+      // 2b. WSL: exit status 1 indicates PID file absence
+      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string, args: any) => {
+        if (cmd === 'wsl' && args && args[0] === 'test') {
+          const err: any = new Error('File not found');
+          err.status = 1;
+          throw err;
+        }
+        if (cmd === 'wsl' && args && args[0] === 'sh') {
+          // Port check: exit 1 means port not listening
+          const err: any = new Error('Port closed');
+          err.status = 1;
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const stoppedWsl = confirmStoppedSync('/wsl/mock/datadir', true, 59997);
+        expect(stoppedWsl).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    it('3. fails closed and preserves data directory when PID file is absent but port remains open', async () => {
+      // Start an actual TCP server on loopback to hold port open
+      const srv = net.createServer();
+      const openPort = await new Promise<number>((resolve, reject) => {
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address() as net.AddressInfo;
+          resolve(addr.port);
+        });
+        srv.on('error', reject);
+      });
+
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_openport_'));
+
+      try {
+        // PID file absent, but port is listening -> confirmStoppedSync returns false
+        expect(confirmStoppedSync(tempDir, false, openPort)).toBe(false);
+
+        // In performEmergencyCleanupSync, data directory must NOT be removed
+        const records = new Set<ActiveInstanceRecord>();
+        let removeCalled = false;
+
+        const testRecord: ActiveInstanceRecord = {
+          dataDir: tempDir,
+          port: openPort,
+          isWsl: false,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        records.add(testRecord);
+
+        const res = performEmergencyCleanupSync(records, {
+          stopServerSync: () => {},
+          confirmStoppedSync: (dir, isWsl, p) => confirmStoppedSync(dir, isWsl, p),
+          tryKillPostmasterSync: () => false,
+          removeDirSync: () => {
+            removeCalled = true;
+          },
+        });
+
+        expect(removeCalled).toBe(false);
+        expect(testRecord.stopped).toBe(false);
+        expect(testRecord.lifecycleState).toBe('cleanup_failed');
+        expect(records.has(testRecord)).toBe(true);
+        expect(res.failed.some(f => f.dataDir === tempDir)).toBe(true);
+      } finally {
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('4. fails closed and preserves data directory when WSL PID inspection encounters command/execution failure (exit status != 1)', () => {
+      // WSL command failure with status 2 or execution error fails closed
+      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string, args: any) => {
+        if (cmd === 'wsl') {
+          const err: any = new Error('WSL command failed: syntax/communication error');
+          err.status = 2; // Not status 1 (status 1 = file absent)
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const isStopped = confirmStoppedSync('/wsl/mock/broken', true, 54321);
+        expect(isStopped).toBe(false);
+
+        // Emergency cleanup preserves directory
+        const records = new Set<ActiveInstanceRecord>();
+        let removeCalled = false;
+
+        const testRecord: ActiveInstanceRecord = {
+          dataDir: '/wsl/mock/broken',
+          port: 54321,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        records.add(testRecord);
+
+        const res = performEmergencyCleanupSync(records, {
+          stopServerSync: () => {},
+          confirmStoppedSync: (dir, isWsl, p) => confirmStoppedSync(dir, isWsl, p),
+          tryKillPostmasterSync: () => false,
+          removeDirSync: () => {
+            removeCalled = true;
+          },
+        });
+
+        expect(removeCalled).toBe(false);
+        expect(testRecord.stopped).toBe(false);
+        expect(testRecord.lifecycleState).toBe('cleanup_failed');
+        expect(records.has(testRecord)).toBe(true);
+        expect(res.failed.some(f => f.dataDir === '/wsl/mock/broken')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    it('5. failed orderly shutdown followed by unverifiable PID refuses force-kill and preserves data directory', () => {
       const records = new Set<ActiveInstanceRecord>();
       let removeCalled = false;
 
       const testRecord: ActiveInstanceRecord = {
-        dataDir: '/tmp/test_emergency_fail',
+        dataDir: '/tmp/test_emergency_unverifiable',
         port: 45679,
         isWsl: false,
         pgCtlPath: 'pg_ctl',
@@ -1006,7 +1122,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
           throw new Error('pg_ctl stop error');
         },
         confirmStoppedSync: () => false, // Cannot confirm stopped
-        tryKillPostmasterSync: () => false,
+        tryKillPostmasterSync: () => false, // Force kill refused due to unverifiable PID
         removeDirSync: () => {
           removeCalled = true;
         },
@@ -1016,42 +1132,12 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(testRecord.stopped).toBe(false);
       expect(testRecord.lifecycleState).toBe('cleanup_failed');
       expect(records.has(testRecord)).toBe(true);
-      expect(res.failed).toContain('/tmp/test_emergency_fail');
+      expect(res.failed.some(f => f.dataDir === '/tmp/test_emergency_unverifiable')).toBe(true);
+      const failure = res.failed.find(f => f.dataDir === '/tmp/test_emergency_unverifiable');
+      expect(failure?.error).toContain('force-kill was refused');
     });
 
-    it('unconfirmed shutdown preserves data directory and reports failure', () => {
-      const records = new Set<ActiveInstanceRecord>();
-      let removeCalled = false;
-
-      const testRecord: ActiveInstanceRecord = {
-        dataDir: '/tmp/test_emergency_unconfirmed',
-        port: 45680,
-        isWsl: false,
-        pgCtlPath: 'pg_ctl',
-        stage: 'starting_server',
-        lifecycleState: 'provisioning_in_progress',
-        serverStarted: false,
-        serverStopped: false,
-        stopped: false,
-      };
-      records.add(testRecord);
-
-      const res = performEmergencyCleanupSync(records, {
-        stopServerSync: () => {},
-        confirmStoppedSync: () => false, // PID file still present
-        tryKillPostmasterSync: () => false,
-        removeDirSync: () => {
-          removeCalled = true;
-        },
-      });
-
-      expect(removeCalled).toBe(false);
-      expect(testRecord.stopped).toBe(false);
-      expect(records.has(testRecord)).toBe(true);
-      expect(res.failed).toContain('/tmp/test_emergency_unconfirmed');
-    });
-
-    it('directory removal failure leaves record tracked in cleanup_failed state with serverStopped === true', () => {
+    it('6. directory removal failure after confirmed shutdown records serverStopped === true and leaves instance tracked in failed', () => {
       const records = new Set<ActiveInstanceRecord>();
 
       const testRecord: ActiveInstanceRecord = {
@@ -1069,17 +1155,53 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
       const res = performEmergencyCleanupSync(records, {
         stopServerSync: () => {},
-        confirmStoppedSync: () => true, // Server stopped
+        confirmStoppedSync: () => true, // Server stopped confirmed
         removeDirSync: () => {
-          throw new Error('File lock error');
+          throw new Error('EACCES: permission denied, unlink directory');
         },
       });
 
       expect(testRecord.serverStopped).toBe(true);
       expect(testRecord.stopped).toBe(false);
       expect(testRecord.lifecycleState).toBe('cleanup_failed');
+      expect(testRecord.lastCleanupError).toBeDefined();
       expect(records.has(testRecord)).toBe(true);
-      expect(res.failed).toContain('/tmp/test_emergency_rm_fail');
+      expect(res.failed.some(f => f.dataDir === '/tmp/test_emergency_rm_fail')).toBe(true);
+      const failure = res.failed.find(f => f.dataDir === '/tmp/test_emergency_rm_fail');
+      expect(failure?.error).toContain('permission denied');
+    });
+
+    it('7. emergency failure reporter surfaces cleanup failures cleanly without leaking sensitive credentials', () => {
+      let capturedFailures: EmergencyCleanupFailure[] = [];
+      setEmergencyFailureReporter((failed) => {
+        capturedFailures = failed;
+      });
+
+      const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      try {
+        const failures: EmergencyCleanupFailure[] = [
+          {
+            dataDir: '/tmp/test_dir_failed',
+            error: 'PostgreSQL server process could not be confirmed as terminated after force-kill',
+            stage: 'ready',
+          },
+        ];
+
+        reportEmergencyCleanupFailures(failures);
+
+        expect(stderrSpy).toHaveBeenCalled();
+        const output = stderrSpy.mock.calls.map(c => String(c[0])).join('');
+        expect(output).toContain('EMERGENCY CLEANUP FAILURE');
+        expect(output).toContain('/tmp/test_dir_failed');
+        expect(output).toContain('Data directories have been preserved');
+        // Ensure no secrets/passwords are printed
+        expect(output).not.toContain('password');
+        expect(output).not.toContain('secret');
+      } finally {
+        stderrSpy.mockRestore();
+        setEmergencyFailureReporter(null);
+      }
     });
   });
 

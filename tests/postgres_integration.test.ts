@@ -15,7 +15,6 @@ import {
   rpcUpdateWorkspaceNode,
   rpcDeleteWorkspaceNode,
   computeSha256,
-  isVerifiedGitHubActionsService,
 } from './fixtures/pgHarness';
 
 import {
@@ -45,19 +44,14 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
       HACKMATE_DISPOSABLE_INSTANCE: process.env.HACKMATE_DISPOSABLE_INSTANCE,
     };
 
-    // Only skip isolated ephemeral provisioning if running within the verified
-    // GitHub Actions disposable service container environment targeting 'postgres'.
-    // Local execution with loopback targets will NEVER bypass ephemeral provisioning,
-    // even if CI markers are set.
-    const targetHost = process.env.PGHOST || '127.0.0.1';
-    if (isVerifiedGitHubActionsService(targetHost)) {
-      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
-    } else {
-      isolatedInstance = await provisionIsolatedPostgres();
-      process.env.PGHOST = isolatedInstance.host;
-      process.env.PGPORT = String(isolatedInstance.port);
-      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
-    }
+    // Always provision a truly isolated, temporary PostgreSQL instance
+    // with its own data directory and dynamic loopback port in both
+    // local development and GitHub Actions CI.
+    isolatedInstance = await provisionIsolatedPostgres();
+    process.env.PGHOST = isolatedInstance.host;
+    process.env.PGPORT = String(isolatedInstance.port);
+    process.env.PGDATABASE = 'hackmate_test';
+    process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
 
     adminClient = await createAdminClient();
     // Apply bootstrap fixtures and all migrations in strict order
