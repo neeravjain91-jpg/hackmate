@@ -178,9 +178,17 @@ npm run build
 
 ---
 
-## 6. Supabase Cloud Configuration (Optional)
+## 6. Storage Driver & Database Configuration
 
-HackMate defaults to the zero-config **Local Persistent Driver** (`STORAGE_DRIVER=local`), requiring no external services or cloud accounts.
+HackMate supports two storage backends:
+1. **Local Persistent Driver (`STORAGE_DRIVER=local`)**:
+   - Zero-config persistent JSON database (`data/hackmate.json`) and private local disk storage (`data/storage/`).
+   - Defaults automatically in local development (`NODE_ENV=development`).
+   - Supported for self-hosted production environments (e.g. Docker, VPS) with explicitly configured persistent writable volumes.
+2. **Supabase Cloud Driver (`STORAGE_DRIVER=supabase`)**:
+   - Supabase PostgreSQL with Row Level Security (RLS) and Supabase Private Object Storage (`hackmate-contributions`).
+   - **Mandatory for Vercel deployments**: Serverless functions run on ephemeral filesystems where local files are wiped between cold starts and instances. To protect student collaboration data, Vercel deployments strictly require an explicitly configured persistent database (`STORAGE_DRIVER=supabase`).
+   - **Fail-Closed Production Safeguards**: In production (`NODE_ENV=production`), `STORAGE_DRIVER` must be explicitly configured. Missing or invalid database configuration never silently falls back to local JSON storage. If `STORAGE_DRIVER=supabase` is configured but Supabase credentials cannot initialize the admin client, the system fails closed with a clear configuration error without exposing secret values.
 
 If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=supabase`):
 

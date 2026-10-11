@@ -13,6 +13,8 @@ import { PATCH as updateTaskHandler } from '@/app/api/projects/[id]/tasks/[taskI
 import { GET as getContributionsHandler, POST as publishContributionHandler } from '@/app/api/projects/[id]/contributions/route';
 import { GET as downloadFileHandler } from '@/app/api/projects/[id]/files/[fileId]/download/route';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
+import { resetDatabaseAdapter } from '@/lib/db';
+import { resetStorageAdapter } from '@/lib/storage';
 
 const TEST_DIR = path.join(process.cwd(), 'data');
 const TEST_DB_PATH = path.join(TEST_DIR, 'hackmate.json');
@@ -20,6 +22,8 @@ const TEST_STORAGE_DIR = path.join(TEST_DIR, 'storage');
 
 describe('HackMate — HTTP API End-to-End Suite', () => {
   beforeEach(() => {
+    resetDatabaseAdapter();
+    resetStorageAdapter();
     // Reset test db
     if (fs.existsSync(TEST_DB_PATH)) {
       fs.rmSync(TEST_DB_PATH, { force: true });
@@ -30,6 +34,8 @@ describe('HackMate — HTTP API End-to-End Suite', () => {
   });
 
   afterEach(() => {
+    resetDatabaseAdapter();
+    resetStorageAdapter();
     if (fs.existsSync(TEST_DB_PATH)) {
       fs.rmSync(TEST_DB_PATH, { force: true });
     }
