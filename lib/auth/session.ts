@@ -9,9 +9,9 @@ const SESSION_EXPIRY_DAYS = 7;
 /**
  * Configured minimum length (in UTF-8 bytes) for production AUTH_SECRET.
  *
- * Enforcing a 32-byte minimum length ensures an adequate byte ceiling, but length
- * alone does not establish cryptographic entropy. Production operators must generate
- * secrets using a cryptographically secure random generator, such as:
+ * A 32-byte minimum length is a configured threshold; length alone does not
+ * establish cryptographic entropy. Production operators must generate secrets
+ * using a cryptographically secure random generator, such as:
  * ```bash
  * openssl rand -base64 32
  * ```
