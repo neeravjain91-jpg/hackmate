@@ -167,7 +167,7 @@ export async function provisionIsolatedPostgres(): Promise<IsolatedPostgresInsta
   if (binaries.isWsl) {
     dataDir = `/tmp/${dirName}`;
     initdbCmd = `wsl bash -c "${binaries.initdbPath} -D ${dataDir} -U postgres --auth=trust --no-instructions"`;
-    startCmd = `wsl bash -c "${binaries.pgCtlPath} -D ${dataDir} -o '-p ${port} -h 127.0.0.1 -k ${dataDir}' -w start"`;
+    startCmd = `wsl bash -c "${binaries.pgCtlPath} -D ${dataDir} -l ${dataDir}/server.log -o '-p ${port} -h 127.0.0.1 -k ${dataDir}' -w start"`;
     createdbCmd = `wsl bash -c "${binaries.createdbPath} -h 127.0.0.1 -p ${port} -U postgres hackmate_test"`;
     stopCmd = `wsl bash -c "${binaries.pgCtlPath} -D ${dataDir} -m immediate -w stop"`;
     rmDirCmd = () => {
@@ -180,8 +180,9 @@ export async function provisionIsolatedPostgres(): Promise<IsolatedPostgresInsta
   } else {
     dataDir = path.join(os.tmpdir(), dirName);
     const socketOption = process.platform === 'win32' ? '' : ` -k "${dataDir}"`;
+    const logPath = path.join(dataDir, 'server.log');
     initdbCmd = `"${binaries.initdbPath}" -D "${dataDir}" -U postgres --auth=trust --no-instructions`;
-    startCmd = `"${binaries.pgCtlPath}" -D "${dataDir}" -o "-p ${port} -h 127.0.0.1${socketOption}" -w start`;
+    startCmd = `"${binaries.pgCtlPath}" -D "${dataDir}" -l "${logPath}" -o "-p ${port} -h 127.0.0.1${socketOption}" -w start`;
     createdbCmd = `"${binaries.createdbPath}" -h 127.0.0.1 -p ${port} -U postgres hackmate_test`;
     stopCmd = `"${binaries.pgCtlPath}" -D "${dataDir}" -m immediate -w stop`;
     rmDirCmd = () => {
@@ -194,13 +195,13 @@ export async function provisionIsolatedPostgres(): Promise<IsolatedPostgresInsta
   }
 
   // 1. Initialize temporary cluster
-  execSync(initdbCmd, { stdio: 'pipe' });
+  execSync(initdbCmd, { stdio: 'ignore' });
 
   // 2. Start server on loopback
-  execSync(startCmd, { stdio: 'pipe' });
+  execSync(startCmd, { stdio: 'ignore' });
 
   // 3. Create dedicated test database
-  execSync(createdbCmd, { stdio: 'pipe' });
+  execSync(createdbCmd, { stdio: 'ignore' });
 
   // 4. Wait for TCP readiness on loopback with retry loop
   let isReady = false;

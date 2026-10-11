@@ -322,11 +322,20 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
       const checkListening = async () => {
         return new Promise<boolean>((resolve) => {
-          const s = net.createConnection({ host: inst.host, port: inst.port }, () => {
+          const s = net.createConnection({ host: inst.host, port: inst.port });
+          s.setTimeout(1000);
+          s.on('connect', () => {
             s.destroy();
             resolve(true);
           });
-          s.on('error', () => resolve(false));
+          s.on('timeout', () => {
+            s.destroy();
+            resolve(false);
+          });
+          s.on('error', () => {
+            s.destroy();
+            resolve(false);
+          });
         });
       };
 
@@ -337,11 +346,20 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
           const isClosed = await new Promise<boolean>((resolve) => {
-            const s = net.createConnection({ host: '127.0.0.1', port }, () => {
+            const s = net.createConnection({ host: '127.0.0.1', port });
+            s.setTimeout(500);
+            s.on('connect', () => {
               s.destroy();
               resolve(false);
             });
-            s.on('error', () => resolve(true));
+            s.on('timeout', () => {
+              s.destroy();
+              resolve(true);
+            });
+            s.on('error', () => {
+              s.destroy();
+              resolve(true);
+            });
           });
           if (isClosed) return true;
           await new Promise((r) => setTimeout(r, 150));
@@ -395,11 +413,20 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
           const isClosed = await new Promise<boolean>((resolve) => {
-            const s = net.createConnection({ host: '127.0.0.1', port }, () => {
+            const s = net.createConnection({ host: '127.0.0.1', port });
+            s.setTimeout(500);
+            s.on('connect', () => {
               s.destroy();
               resolve(false);
             });
-            s.on('error', () => resolve(true));
+            s.on('timeout', () => {
+              s.destroy();
+              resolve(true);
+            });
+            s.on('error', () => {
+              s.destroy();
+              resolve(true);
+            });
           });
           if (isClosed) return true;
           await new Promise((r) => setTimeout(r, 150));
