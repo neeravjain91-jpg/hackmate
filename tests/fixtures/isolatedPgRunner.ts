@@ -13,8 +13,14 @@ export type ProvisioningStage =
   | 'creating_db'
   | 'db_created'
   | 'verifying_readiness'
-  | 'ready'
-  | 'stopped';
+  | 'ready';
+
+export type InstanceLifecycleState =
+  | 'provisioning_in_progress'
+  | 'running'
+  | 'teardown_in_progress'
+  | 'stopped'
+  | 'cleanup_failed';
 
 export interface IsolatedPostgresInstance {
   host: string;
@@ -42,68 +48,162 @@ export interface ProcessExecutor {
   removeDataDir: (dataDir: string, isWsl: boolean) => void;
 }
 
+export interface ProcessVerifier {
+  verifyPostgresProcess: (pid: number, dataDir: string, isWsl: boolean) => boolean;
+}
+
 export interface ActiveInstanceRecord {
   dataDir: string;
   port: number;
   isWsl: boolean;
   pgCtlPath: string;
   stage: ProvisioningStage;
+  lifecycleState: InstanceLifecycleState;
   serverStarted: boolean;
+  serverStopped: boolean;
   stopped: boolean;
+  lastCleanupError?: Error | null;
+  teardownPromise?: Promise<void> | null;
 }
 
 export interface ProvisionOptions {
   executor?: Partial<ProcessExecutor>;
+  verifier?: ProcessVerifier;
   skipReadinessWait?: boolean;
   readinessRetries?: number;
   readinessIntervalMs?: number;
 }
 
+export interface EmergencyCleanupSyncOptions {
+  confirmStoppedSync?: (dataDir: string, isWsl: boolean) => boolean;
+  stopServerSync?: (pgCtlPath: string, dataDir: string, isWsl: boolean) => void;
+  removeDirSync?: (dataDir: string, isWsl: boolean) => void;
+  tryKillPostmasterSync?: (dataDir: string, isWsl: boolean) => boolean;
+}
+
 // Registry of running instances for emergency process cleanup
 export const activeInstanceRecords = new Set<ActiveInstanceRecord>();
+
+/**
+ * Synchronously checks whether postmaster.pid exists in the data directory.
+ * If the file exists, the server cannot be confirmed as stopped.
+ */
+export function confirmStoppedSync(dataDir: string, isWsl: boolean): boolean {
+  if (isWsl) {
+    try {
+      execFileSync('wsl', ['test', '-f', `${dataDir}/postmaster.pid`], { stdio: 'ignore' });
+      return false; // File exists => not stopped
+    } catch {
+      return true; // File does not exist => stopped
+    }
+  } else {
+    return !fs.existsSync(path.join(dataDir, 'postmaster.pid'));
+  }
+}
+
+/**
+ * Synchronous emergency cleanup for process exit and termination signals.
+ * Uses argument-safe process execution, waits for shutdown, confirms stopped state
+ * before removing data directories, and refuses deletion when shutdown is unconfirmed.
+ * Unsuccessful cleanup retains records in activeInstanceRecords.
+ */
+export function performEmergencyCleanupSync(
+  records: Set<ActiveInstanceRecord> = activeInstanceRecords,
+  options?: EmergencyCleanupSyncOptions
+): { succeeded: string[]; failed: string[] } {
+  const succeeded: string[] = [];
+  const failed: string[] = [];
+
+  records.forEach((record) => {
+    if (record.stopped || record.lifecycleState === 'stopped') return;
+
+    // Check if server may have started
+    const mayHaveStarted =
+      !record.serverStopped &&
+      (record.serverStarted || record.stage === 'starting_server');
+
+    if (mayHaveStarted) {
+      try {
+        if (options?.stopServerSync) {
+          options.stopServerSync(record.pgCtlPath, record.dataDir, record.isWsl);
+        } else {
+          if (record.isWsl) {
+            execFileSync('wsl', [record.pgCtlPath, '-D', record.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
+          } else {
+            execFileSync(record.pgCtlPath, ['-D', record.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' });
+          }
+        }
+      } catch {
+        // Stop might fail; proceed to confirmation and guarded kill
+      }
+
+      const isStopped = options?.confirmStoppedSync
+        ? options.confirmStoppedSync(record.dataDir, record.isWsl)
+        : confirmStoppedSync(record.dataDir, record.isWsl);
+
+      if (!isStopped) {
+        if (options?.tryKillPostmasterSync) {
+          options.tryKillPostmasterSync(record.dataDir, record.isWsl);
+        } else {
+          tryKillPostmaster(record.dataDir, record.isWsl);
+        }
+
+        const isStoppedAfterKill = options?.confirmStoppedSync
+          ? options.confirmStoppedSync(record.dataDir, record.isWsl)
+          : confirmStoppedSync(record.dataDir, record.isWsl);
+
+        if (!isStoppedAfterKill) {
+          record.lifecycleState = 'cleanup_failed';
+          failed.push(record.dataDir);
+          return;
+        }
+      }
+
+      record.serverStopped = true;
+    }
+
+    // Server shutdown confirmed (or never started); remove directory
+    try {
+      if (options?.removeDirSync) {
+        options.removeDirSync(record.dataDir, record.isWsl);
+      } else {
+        if (record.isWsl) {
+          execFileSync('wsl', ['rm', '-rf', record.dataDir], { stdio: 'ignore' });
+        } else {
+          if (fs.existsSync(record.dataDir)) {
+            fs.rmSync(record.dataDir, { recursive: true, force: true });
+          }
+        }
+      }
+      record.lifecycleState = 'stopped';
+      record.stopped = true;
+      record.lastCleanupError = null;
+      records.delete(record);
+      succeeded.push(record.dataDir);
+    } catch (err: any) {
+      record.lifecycleState = 'cleanup_failed';
+      record.lastCleanupError = err;
+      failed.push(record.dataDir);
+    }
+  });
+
+  return { succeeded, failed };
+}
 
 let cleanupHooksRegistered = false;
 export function registerCleanupHooks(): void {
   if (cleanupHooksRegistered) return;
   cleanupHooksRegistered = true;
 
-  const cleanupSync = () => {
-    activeInstanceRecords.forEach((record) => {
-      if (record.stopped) return;
-      try {
-        if (record.serverStarted) {
-          if (record.isWsl) {
-            execSync(`wsl ${record.pgCtlPath} -D ${record.dataDir} -m immediate stop 2>/dev/null || true`, { stdio: 'ignore' });
-          } else {
-            execSync(`"${record.pgCtlPath}" -D "${record.dataDir}" -m immediate stop 2>/dev/null || true`, { stdio: 'ignore' });
-          }
-        }
-      } catch {
-        // Best effort during emergency process exit
-      }
-      try {
-        if (record.isWsl) {
-          execSync(`wsl rm -rf ${record.dataDir} 2>/dev/null || true`, { stdio: 'ignore' });
-        } else {
-          if (fs.existsSync(record.dataDir)) {
-            fs.rmSync(record.dataDir, { recursive: true, force: true });
-          }
-        }
-        record.stopped = true;
-      } catch {
-        // Ignore during emergency exit
-      }
-    });
-    activeInstanceRecords.clear();
-  };
-
-  process.once('exit', cleanupSync);
+  process.once('exit', () => {
+    performEmergencyCleanupSync();
+  });
   process.once('SIGINT', () => {
-    cleanupSync();
+    performEmergencyCleanupSync();
     process.exit(130);
   });
   process.once('SIGTERM', () => {
-    cleanupSync();
+    performEmergencyCleanupSync();
     process.exit(143);
   });
 }
@@ -221,28 +321,93 @@ export async function checkPortOpen(port: number, timeoutMs = 300): Promise<bool
 }
 
 /**
- * Attempts best-effort kill of a postmaster process when regular shutdown fails.
+ * Verifies that the process with the given PID belongs to the PostgreSQL instance
+ * running with the designated data directory.
+ * Prevents force-killing unrelated processes due to stale or recycled PIDs.
  */
-export function tryKillPostmaster(dataDir: string, isWsl: boolean): void {
+export function verifyPostmasterIdentity(pid: number, dataDir: string, isWsl: boolean): boolean {
+  if (!pid || isNaN(pid) || pid <= 1) return false;
+
   try {
     if (isWsl) {
-      const pidStr = execSync(`wsl bash -c "head -n 1 ${dataDir}/postmaster.pid 2>/dev/null || true"`, { encoding: 'utf8' }).trim();
-      const pid = parseInt(pidStr, 10);
-      if (pid && !isNaN(pid)) {
-        execSync(`wsl kill -9 ${pid} 2>/dev/null || true`, { stdio: 'ignore' });
+      const cmdline = execFileSync(
+        'wsl',
+        ['sh', '-c', `cat /proc/${pid}/cmdline 2>/dev/null || ps -p ${pid} -o args= 2>/dev/null`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      const normalized = cmdline.replace(/\0/g, ' ');
+      return normalized.includes('postgres') && normalized.includes(dataDir);
+    } else if (process.platform === 'win32') {
+      const cmdline = execFileSync(
+        'powershell.exe',
+        ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      return cmdline.toLowerCase().includes('postgres') && cmdline.includes(dataDir);
+    } else {
+      let cmdline = '';
+      const procPath = `/proc/${pid}/cmdline`;
+      if (fs.existsSync(procPath)) {
+        cmdline = fs.readFileSync(procPath, 'utf8').replace(/\0/g, ' ');
+      } else {
+        cmdline = execFileSync('ps', ['-p', String(pid), '-o', 'args='], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
       }
+      return cmdline.includes('postgres') && cmdline.includes(dataDir);
+    }
+  } catch {
+    // Process does not exist or cmdline could not be verified
+    return false;
+  }
+}
+
+/**
+ * Attempts guarded kill of a postmaster process when regular shutdown fails.
+ * Validates process identity against the expected data directory before sending SIGKILL.
+ */
+export function tryKillPostmaster(
+  dataDir: string,
+  isWsl: boolean,
+  verifier?: ProcessVerifier
+): boolean {
+  try {
+    let pid: number | null = null;
+    if (isWsl) {
+      const pidStr = execFileSync(
+        'wsl',
+        ['sh', '-c', `head -n 1 "${dataDir}/postmaster.pid" 2>/dev/null || true`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      ).trim();
+      pid = parseInt(pidStr, 10);
     } else {
       const pidFilePath = path.join(dataDir, 'postmaster.pid');
       if (fs.existsSync(pidFilePath)) {
         const content = fs.readFileSync(pidFilePath, 'utf8');
-        const pid = parseInt(content.split('\n')[0].trim(), 10);
-        if (pid && !isNaN(pid)) {
-          process.kill(pid, 'SIGKILL');
-        }
+        pid = parseInt(content.split('\n')[0].trim(), 10);
       }
     }
+
+    if (!pid || isNaN(pid)) return false;
+
+    const isVerified = verifier
+      ? verifier.verifyPostgresProcess(pid, dataDir, isWsl)
+      : verifyPostmasterIdentity(pid, dataDir, isWsl);
+
+    if (!isVerified) {
+      // Unverified process or stale PID: refuse to kill!
+      return false;
+    }
+
+    if (isWsl) {
+      execFileSync('wsl', ['kill', '-9', String(pid)], { stdio: 'ignore' });
+    } else {
+      process.kill(pid, 'SIGKILL');
+    }
+    return true;
   } catch {
-    // Best effort
+    return false;
   }
 }
 
@@ -343,11 +508,20 @@ export async function performTeardown(params: {
   isWsl: boolean;
   pgCtlPath: string;
   serverStarted: boolean;
+  serverStopped?: boolean;
+  stage?: ProvisioningStage;
   executor?: ProcessExecutor;
+  verifier?: ProcessVerifier;
+  onServerStopped?: () => void;
 }): Promise<void> {
   const executor = params.executor || defaultProcessExecutor;
 
-  if (params.serverStarted) {
+  // Determine if a server may have started
+  const mayHaveStartedServer =
+    !params.serverStopped &&
+    (params.serverStarted || params.stage === 'starting_server');
+
+  if (mayHaveStartedServer) {
     let stopCmdError: Error | null = null;
     try {
       executor.execStopServer(params.pgCtlPath, params.dataDir, params.isWsl);
@@ -363,8 +537,8 @@ export async function performTeardown(params: {
     );
 
     if (!isStopped) {
-      // Best-effort attempt to terminate postmaster process safely
-      tryKillPostmaster(params.dataDir, params.isWsl);
+      // Guarded force-kill attempt with process identity validation
+      tryKillPostmaster(params.dataDir, params.isWsl, params.verifier);
       const isStoppedAfterKill = await executor.confirmStopped(
         params.dataDir,
         params.port,
@@ -381,6 +555,8 @@ export async function performTeardown(params: {
         );
       }
     }
+
+    params.onServerStopped?.();
   }
 
   // Server shutdown confirmed (or server never started); safely remove data directory
@@ -401,15 +577,12 @@ export async function verifyReadiness(port: number, maxRetries = 25, retryInterv
 
 /**
  * Provisions a truly isolated, temporary PostgreSQL instance on loopback with an ephemeral port.
- * Tracks initialization stages explicitly:
- * 1. Directory allocation
- * 2. initdb execution
- * 3. PostgreSQL startup
- * 4. Database creation
- * 5. Readiness verification
- * 6. Successful handoff
+ * Tracks lifecycle and stages explicitly:
+ * - allocation -> initdb -> starting_server -> creating_db -> verifying_readiness -> ready
+ * - lifecycle: provisioning_in_progress -> running -> teardown_in_progress -> stopped / cleanup_failed
  * 
  * If any stage fails, performs stage-aware cleanup before propagating the original error.
+ * Unregisters instance records and marks stopped ONLY upon confirmed shutdown and directory deletion.
  */
 export async function provisionIsolatedPostgres(options?: ProvisionOptions): Promise<IsolatedPostgresInstance> {
   registerCleanupHooks();
@@ -422,38 +595,66 @@ export async function provisionIsolatedPostgres(options?: ProvisionOptions): Pro
     ...defaultProcessExecutor,
     ...options?.executor,
   };
+  const verifier = options?.verifier;
 
-  // Register in activeInstanceRecords early so emergency handlers can clean up
-  // partially initialized instances even if an interrupt occurs during provisioning
+  // Register in activeInstanceRecords early so emergency handlers and retry paths
+  // can track and clean up partially initialized instances
   const record: ActiveInstanceRecord = {
     dataDir,
     port,
     isWsl: binaries.isWsl,
     pgCtlPath: binaries.pgCtlPath,
     stage: 'allocated',
+    lifecycleState: 'provisioning_in_progress',
     serverStarted: false,
+    serverStopped: false,
     stopped: false,
   };
   activeInstanceRecords.add(record);
 
-  let isStopped = false;
   const stopFn = async (): Promise<void> => {
-    if (isStopped || record.stopped) return;
-    isStopped = true;
-    record.stopped = true;
-    record.stage = 'stopped';
-    try {
-      await performTeardown({
-        dataDir,
-        port,
-        isWsl: binaries.isWsl,
-        pgCtlPath: binaries.pgCtlPath,
-        serverStarted: record.serverStarted,
-        executor,
-      });
-    } finally {
-      activeInstanceRecords.delete(record);
+    // 1. If already stopped, return immediately (idempotent)
+    if (record.lifecycleState === 'stopped' || record.stopped) {
+      return;
     }
+
+    // 2. If teardown in progress by concurrent caller, await in-flight promise
+    if (record.lifecycleState === 'teardown_in_progress' && record.teardownPromise) {
+      return record.teardownPromise;
+    }
+
+    // 3. Mark teardown in progress and execute
+    record.lifecycleState = 'teardown_in_progress';
+    record.teardownPromise = (async () => {
+      try {
+        await performTeardown({
+          dataDir,
+          port,
+          isWsl: binaries.isWsl,
+          pgCtlPath: binaries.pgCtlPath,
+          serverStarted: record.serverStarted,
+          serverStopped: record.serverStopped,
+          stage: record.stage,
+          executor,
+          verifier,
+          onServerStopped: () => {
+            record.serverStopped = true;
+          },
+        });
+        record.lifecycleState = 'stopped';
+        record.stopped = true;
+        record.lastCleanupError = null;
+        activeInstanceRecords.delete(record);
+      } catch (err: any) {
+        record.lifecycleState = 'cleanup_failed';
+        record.lastCleanupError = err;
+        throw err;
+      } finally {
+        record.teardownPromise = null;
+      }
+    })();
+
+    return record.teardownPromise;
   };
 
   try {
@@ -479,6 +680,7 @@ export async function provisionIsolatedPostgres(options?: ProvisionOptions): Pro
       await verifyReadiness(port, options?.readinessRetries ?? 25, options?.readinessIntervalMs ?? 200);
     }
     record.stage = 'ready';
+    record.lifecycleState = 'running';
 
     // Stage 6: Successful handoff
     const instance: IsolatedPostgresInstance = {
@@ -490,8 +692,10 @@ export async function provisionIsolatedPostgres(options?: ProvisionOptions): Pro
     };
 
     return instance;
-  } catch (provisionError) {
+  } catch (provisionError: any) {
     // Stage-aware failure cleanup: clean up whatever was created before propagating
+    record.lifecycleState = 'teardown_in_progress';
+    let cleanupError: Error | null = null;
     try {
       await performTeardown({
         dataDir,
@@ -499,14 +703,28 @@ export async function provisionIsolatedPostgres(options?: ProvisionOptions): Pro
         isWsl: binaries.isWsl,
         pgCtlPath: binaries.pgCtlPath,
         serverStarted: record.serverStarted,
+        serverStopped: record.serverStopped,
+        stage: record.stage,
         executor,
+        verifier,
+        onServerStopped: () => {
+          record.serverStopped = true;
+        },
       });
-    } catch (cleanupErr) {
-      // Record cleanup error details alongside original provisioning failure
-      console.error(`Provisioning failure cleanup encountered secondary error for ${dataDir}:`, cleanupErr);
-    } finally {
+      record.lifecycleState = 'stopped';
       record.stopped = true;
+      record.lastCleanupError = null;
       activeInstanceRecords.delete(record);
+    } catch (cleanupErr: any) {
+      cleanupError = cleanupErr;
+      record.lifecycleState = 'cleanup_failed';
+      record.lastCleanupError = cleanupErr;
+      // Do not delete record from activeInstanceRecords; preserve for retry or exit hooks
+    }
+
+    if (cleanupError) {
+      provisionError.cleanupError = cleanupError;
+      provisionError.message = `${provisionError.message} (Cleanup failure: ${cleanupError.message})`;
     }
     throw provisionError;
   }

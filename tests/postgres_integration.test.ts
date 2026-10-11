@@ -46,9 +46,11 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
     };
 
     // Only skip isolated ephemeral provisioning if running within the verified
-    // GitHub Actions disposable service container environment.
-    // Local execution with CI=true will NEVER bypass ephemeral provisioning.
-    if (isVerifiedGitHubActionsService()) {
+    // GitHub Actions disposable service container environment targeting 'postgres'.
+    // Local execution with loopback targets will NEVER bypass ephemeral provisioning,
+    // even if CI markers are set.
+    const targetHost = process.env.PGHOST || '127.0.0.1';
+    if (isVerifiedGitHubActionsService(targetHost)) {
       process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
     } else {
       isolatedInstance = await provisionIsolatedPostgres();
@@ -64,14 +66,33 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
   }, 45000);
 
   afterAll(async () => {
-    try {
-      if (testClient) await testClient.end();
-      if (adminClient) await adminClient.end();
-      if (isolatedInstance) {
-        await isolatedInstance.stop();
+    const teardownErrors: Error[] = [];
+
+    if (testClient) {
+      try {
+        await testClient.end();
+      } catch (err: any) {
+        teardownErrors.push(new Error(`Failed to close testClient: ${err.message}`));
       }
-    } finally {
-      // Restore environment variables modified by integration harness
+    }
+
+    if (adminClient) {
+      try {
+        await adminClient.end();
+      } catch (err: any) {
+        teardownErrors.push(new Error(`Failed to close adminClient: ${err.message}`));
+      }
+    }
+
+    if (isolatedInstance) {
+      try {
+        await isolatedInstance.stop();
+      } catch (err: any) {
+        teardownErrors.push(new Error(`Failed to stop isolated PostgreSQL instance: ${err.message}`));
+      }
+    }
+
+    try {
       if (savedEnv) {
         for (const [k, v] of Object.entries(savedEnv)) {
           if (v === undefined) {
@@ -81,6 +102,12 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
           }
         }
       }
+    } catch (err: any) {
+      teardownErrors.push(new Error(`Failed to restore environment variables: ${err.message}`));
+    }
+
+    if (teardownErrors.length > 0) {
+      throw new Error(`Integration harness teardown encountered errors:\n${teardownErrors.map(e => e.message).join('\n')}`);
     }
   });
 

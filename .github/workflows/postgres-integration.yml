@@ -30,7 +30,7 @@ jobs:
           --health-retries 5
 
     env:
-      PGHOST: 127.0.0.1
+      PGHOST: postgres
       PGPORT: 5432
       PGDATABASE: hackmate_test
       PGUSER: postgres
@@ -38,6 +38,9 @@ jobs:
       HACKMATE_CI_SERVICE_CONTAINER: 'true'
 
     steps:
+      - name: Map CI PostgreSQL service host
+        run: echo "127.0.0.1 postgres" | sudo tee -a /etc/hosts
+
       - name: Check out repository
         uses: actions/checkout@v4
 

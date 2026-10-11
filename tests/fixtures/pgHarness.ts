@@ -5,7 +5,7 @@ import crypto from 'crypto';
 
 export const EXPECTED_TEST_DATABASE = 'hackmate_test';
 export const ALLOWED_LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
-export const ALLOWED_CI_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', 'postgres']);
+export const ALLOWED_CI_SERVICE_HOSTS = new Set(['postgres']);
 
 export interface HarnessConfig {
   host?: string;
@@ -25,24 +25,35 @@ export interface ValidatedTestConfig {
 }
 
 /**
- * Verifies whether the current process is running in the verified GitHub Actions
- * disposable service container environment.
+ * Verifies whether the target is the designated GitHub Actions disposable
+ * service container environment.
  * Requires:
  * 1. CI === 'true'
  * 2. GITHUB_ACTIONS === 'true'
  * 3. HACKMATE_CI_SERVICE_CONTAINER === 'true'
  * 4. PGDATABASE === EXPECTED_TEST_DATABASE
+ * 5. targetHost (or process.env.PGHOST) is an allowed CI service host ('postgres')
+ *    and NOT a local loopback host (127.0.0.1, localhost, ::1).
  *
- * Simply having CI=true locally without the verified GitHub Actions service configuration
- * is NOT sufficient to bypass local isolated disposable provisioning.
+ * Local execution with loopback targets (127.0.0.1/localhost) CANNOT bypass
+ * isolated disposable cluster provisioning, even if CI markers are set.
  */
-export function isVerifiedGitHubActionsService(): boolean {
-  return (
-    process.env.CI === 'true' &&
-    process.env.GITHUB_ACTIONS === 'true' &&
-    process.env.HACKMATE_CI_SERVICE_CONTAINER === 'true' &&
-    process.env.PGDATABASE === EXPECTED_TEST_DATABASE
-  );
+export function isVerifiedGitHubActionsService(targetHost?: string): boolean {
+  const isCI = process.env.CI === 'true';
+  const isGitHubActions = process.env.GITHUB_ACTIONS === 'true';
+  const isHackmateService = process.env.HACKMATE_CI_SERVICE_CONTAINER === 'true';
+  const isExpectedDb = process.env.PGDATABASE === EXPECTED_TEST_DATABASE;
+
+  if (!isCI || !isGitHubActions || !isHackmateService || !isExpectedDb) {
+    return false;
+  }
+
+  const hostToCheck = (targetHost || process.env.PGHOST || '').toLowerCase();
+  if (!hostToCheck || ALLOWED_LOCAL_HOSTS.has(hostToCheck)) {
+    return false;
+  }
+
+  return ALLOWED_CI_SERVICE_HOSTS.has(hostToCheck);
 }
 
 /**
@@ -91,26 +102,35 @@ export function validateDbTarget(config: ClientConfig | HarnessConfig): Validate
     throw new Error('Safety violation: Target host is unspecified. Aborting.');
   }
 
-  const isGhaService = isVerifiedGitHubActionsService();
-  const isLoopback = ALLOWED_LOCAL_HOSTS.has(host.toLowerCase());
+  const hostLower = host.toLowerCase();
+  const isLoopback = ALLOWED_LOCAL_HOSTS.has(hostLower);
+  const isCiServiceHost = ALLOWED_CI_SERVICE_HOSTS.has(hostLower);
 
-  if (!isLoopback) {
-    if (!isGhaService || !ALLOWED_CI_HOSTS.has(host.toLowerCase())) {
+  if (isLoopback) {
+    // Local loopback execution strictly requires an isolated temporary instance.
+    // CI service bypass is forbidden on loopback to protect local developer databases.
+    const isDisposable = process.env.HACKMATE_DISPOSABLE_INSTANCE === 'true';
+    if (!isDisposable) {
       throw new Error(
-        `Safety violation: Target host must be a loopback address (${Array.from(ALLOWED_LOCAL_HOSTS).join(', ')}) ` +
-        `for local test execution. Received: "${host}". Remote or shared databases are strictly disallowed.`
+        'Safety violation: Direct connection to shared PostgreSQL cluster is disallowed. ' +
+        'Local tests must execute against an isolated temporary instance with HACKMATE_DISPOSABLE_INSTANCE=true ' +
+        'to prevent persistent cluster-wide changes.'
       );
     }
-  }
-
-  // 3. Isolated instance enforcement:
-  // Local execution must never silently attach to an ordinary shared PostgreSQL cluster.
-  const isDisposable = process.env.HACKMATE_DISPOSABLE_INSTANCE === 'true';
-  if (!isGhaService && !isDisposable) {
+  } else if (isCiServiceHost) {
+    // CI service container host is only allowed in verified GitHub Actions environment
+    if (!isVerifiedGitHubActionsService(host)) {
+      throw new Error(
+        `Safety violation: CI service container host "${host}" is only permitted ` +
+        `within a verified GitHub Actions disposable container environment. Aborting.`
+      );
+    }
+  } else {
+    // All other hosts (remote databases, shared development hosts) are strictly forbidden
     throw new Error(
-      'Safety violation: Direct connection to shared PostgreSQL cluster is disallowed. ' +
-      'Local tests must execute against an isolated temporary instance with HACKMATE_DISPOSABLE_INSTANCE=true ' +
-      'to prevent persistent cluster-wide changes.'
+      `Safety violation: Target host must be a loopback address (${Array.from(ALLOWED_LOCAL_HOSTS).join(', ')}) ` +
+      `for local test execution or a verified CI service host (${Array.from(ALLOWED_CI_SERVICE_HOSTS).join(', ')}) in CI. ` +
+      `Received: "${host}". Remote or shared databases are strictly disallowed.`
     );
   }
 

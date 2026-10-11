@@ -12,13 +12,22 @@ import {
   applyMigrations,
   isVerifiedGitHubActionsService,
   EXPECTED_TEST_DATABASE,
+  ALLOWED_LOCAL_HOSTS,
+  ALLOWED_CI_SERVICE_HOSTS,
 } from './fixtures/pgHarness';
 import {
   provisionIsolatedPostgres,
   performTeardown,
   defaultProcessExecutor,
   ProcessExecutor,
+  ProcessVerifier,
   IsolatedPostgresInstance,
+  activeInstanceRecords,
+  performEmergencyCleanupSync,
+  verifyPostmasterIdentity,
+  tryKillPostmaster,
+  confirmStoppedSync,
+  ActiveInstanceRecord,
 } from './fixtures/isolatedPgRunner';
 
 describe('PostgreSQL Harness Target Safety & Isolation', () => {
@@ -253,14 +262,17 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       process.env.CI = 'true';
       process.env.GITHUB_ACTIONS = 'true';
       delete process.env.HACKMATE_CI_SERVICE_CONTAINER;
-      expect(isVerifiedGitHubActionsService()).toBe(false);
+      expect(isVerifiedGitHubActionsService('postgres')).toBe(false);
 
       process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
       process.env.PGDATABASE = 'wrong_database';
-      expect(isVerifiedGitHubActionsService()).toBe(false);
+      expect(isVerifiedGitHubActionsService('postgres')).toBe(false);
 
       process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
-      expect(isVerifiedGitHubActionsService()).toBe(true);
+      expect(isVerifiedGitHubActionsService('postgres')).toBe(true);
+      expect(isVerifiedGitHubActionsService('127.0.0.1')).toBe(false);
+      expect(isVerifiedGitHubActionsService('localhost')).toBe(false);
+      expect(isVerifiedGitHubActionsService('::1')).toBe(false);
     });
 
     it('validates verified GitHub Actions service container configuration', () => {
@@ -270,7 +282,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
 
       const ciConfig = {
-        host: '127.0.0.1',
+        host: 'postgres',
         port: 5432,
         database: 'hackmate_test',
         user: 'postgres',
@@ -278,7 +290,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       };
 
       const validated = validateDbTarget(ciConfig);
-      expect(validated.host).toBe('127.0.0.1');
+      expect(validated.host).toBe('postgres');
       expect(validated.database).toBe('hackmate_test');
       expect(validated.port).toBe(5432);
       expect(validated.user).toBe('postgres');
@@ -297,6 +309,33 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       });
       expect(validated.host).toBe('postgres');
       expect(validated.database).toBe('hackmate_test');
+    });
+
+    it('proves setting all four CI markers locally with 127.0.0.1:5432 cannot bypass isolated provisioning or reach shared-cluster path', () => {
+      process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
+      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
+      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
+      delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
+
+      // Loopback targets must NEVER be recognized as the CI service container
+      expect(isVerifiedGitHubActionsService('127.0.0.1')).toBe(false);
+      expect(isVerifiedGitHubActionsService('localhost')).toBe(false);
+      expect(isVerifiedGitHubActionsService('::1')).toBe(false);
+
+      // validateDbTarget must reject loopback 127.0.0.1:5432 without disposable flag
+      expect(() => {
+        validateDbTarget({ host: '127.0.0.1', port: 5432, database: 'hackmate_test' });
+      }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
+    });
+
+    it('rejects CI service container host "postgres" when not in a verified GitHub Actions environment', () => {
+      delete process.env.CI;
+      delete process.env.GITHUB_ACTIONS;
+
+      expect(() => {
+        validateDbTarget({ host: 'postgres', port: 5432, database: 'hackmate_test' });
+      }).toThrow(/Safety violation: CI service container host "postgres" is only permitted within a verified GitHub Actions/);
     });
 
     it('rejects remote hosts even in verified GitHub Actions environment', () => {
@@ -546,7 +585,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(stopCalled).toBe(false); // Server was never started
     });
 
-    it('cleans up temporary directory on failure during server startup and propagates error', async () => {
+    it('cleans up temporary directory on failure during server startup and attempts shutdown before removal', async () => {
       let removedDir: string | null = null;
       let stopCalled = false;
 
@@ -558,6 +597,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         execStopServer: () => {
           stopCalled = true;
         },
+        confirmStopped: async () => true,
         removeDataDir: (dir) => {
           removedDir = dir;
         },
@@ -568,7 +608,75 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       ).rejects.toThrow('Injected failure during pg_ctl start');
 
       expect(removedDir).not.toBeNull();
-      expect(stopCalled).toBe(false);
+      // Per Objective 2: starting_server is treated as potentially active, so shutdown is attempted
+      expect(stopCalled).toBe(true);
+    });
+
+    it('partially successful startup: simulated postmaster launch followed by startup failure attempts shutdown, confirms stopped, and removes directory', async () => {
+      let stoppedDir: string | null = null;
+      let removedDir: string | null = null;
+      let confirmedStopped = false;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: (_bin, _dir) => {
+          // Simulate a partial startup that launched the postmaster daemon before failing
+          throw new Error('pg_ctl start timed out after launching postmaster daemon');
+        },
+        execStopServer: (_bin, dir) => {
+          stoppedDir = dir;
+        },
+        confirmStopped: async () => {
+          confirmedStopped = true;
+          return true;
+        },
+        removeDataDir: (dir) => {
+          removedDir = dir;
+        },
+      };
+
+      await expect(
+        provisionIsolatedPostgres({ executor: mockExecutor })
+      ).rejects.toThrow('pg_ctl start timed out after launching postmaster daemon');
+
+      expect(stoppedDir).not.toBeNull();
+      expect(confirmedStopped).toBe(true);
+      expect(removedDir).not.toBeNull();
+    });
+
+    it('startup failure where server refuses to stop: preserves data directory, retains active tracking, and enriches error', async () => {
+      let removeCalled = false;
+      const initialActiveCount = activeInstanceRecords.size;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {
+          throw new Error('Startup failed after launching daemon');
+        },
+        execStopServer: () => {},
+        confirmStopped: async () => false, // Shutdown refused
+        removeDataDir: () => {
+          removeCalled = true;
+        },
+      };
+
+      await expect(
+        provisionIsolatedPostgres({ executor: mockExecutor })
+      ).rejects.toThrow(/Cleanup failure: PostgreSQL server in ".*" failed to shut down within timeout/);
+
+      // Data directory was NOT removed
+      expect(removeCalled).toBe(false);
+
+      // Instance record was NOT discarded from activeInstanceRecords
+      expect(activeInstanceRecords.size).toBe(initialActiveCount + 1);
+      const remainingRecord = Array.from(activeInstanceRecords).find(r => r.lifecycleState === 'cleanup_failed');
+      expect(remainingRecord).toBeDefined();
+      expect(remainingRecord!.stopped).toBe(false);
+
+      // Clean up test record from registry
+      if (remainingRecord) {
+        activeInstanceRecords.delete(remainingRecord);
+      }
     });
 
     it('stops server and cleans up directory on failure during database creation after startup', async () => {
@@ -690,6 +798,341 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       await inst.stop();
       expect(stopCallCount).toBe(1);
       expect(removeCallCount).toBe(1);
+    });
+  });
+
+  describe('9. Retryable & State-Safe Teardown Lifecycle', () => {
+    it('failed shutdown leaves instance tracked with lifecycleState === "cleanup_failed" and stopped === false', async () => {
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {},
+        execStopServer: () => {},
+        confirmStopped: async () => false, // Shutdown fails
+        removeDataDir: () => {},
+      };
+
+      const inst = await provisionIsolatedPostgres({
+        executor: mockExecutor,
+        skipReadinessWait: true,
+      });
+
+      const record = Array.from(activeInstanceRecords).find(r => r.dataDir === inst.dataDir);
+      expect(record).toBeDefined();
+
+      await expect(inst.stop()).rejects.toThrow(/failed to shut down within timeout/);
+
+      // Record remains tracked and marked cleanup_failed
+      expect(activeInstanceRecords.has(record!)).toBe(true);
+      expect(record!.lifecycleState).toBe('cleanup_failed');
+      expect(record!.stopped).toBe(false);
+
+      // Clean up record from test set
+      activeInstanceRecords.delete(record!);
+    });
+
+    it('failed directory removal after server stopped leaves instance tracked with serverStopped === true', async () => {
+      let directoryRemovalAttempted = false;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {},
+        execStopServer: () => {},
+        confirmStopped: async () => true, // Server stopped successfully
+        removeDataDir: () => {
+          directoryRemovalAttempted = true;
+          throw new Error('EACCES: permission denied, unlink data directory');
+        },
+      };
+
+      const inst = await provisionIsolatedPostgres({
+        executor: mockExecutor,
+        skipReadinessWait: true,
+      });
+
+      const record = Array.from(activeInstanceRecords).find(r => r.dataDir === inst.dataDir);
+      expect(record).toBeDefined();
+
+      await expect(inst.stop()).rejects.toThrow(/permission denied/);
+
+      expect(directoryRemovalAttempted).toBe(true);
+      expect(activeInstanceRecords.has(record!)).toBe(true);
+      expect(record!.lifecycleState).toBe('cleanup_failed');
+      expect(record!.serverStopped).toBe(true);
+      expect(record!.stopped).toBe(false);
+
+      // Clean up record from test set
+      activeInstanceRecords.delete(record!);
+    });
+
+    it('retry after cleanup failure succeeds once underlying issue is resolved', async () => {
+      let directoryRemovalShouldFail = true;
+      let stopCallCount = 0;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {},
+        execStopServer: () => {
+          stopCallCount++;
+        },
+        confirmStopped: async () => true,
+        removeDataDir: () => {
+          if (directoryRemovalShouldFail) {
+            throw new Error('EBUSY: resource busy or locked');
+          }
+        },
+      };
+
+      const inst = await provisionIsolatedPostgres({
+        executor: mockExecutor,
+        skipReadinessWait: true,
+      });
+
+      const record = Array.from(activeInstanceRecords).find(r => r.dataDir === inst.dataDir);
+      expect(record).toBeDefined();
+
+      // First stop attempt fails on directory removal
+      await expect(inst.stop()).rejects.toThrow(/resource busy or locked/);
+      expect(record!.lifecycleState).toBe('cleanup_failed');
+      expect(activeInstanceRecords.has(record!)).toBe(true);
+      expect(stopCallCount).toBe(1);
+
+      // Resolve the issue and retry stop()
+      directoryRemovalShouldFail = false;
+      await expect(inst.stop()).resolves.not.toThrow();
+
+      // Server was already stopped, so execStopServer was not re-executed
+      expect(stopCallCount).toBe(1);
+      // Now successfully stopped and unregistered
+      expect(record!.lifecycleState).toBe('stopped');
+      expect(record!.stopped).toBe(true);
+      expect(activeInstanceRecords.has(record!)).toBe(false);
+    });
+
+    it('concurrent stop() calls do not run conflicting operations and resolve together', async () => {
+      let stopCallCount = 0;
+      let removeCallCount = 0;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {},
+        execStopServer: () => {
+          stopCallCount++;
+        },
+        confirmStopped: async () => {
+          await new Promise((r) => setTimeout(r, 50));
+          return true;
+        },
+        removeDataDir: () => {
+          removeCallCount++;
+        },
+      };
+
+      const inst = await provisionIsolatedPostgres({
+        executor: mockExecutor,
+        skipReadinessWait: true,
+      });
+
+      // Call stop() 3 times concurrently
+      await Promise.all([inst.stop(), inst.stop(), inst.stop()]);
+
+      // Exactly one execution occurred
+      expect(stopCallCount).toBe(1);
+      expect(removeCallCount).toBe(1);
+    });
+  });
+
+  describe('10. Synchronous Emergency Cleanup Safeguards', () => {
+    it('successfully stops running server, confirms stopped, removes directory, and unregisters', () => {
+      const records = new Set<ActiveInstanceRecord>();
+      let stopCalled = false;
+      let removeCalled = false;
+
+      const testRecord: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_emergency_success',
+        port: 45678,
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'ready',
+        lifecycleState: 'running',
+        serverStarted: true,
+        serverStopped: false,
+        stopped: false,
+      };
+      records.add(testRecord);
+
+      const res = performEmergencyCleanupSync(records, {
+        stopServerSync: () => {
+          stopCalled = true;
+        },
+        confirmStoppedSync: () => true,
+        removeDirSync: () => {
+          removeCalled = true;
+        },
+      });
+
+      expect(stopCalled).toBe(true);
+      expect(removeCalled).toBe(true);
+      expect(testRecord.stopped).toBe(true);
+      expect(testRecord.lifecycleState).toBe('stopped');
+      expect(records.has(testRecord)).toBe(false);
+      expect(res.succeeded).toContain('/tmp/test_emergency_success');
+    });
+
+    it('failed stop does not remove directory and retains record in cleanup_failed state', () => {
+      const records = new Set<ActiveInstanceRecord>();
+      let removeCalled = false;
+
+      const testRecord: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_emergency_fail',
+        port: 45679,
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'ready',
+        lifecycleState: 'running',
+        serverStarted: true,
+        serverStopped: false,
+        stopped: false,
+      };
+      records.add(testRecord);
+
+      const res = performEmergencyCleanupSync(records, {
+        stopServerSync: () => {
+          throw new Error('pg_ctl stop error');
+        },
+        confirmStoppedSync: () => false, // Cannot confirm stopped
+        tryKillPostmasterSync: () => false,
+        removeDirSync: () => {
+          removeCalled = true;
+        },
+      });
+
+      expect(removeCalled).toBe(false);
+      expect(testRecord.stopped).toBe(false);
+      expect(testRecord.lifecycleState).toBe('cleanup_failed');
+      expect(records.has(testRecord)).toBe(true);
+      expect(res.failed).toContain('/tmp/test_emergency_fail');
+    });
+
+    it('unconfirmed shutdown preserves data directory and reports failure', () => {
+      const records = new Set<ActiveInstanceRecord>();
+      let removeCalled = false;
+
+      const testRecord: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_emergency_unconfirmed',
+        port: 45680,
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'starting_server',
+        lifecycleState: 'provisioning_in_progress',
+        serverStarted: false,
+        serverStopped: false,
+        stopped: false,
+      };
+      records.add(testRecord);
+
+      const res = performEmergencyCleanupSync(records, {
+        stopServerSync: () => {},
+        confirmStoppedSync: () => false, // PID file still present
+        tryKillPostmasterSync: () => false,
+        removeDirSync: () => {
+          removeCalled = true;
+        },
+      });
+
+      expect(removeCalled).toBe(false);
+      expect(testRecord.stopped).toBe(false);
+      expect(records.has(testRecord)).toBe(true);
+      expect(res.failed).toContain('/tmp/test_emergency_unconfirmed');
+    });
+
+    it('directory removal failure leaves record tracked in cleanup_failed state with serverStopped === true', () => {
+      const records = new Set<ActiveInstanceRecord>();
+
+      const testRecord: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_emergency_rm_fail',
+        port: 45681,
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'ready',
+        lifecycleState: 'running',
+        serverStarted: true,
+        serverStopped: false,
+        stopped: false,
+      };
+      records.add(testRecord);
+
+      const res = performEmergencyCleanupSync(records, {
+        stopServerSync: () => {},
+        confirmStoppedSync: () => true, // Server stopped
+        removeDirSync: () => {
+          throw new Error('File lock error');
+        },
+      });
+
+      expect(testRecord.serverStopped).toBe(true);
+      expect(testRecord.stopped).toBe(false);
+      expect(testRecord.lifecycleState).toBe('cleanup_failed');
+      expect(records.has(testRecord)).toBe(true);
+      expect(res.failed).toContain('/tmp/test_emergency_rm_fail');
+    });
+  });
+
+  describe('11. Process Identity Verification Before Force-Kill', () => {
+    it('returns false for invalid or missing PIDs', () => {
+      expect(verifyPostmasterIdentity(0, '/tmp/pg', false)).toBe(false);
+      expect(verifyPostmasterIdentity(-1, '/tmp/pg', false)).toBe(false);
+      expect(verifyPostmasterIdentity(1, '/tmp/pg', false)).toBe(false);
+      expect(verifyPostmasterIdentity(NaN, '/tmp/pg', false)).toBe(false);
+    });
+
+    it('refuses to kill process when verifier rejects process identity', () => {
+      let killCalled = false;
+
+      const mockVerifier: ProcessVerifier = {
+        verifyPostgresProcess: (_pid, _dataDir) => false, // Stale or mismatched PID
+      };
+
+      const result = tryKillPostmaster('/tmp/nonexistent_test_pg_dir', false, mockVerifier);
+      expect(result).toBe(false);
+      expect(killCalled).toBe(false);
+    });
+  });
+
+  describe('12. Error Enrichment & Teardown Independence', () => {
+    it('provisioning failure enriches original error with secondary cleanup failure details without swallowing either', async () => {
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {
+          throw new Error('Primary provisioning failure: port in use');
+        },
+        execStopServer: () => {},
+        confirmStopped: async () => false, // Secondary cleanup fails
+        removeDataDir: () => {},
+      };
+
+      let thrownError: any = null;
+      try {
+        await provisionIsolatedPostgres({ executor: mockExecutor });
+      } catch (err: any) {
+        thrownError = err;
+      }
+
+      expect(thrownError).not.toBeNull();
+      // Primary error message is preserved
+      expect(thrownError.message).toContain('Primary provisioning failure: port in use');
+      // Secondary cleanup failure is surfaced
+      expect(thrownError.message).toContain('Cleanup failure');
+      expect(thrownError.cleanupError).toBeDefined();
+
+      // Clean up any tracked record
+      const record = Array.from(activeInstanceRecords).find(r => r.lifecycleState === 'cleanup_failed');
+      if (record) {
+        activeInstanceRecords.delete(record);
+      }
     });
   });
 });
