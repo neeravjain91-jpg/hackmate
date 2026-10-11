@@ -25,6 +25,27 @@ export interface ValidatedTestConfig {
 }
 
 /**
+ * Verifies whether the current process is running in the verified GitHub Actions
+ * disposable service container environment.
+ * Requires:
+ * 1. CI === 'true'
+ * 2. GITHUB_ACTIONS === 'true'
+ * 3. HACKMATE_CI_SERVICE_CONTAINER === 'true'
+ * 4. PGDATABASE === EXPECTED_TEST_DATABASE
+ *
+ * Simply having CI=true locally without the verified GitHub Actions service configuration
+ * is NOT sufficient to bypass local isolated disposable provisioning.
+ */
+export function isVerifiedGitHubActionsService(): boolean {
+  return (
+    process.env.CI === 'true' &&
+    process.env.GITHUB_ACTIONS === 'true' &&
+    process.env.HACKMATE_CI_SERVICE_CONTAINER === 'true' &&
+    process.env.PGDATABASE === EXPECTED_TEST_DATABASE
+  );
+}
+
+/**
  * Validates connection target strictly against safety rules.
  * Fails closed before any connection, migration, fixture creation, or truncation.
  * Error messages never leak passwords or sensitive connection URLs.
@@ -70,11 +91,11 @@ export function validateDbTarget(config: ClientConfig | HarnessConfig): Validate
     throw new Error('Safety violation: Target host is unspecified. Aborting.');
   }
 
-  const isCi = process.env.CI === 'true';
+  const isGhaService = isVerifiedGitHubActionsService();
   const isLoopback = ALLOWED_LOCAL_HOSTS.has(host.toLowerCase());
 
   if (!isLoopback) {
-    if (!isCi || !ALLOWED_CI_HOSTS.has(host.toLowerCase())) {
+    if (!isGhaService || !ALLOWED_CI_HOSTS.has(host.toLowerCase())) {
       throw new Error(
         `Safety violation: Target host must be a loopback address (${Array.from(ALLOWED_LOCAL_HOSTS).join(', ')}) ` +
         `for local test execution. Received: "${host}". Remote or shared databases are strictly disallowed.`
@@ -85,7 +106,7 @@ export function validateDbTarget(config: ClientConfig | HarnessConfig): Validate
   // 3. Isolated instance enforcement:
   // Local execution must never silently attach to an ordinary shared PostgreSQL cluster.
   const isDisposable = process.env.HACKMATE_DISPOSABLE_INSTANCE === 'true';
-  if (!isCi && !isDisposable) {
+  if (!isGhaService && !isDisposable) {
     throw new Error(
       'Safety violation: Direct connection to shared PostgreSQL cluster is disallowed. ' +
       'Local tests must execute against an isolated temporary instance with HACKMATE_DISPOSABLE_INSTANCE=true ' +

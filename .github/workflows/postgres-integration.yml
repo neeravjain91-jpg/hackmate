@@ -35,6 +35,7 @@ jobs:
       PGDATABASE: hackmate_test
       PGUSER: postgres
       PGPASSWORD: testpassword
+      HACKMATE_CI_SERVICE_CONTAINER: 'true'
 
     steps:
       - name: Check out repository

@@ -15,6 +15,7 @@ import {
   rpcUpdateWorkspaceNode,
   rpcDeleteWorkspaceNode,
   computeSha256,
+  isVerifiedGitHubActionsService,
 } from './fixtures/pgHarness';
 
 import {
@@ -26,6 +27,7 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
   let isolatedInstance: IsolatedPostgresInstance | null = null;
   let adminClient: Client;
   let testClient: Client;
+  let savedEnv: Record<string, string | undefined> | null = null;
 
   // Test UUIDs
   const USER_1 = '11111111-1111-1111-1111-111111111111';
@@ -36,14 +38,22 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
   const PROJECT_2 = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 
   beforeAll(async () => {
-    // 1. If not running in CI with a pre-provisioned disposable service container,
-    // provision an isolated temporary PostgreSQL cluster with its own ephemeral lifecycle.
-    if (process.env.CI !== 'true') {
+    savedEnv = {
+      PGHOST: process.env.PGHOST,
+      PGPORT: process.env.PGPORT,
+      PGDATABASE: process.env.PGDATABASE,
+      HACKMATE_DISPOSABLE_INSTANCE: process.env.HACKMATE_DISPOSABLE_INSTANCE,
+    };
+
+    // Only skip isolated ephemeral provisioning if running within the verified
+    // GitHub Actions disposable service container environment.
+    // Local execution with CI=true will NEVER bypass ephemeral provisioning.
+    if (isVerifiedGitHubActionsService()) {
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
+    } else {
       isolatedInstance = await provisionIsolatedPostgres();
       process.env.PGHOST = isolatedInstance.host;
       process.env.PGPORT = String(isolatedInstance.port);
-      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
-    } else {
       process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
     }
 
@@ -54,10 +64,23 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
   }, 45000);
 
   afterAll(async () => {
-    if (testClient) await testClient.end();
-    if (adminClient) await adminClient.end();
-    if (isolatedInstance) {
-      await isolatedInstance.stop();
+    try {
+      if (testClient) await testClient.end();
+      if (adminClient) await adminClient.end();
+      if (isolatedInstance) {
+        await isolatedInstance.stop();
+      }
+    } finally {
+      // Restore environment variables modified by integration harness
+      if (savedEnv) {
+        for (const [k, v] of Object.entries(savedEnv)) {
+          if (v === undefined) {
+            delete process.env[k];
+          } else {
+            process.env[k] = v;
+          }
+        }
+      }
     }
   });
 

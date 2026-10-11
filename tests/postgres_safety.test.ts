@@ -10,10 +10,14 @@ import {
   createAdminClient,
   cleanTables,
   applyMigrations,
+  isVerifiedGitHubActionsService,
   EXPECTED_TEST_DATABASE,
 } from './fixtures/pgHarness';
 import {
   provisionIsolatedPostgres,
+  performTeardown,
+  defaultProcessExecutor,
+  ProcessExecutor,
   IsolatedPostgresInstance,
 } from './fixtures/isolatedPgRunner';
 
@@ -23,6 +27,8 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
   beforeEach(() => {
     process.env = { ...originalEnv };
     delete process.env.CI;
+    delete process.env.GITHUB_ACTIONS;
+    delete process.env.HACKMATE_CI_SERVICE_CONTAINER;
     delete process.env.DATABASE_URL;
     delete process.env.TEST_DATABASE_URL;
     delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
@@ -229,9 +235,39 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     });
   });
 
-  describe('5. Documented CI Configuration Validation', () => {
-    it('validates the documented CI service container configuration', () => {
+  describe('5. Verified GitHub Actions Environment & CI Bypass Prevention', () => {
+    it('proves a local process with CI=true alone cannot bypass ephemeral provisioning', () => {
       process.env.CI = 'true';
+      delete process.env.GITHUB_ACTIONS;
+      delete process.env.HACKMATE_CI_SERVICE_CONTAINER;
+      delete process.env.HACKMATE_DISPOSABLE_INSTANCE;
+
+      expect(isVerifiedGitHubActionsService()).toBe(false);
+
+      expect(() => {
+        validateDbTarget({ host: '127.0.0.1', database: 'hackmate_test' });
+      }).toThrow(/Safety violation: Direct connection to shared PostgreSQL cluster is disallowed/);
+    });
+
+    it('requires all GitHub Actions markers to recognize disposable CI container', () => {
+      process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
+      delete process.env.HACKMATE_CI_SERVICE_CONTAINER;
+      expect(isVerifiedGitHubActionsService()).toBe(false);
+
+      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
+      process.env.PGDATABASE = 'wrong_database';
+      expect(isVerifiedGitHubActionsService()).toBe(false);
+
+      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
+      expect(isVerifiedGitHubActionsService()).toBe(true);
+    });
+
+    it('validates verified GitHub Actions service container configuration', () => {
+      process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
+      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
+      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
 
       const ciConfig = {
         host: '127.0.0.1',
@@ -248,8 +284,11 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(validated.user).toBe('postgres');
     });
 
-    it('allows container service host "postgres" in CI environment without external credentials', () => {
+    it('allows container service host "postgres" in verified GitHub Actions environment', () => {
       process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
+      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
+      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
 
       const validated = validateDbTarget({
         host: 'postgres',
@@ -260,8 +299,11 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(validated.database).toBe('hackmate_test');
     });
 
-    it('rejects remote non-service hosts even in CI', () => {
+    it('rejects remote hosts even in verified GitHub Actions environment', () => {
       process.env.CI = 'true';
+      process.env.GITHUB_ACTIONS = 'true';
+      process.env.HACKMATE_CI_SERVICE_CONTAINER = 'true';
+      process.env.PGDATABASE = EXPECTED_TEST_DATABASE;
 
       expect(() => {
         validateDbTarget({
@@ -270,6 +312,36 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
           database: 'hackmate_test',
         });
       }).toThrow(/Safety violation: Target host must be a loopback address/);
+    });
+
+    it('verifies that environment variables modified by integration harness are restored after teardown', async () => {
+      const initialPgHost = process.env.PGHOST;
+      const initialPgPort = process.env.PGPORT;
+      const initialDisposable = process.env.HACKMATE_DISPOSABLE_INSTANCE;
+
+      const savedEnv = {
+        PGHOST: process.env.PGHOST,
+        PGPORT: process.env.PGPORT,
+        HACKMATE_DISPOSABLE_INSTANCE: process.env.HACKMATE_DISPOSABLE_INSTANCE,
+      };
+
+      // Simulate integration harness modifying env
+      process.env.PGHOST = '127.0.0.1';
+      process.env.PGPORT = '65432';
+      process.env.HACKMATE_DISPOSABLE_INSTANCE = 'true';
+
+      // Simulate afterAll restoration
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) {
+          delete process.env[k];
+        } else {
+          process.env[k] = v;
+        }
+      }
+
+      expect(process.env.PGHOST).toBe(initialPgHost);
+      expect(process.env.PGPORT).toBe(initialPgPort);
+      expect(process.env.HACKMATE_DISPOSABLE_INSTANCE).toBe(initialDisposable);
     });
   });
 
@@ -378,7 +450,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       if (inst.isWsl) {
         let dirExists = true;
         try {
-          execSync(`wsl bash -c "test -d ${inst.dataDir}"`, { stdio: 'ignore' });
+          execSync(`wsl test -d ${inst.dataDir}`, { stdio: 'ignore' });
         } catch {
           dirExists = false;
         }
@@ -446,6 +518,178 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(() => {
         validateDbTarget({ host: '127.0.0.1', database: 'hackmate_test' });
       }).toThrow(/Direct connection to shared PostgreSQL cluster is disallowed/);
+    });
+  });
+
+  describe('8. Provisioning Failure-Path Cleanup & Teardown Safety', () => {
+    it('cleans up temporary directory on failure during initdb and propagates error', async () => {
+      let removedDir: string | null = null;
+      let stopCalled = false;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: (_bin, _dir) => {
+          throw new Error('Injected failure during initdb');
+        },
+        execStopServer: () => {
+          stopCalled = true;
+        },
+        removeDataDir: (dir) => {
+          removedDir = dir;
+        },
+      };
+
+      await expect(
+        provisionIsolatedPostgres({ executor: mockExecutor })
+      ).rejects.toThrow('Injected failure during initdb');
+
+      expect(removedDir).not.toBeNull();
+      expect(stopCalled).toBe(false); // Server was never started
+    });
+
+    it('cleans up temporary directory on failure during server startup and propagates error', async () => {
+      let removedDir: string | null = null;
+      let stopCalled = false;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {}, // initdb succeeds
+        execStartServer: () => {
+          throw new Error('Injected failure during pg_ctl start');
+        },
+        execStopServer: () => {
+          stopCalled = true;
+        },
+        removeDataDir: (dir) => {
+          removedDir = dir;
+        },
+      };
+
+      await expect(
+        provisionIsolatedPostgres({ executor: mockExecutor })
+      ).rejects.toThrow('Injected failure during pg_ctl start');
+
+      expect(removedDir).not.toBeNull();
+      expect(stopCalled).toBe(false);
+    });
+
+    it('stops server and cleans up directory on failure during database creation after startup', async () => {
+      let stoppedDir: string | null = null;
+      let removedDir: string | null = null;
+      let confirmedStopped = false;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {
+          throw new Error('Injected failure during createdb');
+        },
+        execStopServer: (_bin, dir) => {
+          stoppedDir = dir;
+        },
+        confirmStopped: async () => {
+          confirmedStopped = true;
+          return true;
+        },
+        removeDataDir: (dir) => {
+          removedDir = dir;
+        },
+      };
+
+      await expect(
+        provisionIsolatedPostgres({ executor: mockExecutor })
+      ).rejects.toThrow('Injected failure during createdb');
+
+      expect(stoppedDir).not.toBeNull();
+      expect(confirmedStopped).toBe(true);
+      expect(removedDir).not.toBeNull();
+    });
+
+    it('stops server and cleans up directory on failure during readiness verification', async () => {
+      let stoppedDir: string | null = null;
+      let removedDir: string | null = null;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {},
+        execStopServer: (_bin, dir) => {
+          stoppedDir = dir;
+        },
+        confirmStopped: async () => true,
+        removeDataDir: (dir) => {
+          removedDir = dir;
+        },
+      };
+
+      // Mock readiness failure with short retry loop to fail fast
+      await expect(
+        provisionIsolatedPostgres({
+          executor: mockExecutor,
+          readinessRetries: 3,
+          readinessIntervalMs: 50,
+        })
+      ).rejects.toThrow(/Failed to establish connection to isolated PostgreSQL instance/);
+
+      expect(stoppedDir).not.toBeNull();
+      expect(removedDir).not.toBeNull();
+    });
+
+    it('refuses to remove data directory and reports error when shutdown cannot be confirmed', async () => {
+      let removeCalled = false;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execStopServer: () => {},
+        confirmStopped: async () => false, // Server refuses to stop
+        removeDataDir: () => {
+          removeCalled = true;
+        },
+      };
+
+      await expect(
+        performTeardown({
+          dataDir: '/tmp/test_stubborn_pg',
+          port: 54321,
+          isWsl: false,
+          pgCtlPath: 'pg_ctl',
+          serverStarted: true,
+          executor: { ...defaultProcessExecutor, ...mockExecutor },
+        })
+      ).rejects.toThrow(/Cleanup failure: PostgreSQL server in ".*" failed to shut down within timeout/);
+
+      // Data directory must NOT have been removed
+      expect(removeCalled).toBe(false);
+    });
+
+    it('guarantees stop() is strictly idempotent', async () => {
+      let stopCallCount = 0;
+      let removeCallCount = 0;
+
+      const mockExecutor: Partial<ProcessExecutor> = {
+        execInitdb: () => {},
+        execStartServer: () => {},
+        execCreatedb: () => {},
+        execStopServer: () => {
+          stopCallCount++;
+        },
+        confirmStopped: async () => true,
+        removeDataDir: () => {
+          removeCallCount++;
+        },
+      };
+
+      const inst = await provisionIsolatedPostgres({
+        executor: mockExecutor,
+        skipReadinessWait: true,
+      });
+
+      // First stop call
+      await inst.stop();
+      expect(stopCallCount).toBe(1);
+      expect(removeCallCount).toBe(1);
+
+      // Second stop call (must be no-op)
+      await inst.stop();
+      expect(stopCallCount).toBe(1);
+      expect(removeCallCount).toBe(1);
     });
   });
 });
