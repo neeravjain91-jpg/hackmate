@@ -80,8 +80,33 @@ export interface EmergencyCleanupFailure {
   stage?: ProvisioningStage;
 }
 
+export type PortProbeStatus = 'open' | 'closed' | 'unknown';
+
+export interface PortProbeResult {
+  status: PortProbeStatus;
+  reason?: string;
+  error?: unknown;
+}
+
+export type PidFileStatus = 'present' | 'absent' | 'unknown';
+
+export interface PidFileInspectionResult {
+  status: PidFileStatus;
+  reason?: string;
+  error?: unknown;
+}
+
+export type ShutdownConfirmationStatus = 'stopped' | 'running' | 'unknown';
+
+export interface ShutdownVerificationResult {
+  confirmedStopped: boolean;
+  pidStatus: PidFileStatus;
+  portStatus: PortProbeStatus;
+  reason?: string;
+}
+
 export interface EmergencyCleanupSyncOptions {
-  confirmStoppedSync?: (dataDir: string, isWsl: boolean, port?: number) => boolean;
+  confirmStoppedSync?: (dataDir: string, isWsl: boolean, port?: number) => boolean | ShutdownVerificationResult;
   stopServerSync?: (pgCtlPath: string, dataDir: string, isWsl: boolean) => void;
   removeDirSync?: (dataDir: string, isWsl: boolean) => void;
   tryKillPostmasterSync?: (dataDir: string, isWsl: boolean) => boolean;
@@ -91,91 +116,327 @@ export interface EmergencyCleanupSyncOptions {
 export const activeInstanceRecords = new Set<ActiveInstanceRecord>();
 
 /**
- * Synchronously checks whether a local TCP port is open.
- * Uses child process TCP probe without depending on asynchronous callbacks.
+ * Validates that a port is an integer in the safe ephemeral TCP port range.
  */
-export function checkPortOpenSync(port: number, isWsl: boolean): boolean {
-  if (isWsl) {
-    try {
-      childProcess.execFileSync(
-        'wsl',
-        ['sh', '-c', `(ss -tln "sport = :${port}" 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":${port} "`],
-        { stdio: 'ignore' }
-      );
-      return true; // Exit 0 => port is listening
-    } catch (err: any) {
-      if (err && typeof err.status === 'number' && err.status === 1) {
-        return false; // Exit 1 => port is not listening
-      }
-      return false;
-    }
+export function isValidPort(port: unknown): port is number {
+  return typeof port === 'number' && Number.isInteger(port) && port >= 1024 && port <= 65535;
+}
+
+/**
+ * Probes a local TCP port synchronously on native systems using Node child process.
+ * Explicitly distinguishes:
+ * - 'open': connection successfully established.
+ * - 'closed': connection explicitly refused (ECONNREFUSED on loopback).
+ * - 'unknown': process spawn failure, timeout, unexpected socket error, etc.
+ */
+export function probePortSyncNative(port: number, timeoutMs = 1500): PortProbeResult {
+  if (!isValidPort(port)) {
+    return { status: 'unknown', reason: `Invalid port: ${port}` };
+  }
+
+  const childScript = `
+const net = require('net');
+const s = net.createConnection({ port: ${port}, host: '127.0.0.1' }, () => {
+  process.stdout.write('HACKMATE_PORT:OPEN\\n');
+  s.destroy();
+  process.exit(0);
+});
+s.on('error', (err) => {
+  if (err && err.code === 'ECONNREFUSED') {
+    process.stdout.write('HACKMATE_PORT:CLOSED\\n');
+    process.exit(0);
   } else {
-    try {
-      childProcess.execFileSync(
-        process.execPath,
-        [
-          '-e',
-          `const net = require('net');
-           const s = net.createConnection({ port: ${port}, host: '127.0.0.1' }, () => { process.exit(0); });
-           s.on('error', () => process.exit(1));
-           setTimeout(() => process.exit(1), 300);`,
-        ],
-        { stdio: 'ignore', timeout: 1000 }
-      );
-      return true; // Connected => port open
-    } catch {
-      return false; // Error or timeout => port closed
+    process.stdout.write('HACKMATE_PORT:UNKNOWN_ERR_' + (err && err.code ? err.code : 'UNKNOWN') + '\\n');
+    process.exit(2);
+  }
+});
+setTimeout(() => {
+  try { s.destroy(); } catch {}
+  process.stdout.write('HACKMATE_PORT:TIMEOUT\\n');
+  process.exit(3);
+}, 300);
+`;
+
+  try {
+    const stdoutBuf = childProcess.execFileSync(
+      process.execPath,
+      ['-e', childScript],
+      {
+        timeout: timeoutMs,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    const stdout = String(stdoutBuf);
+    if (stdout.includes('HACKMATE_PORT:OPEN')) {
+      return { status: 'open' };
     }
+    if (stdout.includes('HACKMATE_PORT:CLOSED')) {
+      return { status: 'closed' };
+    }
+    return { status: 'unknown', reason: `Unrecognized output from port probe: ${stdout.trim()}` };
+  } catch (err: any) {
+    if (err && err.stdout) {
+      const stdout = String(err.stdout);
+      if (stdout.includes('HACKMATE_PORT:OPEN')) return { status: 'open' };
+      if (stdout.includes('HACKMATE_PORT:CLOSED')) return { status: 'closed' };
+    }
+    if (err?.code === 'ETIMEDOUT') {
+      return { status: 'unknown', reason: `Port probe process timed out after ${timeoutMs}ms`, error: err };
+    }
+    if (err?.code === 'ENOENT' || err?.code === 'EACCES' || err?.code === 'ENOMEM' || String(err?.message).includes('spawn')) {
+      return { status: 'unknown', reason: `Port probe process spawn failure: ${err.message}`, error: err };
+    }
+    return { status: 'unknown', reason: `Port probe process failure: ${err?.message || String(err)}`, error: err };
   }
 }
 
 /**
- * Synchronously checks whether a postmaster process has fully stopped.
- * Confirms both absence of postmaster.pid AND (where port is specified) closed port status.
- * Fails closed: treats command-execution errors or inability to inspect as UNVERIFIED (false).
+ * Probes a local TCP port synchronously in WSL.
+ * Verifies inspection utilities exist, avoids false closures from pipeline failures,
+ * and uses unambiguous protocol markers.
  */
-export function confirmStoppedSync(dataDir: string, isWsl: boolean, port?: number): boolean {
-  let pidExists = false;
+export function probePortSyncWsl(port: number, timeoutMs = 2000): PortProbeResult {
+  if (!isValidPort(port)) {
+    return { status: 'unknown', reason: `Invalid port: ${port}` };
+  }
 
-  if (isWsl) {
-    try {
-      childProcess.execFileSync('wsl', ['test', '-f', `${dataDir}/postmaster.pid`], { stdio: 'ignore' });
-      // Exit 0 means file exists => server not stopped
-      pidExists = true;
-    } catch (err: any) {
-      if (err && typeof err.status === 'number' && err.status === 1) {
-        // Exit 1 means file does not exist
-        pidExists = false;
-      } else {
-        // Any other exit code or process error is an execution failure.
-        // Treat inability to inspect as unverified => fail closed
-        return false;
+  const wslScript =
+    `if command -v ss >/dev/null 2>&1; then ` +
+    `if ss -tln 2>/dev/null | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
+    `echo 'HACKMATE_PORT:OPEN'; else echo 'HACKMATE_PORT:CLOSED'; fi; exit 0; fi; ` +
+    `if command -v netstat >/dev/null 2>&1; then ` +
+    `if netstat -tln 2>/dev/null | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
+    `echo 'HACKMATE_PORT:OPEN'; else echo 'HACKMATE_PORT:CLOSED'; fi; exit 0; fi; ` +
+    `echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; exit 1`;
+
+  try {
+    const stdoutBuf = childProcess.execFileSync(
+      'wsl',
+      ['sh', '-c', wslScript],
+      {
+        timeout: timeoutMs,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    const stdout = String(stdoutBuf);
+    if (stdout.includes('HACKMATE_PORT:OPEN')) {
+      return { status: 'open' };
+    }
+    if (stdout.includes('HACKMATE_PORT:CLOSED')) {
+      return { status: 'closed' };
+    }
+    if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
+      return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
+    }
+    return { status: 'unknown', reason: `Unrecognized WSL port probe output: ${stdout.trim()}` };
+  } catch (err: any) {
+    if (err && err.stdout) {
+      const stdout = String(err.stdout);
+      if (stdout.includes('HACKMATE_PORT:OPEN')) return { status: 'open' };
+      if (stdout.includes('HACKMATE_PORT:CLOSED')) return { status: 'closed' };
+      if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
+        return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
       }
     }
-  } else {
-    try {
-      pidExists = fs.existsSync(path.join(dataDir, 'postmaster.pid'));
-    } catch {
-      // Filesystem inspection error => fail closed
-      return false;
+    return { status: 'unknown', reason: `WSL port probe failed: ${err?.message || String(err)}`, error: err };
+  }
+}
+
+/**
+ * Synchronously checks whether a local TCP port is open.
+ * Returns PortProbeResult: 'open', 'closed', or 'unknown'.
+ */
+export function checkPortOpenSync(port: number, isWsl: boolean): PortProbeResult {
+  if (isWsl) {
+    return probePortSyncWsl(port);
+  }
+  return probePortSyncNative(port);
+}
+
+/**
+ * Inspects postmaster.pid synchronously on native systems.
+ * Distinguishes present, definitively absent (ENOENT / ENOTDIR), or unknown (EACCES / I/O errors).
+ */
+export function inspectPidFileSync(dataDir: string): PidFileInspectionResult {
+  const pidPath = path.join(dataDir, 'postmaster.pid');
+  try {
+    fs.statSync(pidPath);
+    return { status: 'present' };
+  } catch (err: any) {
+    if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+      return { status: 'absent' };
     }
+    return {
+      status: 'unknown',
+      reason: `PID inspection filesystem error (${err?.code || err?.message || 'unknown'})`,
+      error: err,
+    };
+  }
+}
+
+/**
+ * Inspects postmaster.pid asynchronously on native systems.
+ */
+export async function inspectPidFileAsync(dataDir: string): Promise<PidFileInspectionResult> {
+  const pidPath = path.join(dataDir, 'postmaster.pid');
+  try {
+    await fs.promises.stat(pidPath);
+    return { status: 'present' };
+  } catch (err: any) {
+    if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+      return { status: 'absent' };
+    }
+    return {
+      status: 'unknown',
+      reason: `PID inspection filesystem error (${err?.code || err?.message || 'unknown'})`,
+      error: err,
+    };
+  }
+}
+
+/**
+ * Inspects postmaster.pid synchronously in WSL.
+ * Uses explicit markers: HACKMATE_PID:PRESENT, HACKMATE_PID:ABSENT, HACKMATE_PID:UNKNOWN.
+ */
+export function inspectPidFileWslSync(dataDir: string, timeoutMs = 2000): PidFileInspectionResult {
+  const pidPath = `${dataDir}/postmaster.pid`;
+  const escapedPidPath = pidPath.replace(/'/g, "'\\''");
+  const wslScript =
+    `if [ -f '${escapedPidPath}' ]; then echo 'HACKMATE_PID:PRESENT'; exit 0; fi; ` +
+    `d=$(dirname '${escapedPidPath}'); if [ -d "$d" ]; then if [ ! -x "$d" ] || [ ! -r "$d" ]; then echo 'HACKMATE_PID:UNKNOWN'; exit 1; fi; fi; ` +
+    `if [ ! -e '${escapedPidPath}' ]; then echo 'HACKMATE_PID:ABSENT'; exit 0; fi; ` +
+    `echo 'HACKMATE_PID:UNKNOWN'; exit 1`;
+
+  try {
+    const stdoutBuf = childProcess.execFileSync(
+      'wsl',
+      ['sh', '-c', wslScript],
+      {
+        timeout: timeoutMs,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    const stdout = String(stdoutBuf);
+    if (stdout.includes('HACKMATE_PID:PRESENT')) {
+      return { status: 'present' };
+    }
+    if (stdout.includes('HACKMATE_PID:ABSENT')) {
+      return { status: 'absent' };
+    }
+    return { status: 'unknown', reason: `Unrecognized WSL PID inspection output: ${stdout.trim()}` };
+  } catch (err: any) {
+    if (err && err.stdout) {
+      const stdout = String(err.stdout);
+      if (stdout.includes('HACKMATE_PID:PRESENT')) return { status: 'present' };
+      if (stdout.includes('HACKMATE_PID:ABSENT')) return { status: 'absent' };
+    }
+    return { status: 'unknown', reason: `WSL PID inspection failed: ${err?.message || String(err)}`, error: err };
+  }
+}
+
+/**
+ * Inspects postmaster.pid synchronously, delegating to native or WSL implementation.
+ */
+export function inspectPidFile(dataDir: string, isWsl: boolean): PidFileInspectionResult {
+  if (isWsl) {
+    return inspectPidFileWslSync(dataDir);
+  }
+  return inspectPidFileSync(dataDir);
+}
+
+/**
+ * Synchronously verifies complete shutdown evidence for a PostgreSQL instance.
+ * Positively requires BOTH confirmed absence of postmaster.pid AND confirmed closed TCP port.
+ */
+export function verifyShutdownSync(dataDir: string, port: number, isWsl: boolean): ShutdownVerificationResult {
+  if (!isValidPort(port)) {
+    return {
+      confirmedStopped: false,
+      pidStatus: 'unknown',
+      portStatus: 'unknown',
+      reason: `Invalid or missing port: ${port}. Active instance shutdown requires a valid loopback port.`,
+    };
   }
 
-  // If postmaster.pid still exists, server is definitely not stopped
-  if (pidExists) {
+  let pidResult: PidFileInspectionResult;
+  try {
+    pidResult = inspectPidFile(dataDir, isWsl);
+  } catch (err: any) {
+    pidResult = { status: 'unknown', reason: `PID inspection exception: ${err?.message || String(err)}` };
+  }
+
+  let portResult: PortProbeResult;
+  try {
+    portResult = checkPortOpenSync(port, isWsl);
+  } catch (err: any) {
+    portResult = { status: 'unknown', reason: `Port probe exception: ${err?.message || String(err)}` };
+  }
+
+  if (pidResult.status === 'present') {
+    return {
+      confirmedStopped: false,
+      pidStatus: 'present',
+      portStatus: portResult.status,
+      reason: `PostgreSQL PID file is still present at "${dataDir}/postmaster.pid"`,
+    };
+  }
+
+  if (portResult.status === 'open') {
+    return {
+      confirmedStopped: false,
+      pidStatus: pidResult.status,
+      portStatus: 'open',
+      reason: `PostgreSQL port ${port} is still open and accepting connections`,
+    };
+  }
+
+  if (pidResult.status === 'unknown') {
+    return {
+      confirmedStopped: false,
+      pidStatus: 'unknown',
+      portStatus: portResult.status,
+      reason: `PostgreSQL PID file status is unknown (${pidResult.reason || 'inspection error'}). Shutdown cannot be confirmed.`,
+    };
+  }
+
+  if (portResult.status === 'unknown') {
+    return {
+      confirmedStopped: false,
+      pidStatus: pidResult.status,
+      portStatus: 'unknown',
+      reason: `PostgreSQL port ${port} status is unknown (${portResult.reason || 'probe error'}). Shutdown cannot be confirmed.`,
+    };
+  }
+
+  if (pidResult.status === 'absent' && portResult.status === 'closed') {
+    return {
+      confirmedStopped: true,
+      pidStatus: 'absent',
+      portStatus: 'closed',
+    };
+  }
+
+  return {
+    confirmedStopped: false,
+    pidStatus: pidResult.status,
+    portStatus: portResult.status,
+    reason: `Incomplete shutdown evidence (PID: ${pidResult.status}, Port: ${portResult.status})`,
+  };
+}
+
+/**
+ * Backward-compatible synchronous confirmation helper.
+ * Returns true ONLY when shutdown is positively confirmed by complete evidence.
+ */
+export function confirmStoppedSync(dataDir: string, isWsl: boolean, port?: number): boolean {
+  if (port === undefined || !isValidPort(port)) {
     return false;
   }
-
-  // If port is specified, verify port is also closed
-  if (port && port > 0) {
-    const isPortOpen = checkPortOpenSync(port, isWsl);
-    if (isPortOpen) {
-      // Port is still open even though PID file is absent => server not stopped!
-      return false;
-    }
-  }
-
-  return true;
+  const result = verifyShutdownSync(dataDir, port, isWsl);
+  return result.confirmedStopped;
 }
 
 /**
@@ -200,6 +461,16 @@ export function performEmergencyCleanupSync(
       (record.serverStarted || record.stage === 'starting_server');
 
     if (mayHaveStarted) {
+      if (!isValidPort(record.port)) {
+        record.lifecycleState = 'cleanup_failed';
+        failed.push({
+          dataDir: record.dataDir,
+          error: `Shutdown verification failed: missing or invalid port (${record.port}). Data directory removal aborted.`,
+          stage: record.stage,
+        });
+        return; // Abort directory removal to protect running server!
+      }
+
       try {
         if (options?.stopServerSync) {
           options.stopServerSync(record.pgCtlPath, record.dataDir, record.isWsl);
@@ -214,16 +485,25 @@ export function performEmergencyCleanupSync(
         // Orderly stop might fail
       }
 
-      let isStopped = false;
+      let checkResult: ShutdownVerificationResult;
       try {
-        isStopped = options?.confirmStoppedSync
-          ? options.confirmStoppedSync(record.dataDir, record.isWsl, record.port)
-          : confirmStoppedSync(record.dataDir, record.isWsl, record.port);
-      } catch {
-        isStopped = false;
+        if (options?.confirmStoppedSync) {
+          const optRes = options.confirmStoppedSync(record.dataDir, record.isWsl, record.port);
+          if (typeof optRes === 'boolean') {
+            checkResult = optRes
+              ? { confirmedStopped: true, pidStatus: 'absent', portStatus: 'closed' }
+              : { confirmedStopped: false, pidStatus: 'unknown', portStatus: 'unknown', reason: 'Shutdown confirmation returned false' };
+          } else {
+            checkResult = optRes;
+          }
+        } else {
+          checkResult = verifyShutdownSync(record.dataDir, record.port, record.isWsl);
+        }
+      } catch (err: any) {
+        checkResult = { confirmedStopped: false, pidStatus: 'unknown', portStatus: 'unknown', reason: err?.message };
       }
 
-      if (!isStopped) {
+      if (!checkResult.confirmedStopped) {
         // Guarded force-kill attempt
         let killResult = false;
         try {
@@ -237,20 +517,29 @@ export function performEmergencyCleanupSync(
         }
 
         // Re-confirm shutdown. Do not treat killResult alone as proof that server stopped!
-        let isStoppedAfterKill = false;
+        let checkAfterKill: ShutdownVerificationResult;
         try {
-          isStoppedAfterKill = options?.confirmStoppedSync
-            ? options.confirmStoppedSync(record.dataDir, record.isWsl, record.port)
-            : confirmStoppedSync(record.dataDir, record.isWsl, record.port);
-        } catch {
-          isStoppedAfterKill = false;
+          if (options?.confirmStoppedSync) {
+            const optRes = options.confirmStoppedSync(record.dataDir, record.isWsl, record.port);
+            if (typeof optRes === 'boolean') {
+              checkAfterKill = optRes
+                ? { confirmedStopped: true, pidStatus: 'absent', portStatus: 'closed' }
+                : { confirmedStopped: false, pidStatus: 'unknown', portStatus: 'unknown', reason: 'Shutdown confirmation returned false' };
+            } else {
+              checkAfterKill = optRes;
+            }
+          } else {
+            checkAfterKill = verifyShutdownSync(record.dataDir, record.port, record.isWsl);
+          }
+        } catch (err: any) {
+          checkAfterKill = { confirmedStopped: false, pidStatus: 'unknown', portStatus: 'unknown', reason: err?.message };
         }
 
-        if (!isStoppedAfterKill) {
+        if (!checkAfterKill.confirmedStopped) {
           record.lifecycleState = 'cleanup_failed';
           const reason = !killResult
-            ? 'PostgreSQL server failed to stop and force-kill was refused (unverifiable PID) or failed'
-            : 'PostgreSQL server process could not be confirmed as terminated after force-kill';
+            ? `PostgreSQL server failed to stop and force-kill was refused (unverifiable PID) or failed (${checkAfterKill.reason || 'shutdown unconfirmed'})`
+            : `PostgreSQL server process could not be confirmed as terminated after force-kill (${checkAfterKill.reason || 'shutdown unconfirmed'})`;
           failed.push({ dataDir: record.dataDir, error: reason, stage: record.stage });
           return; // Abort directory removal to protect running server!
         }
@@ -434,22 +723,48 @@ export async function getFreeEphemeralPort(): Promise<number> {
 
 /**
  * Checks whether TCP connection can be established on a local port.
+ * Returns PortProbeResult: 'open', 'closed', or 'unknown'.
  */
-export async function checkPortOpen(port: number, timeoutMs = 300): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    const s = net.createConnection({ host: '127.0.0.1', port });
-    s.setTimeout(timeoutMs);
-    s.on('connect', () => {
-      s.destroy();
-      resolve(true);
+export async function checkPortOpen(port: number, timeoutMs = 300): Promise<PortProbeResult> {
+  if (!isValidPort(port)) {
+    return { status: 'unknown', reason: `Invalid port: ${port}` };
+  }
+
+  return new Promise<PortProbeResult>((resolve) => {
+    let resolved = false;
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    socket.setTimeout(timeoutMs);
+
+    const finish = (result: PortProbeResult) => {
+      if (resolved) return;
+      resolved = true;
+      try {
+        socket.destroy();
+      } catch {}
+      resolve(result);
+    };
+
+    socket.on('connect', () => {
+      finish({ status: 'open' });
     });
-    s.on('timeout', () => {
-      s.destroy();
-      resolve(false);
+
+    socket.on('timeout', () => {
+      finish({
+        status: 'unknown',
+        reason: `Connection to 127.0.0.1:${port} timed out after ${timeoutMs}ms`,
+      });
     });
-    s.on('error', () => {
-      s.destroy();
-      resolve(false);
+
+    socket.on('error', (err: any) => {
+      if (err && err.code === 'ECONNREFUSED') {
+        finish({ status: 'closed' });
+      } else {
+        finish({
+          status: 'unknown',
+          reason: `Connection to 127.0.0.1:${port} failed with unexpected error: ${err?.code || err?.message}`,
+          error: err,
+        });
+      }
     });
   });
 }
@@ -587,50 +902,14 @@ export const defaultProcessExecutor: ProcessExecutor = {
   },
 
   async confirmStopped(dataDir: string, port: number, isWsl: boolean, _pgCtlPath: string, maxWaitMs = 5000): Promise<boolean> {
-    const start = Date.now();
-    while (Date.now() - start < maxWaitMs) {
-      let pidExists = false;
-      let inspectionFailed = false;
-
-      if (isWsl) {
-        try {
-          execFileSync('wsl', ['test', '-f', `${dataDir}/postmaster.pid`], { stdio: 'ignore' });
-          pidExists = true;
-        } catch (err: any) {
-          if (err && typeof err.status === 'number' && err.status === 1) {
-            pidExists = false;
-          } else {
-            // Inspection error: cannot confirm stopped, keep polling
-            inspectionFailed = true;
-          }
-        }
-      } else {
-        try {
-          pidExists = fs.existsSync(path.join(dataDir, 'postmaster.pid'));
-        } catch {
-          inspectionFailed = true;
-        }
-      }
-
-      if (inspectionFailed) {
-        await new Promise((r) => setTimeout(r, 150));
-        continue;
-      }
-
-      const isPortOpen = await checkPortOpen(port);
-
-      if (!pidExists && !isPortOpen) {
-        return true;
-      }
-      await new Promise((r) => setTimeout(r, 150));
-    }
-    return false;
+    const result = await verifyShutdownAsync(dataDir, port, isWsl, maxWaitMs);
+    return result.confirmedStopped;
   },
 
   removeDataDir(dataDir: string, isWsl: boolean) {
     if (isWsl) {
       try {
-        execFileSync('wsl', ['rm', '-rf', dataDir], { stdio: 'ignore' });
+        childProcess.execFileSync('wsl', ['rm', '-rf', dataDir], { stdio: 'ignore' });
       } catch (err: any) {
         throw new Error(`Cleanup failure: Failed to remove WSL data directory "${dataDir}": ${err.message}`);
       }
@@ -645,6 +924,81 @@ export const defaultProcessExecutor: ProcessExecutor = {
     }
   },
 };
+
+/**
+ * Asynchronously verifies complete shutdown evidence for a PostgreSQL instance.
+ * Requires positively confirmed absence of postmaster.pid AND confirmed closed TCP port.
+ */
+export async function verifyShutdownAsync(
+  dataDir: string,
+  port: number,
+  isWsl: boolean,
+  maxWaitMs = 5000
+): Promise<ShutdownVerificationResult> {
+  if (!isValidPort(port)) {
+    return {
+      confirmedStopped: false,
+      pidStatus: 'unknown',
+      portStatus: 'unknown',
+      reason: `Invalid or missing port: ${port}. Active instance shutdown requires a valid loopback port.`,
+    };
+  }
+
+  const start = Date.now();
+  let lastResult: ShutdownVerificationResult = {
+    confirmedStopped: false,
+    pidStatus: 'unknown',
+    portStatus: 'unknown',
+    reason: 'Shutdown verification timed out',
+  };
+
+  while (Date.now() - start < maxWaitMs) {
+    let pidResult: PidFileInspectionResult;
+    try {
+      pidResult = isWsl ? inspectPidFileWslSync(dataDir) : await inspectPidFileAsync(dataDir);
+    } catch (err: any) {
+      pidResult = { status: 'unknown', reason: err?.message };
+    }
+
+    if (pidResult.status === 'present' || pidResult.status === 'unknown') {
+      lastResult = {
+        confirmedStopped: false,
+        pidStatus: pidResult.status,
+        portStatus: 'unknown',
+        reason: pidResult.status === 'present' ? 'PID file is present' : `PID inspection error: ${pidResult.reason}`,
+      };
+      await new Promise((r) => setTimeout(r, 150));
+      continue;
+    }
+
+    // PID is confirmed absent
+    let portResult: PortProbeResult;
+    try {
+      portResult = isWsl ? probePortSyncWsl(port) : await checkPortOpen(port);
+    } catch (err: any) {
+      portResult = { status: 'unknown', reason: err?.message };
+    }
+
+    if (portResult.status === 'closed') {
+      return {
+        confirmedStopped: true,
+        pidStatus: 'absent',
+        portStatus: 'closed',
+      };
+    }
+
+    lastResult = {
+      confirmedStopped: false,
+      pidStatus: 'absent',
+      portStatus: portResult.status,
+      reason: portResult.status === 'open' ? `Port ${port} is still open` : `Port ${port} probe error: ${portResult.reason}`,
+    };
+
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  return lastResult;
+}
 
 /**
  * Performs stage-aware teardown of a temporary PostgreSQL cluster.
@@ -672,6 +1026,13 @@ export async function performTeardown(params: {
     (params.serverStarted || params.stage === 'starting_server');
 
   if (mayHaveStartedServer) {
+    if (!isValidPort(params.port)) {
+      throw new Error(
+        `Cleanup failure: PostgreSQL instance in "${params.dataDir}" has missing or invalid port (${params.port}). ` +
+        `Data directory removal aborted to prevent running rogue postmaster process.`
+      );
+    }
+
     let stopCmdError: Error | null = null;
     try {
       executor.execStopServer(params.pgCtlPath, params.dataDir, params.isWsl);
@@ -721,8 +1082,8 @@ export async function performTeardown(params: {
  */
 export async function verifyReadiness(port: number, maxRetries = 25, retryIntervalMs = 200): Promise<void> {
   for (let i = 1; i <= maxRetries; i++) {
-    const isOpen = await checkPortOpen(port);
-    if (isOpen) return;
+    const probe = await checkPortOpen(port);
+    if (probe.status === 'open') return;
     await new Promise((res) => setTimeout(res, retryIntervalMs));
   }
   throw new Error(`Failed to establish connection to isolated PostgreSQL instance on port ${port}.`);

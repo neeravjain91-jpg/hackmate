@@ -28,6 +28,19 @@ import {
   tryKillPostmaster,
   confirmStoppedSync,
   checkPortOpenSync,
+  checkPortOpen,
+  probePortSyncNative,
+  probePortSyncWsl,
+  inspectPidFileSync,
+  inspectPidFileAsync,
+  inspectPidFileWslSync,
+  inspectPidFile,
+  verifyShutdownSync,
+  verifyShutdownAsync,
+  isValidPort,
+  PortProbeResult,
+  PidFileInspectionResult,
+  ShutdownVerificationResult,
   setEmergencyFailureReporter,
   reportEmergencyCleanupFailures,
   EmergencyCleanupFailure,
@@ -918,7 +931,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
     });
   });
 
-  describe('10. Synchronous Emergency Cleanup Safeguards', () => {
+  describe('10. Synchronous Emergency Cleanup Safeguards & Explicit Result Probing', () => {
     it('1. successfully stops running server, confirms stopped, removes directory, and unregisters', () => {
       const records = new Set<ActiveInstanceRecord>();
       let stopCalled = false;
@@ -956,7 +969,437 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
       expect(res.failed).toHaveLength(0);
     });
 
-    it('2. confirms stopped when PID file is absent and port is closed (native and WSL)', () => {
+    it('A. native port-probe spawn failure yields unknown status and preserves data directory', () => {
+      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation(() => {
+        const err: any = new Error('spawn ENOMEM: out of memory');
+        err.code = 'ENOMEM';
+        throw err;
+      });
+
+      try {
+        // Direct probe yields unknown, never closed
+        const probeRes = checkPortOpenSync(54321, false);
+        expect(probeRes.status).toBe('unknown');
+        expect(probeRes.reason).toContain('spawn failure');
+
+        // Combined verification must fail closed
+        const verifyRes = verifyShutdownSync('/tmp/test_spawn_fail', 54321, false);
+        expect(verifyRes.confirmedStopped).toBe(false);
+        expect(verifyRes.portStatus).toBe('unknown');
+
+        // In emergency cleanup, directory removal must be strictly aborted
+        const records = new Set<ActiveInstanceRecord>();
+        let removeCalled = false;
+
+        const testRecord: ActiveInstanceRecord = {
+          dataDir: '/tmp/test_spawn_fail',
+          port: 54321,
+          isWsl: false,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        records.add(testRecord);
+
+        const res = performEmergencyCleanupSync(records, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalled = true;
+          },
+        });
+
+        expect(removeCalled).toBe(false);
+        expect(testRecord.stopped).toBe(false);
+        expect(testRecord.lifecycleState).toBe('cleanup_failed');
+        expect(records.has(testRecord)).toBe(true);
+        expect(res.failed.some(f => f.dataDir === '/tmp/test_spawn_fail')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    it('B. native port-probe timeout yields unknown status and cannot authorize data directory deletion', async () => {
+      // 1. Sync timeout via ETIMEDOUT
+      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation(() => {
+        const err: any = new Error('Process timed out');
+        err.code = 'ETIMEDOUT';
+        throw err;
+      });
+
+      try {
+        const probeRes = checkPortOpenSync(54322, false);
+        expect(probeRes.status).toBe('unknown');
+        expect(probeRes.reason).toContain('timed out');
+
+        // In emergency cleanup, timeout cannot authorize deletion
+        const records = new Set<ActiveInstanceRecord>();
+        let removeCalled = false;
+
+        const testRecord: ActiveInstanceRecord = {
+          dataDir: '/tmp/test_timeout_fail',
+          port: 54322,
+          isWsl: false,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        records.add(testRecord);
+
+        const res = performEmergencyCleanupSync(records, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalled = true;
+          },
+        });
+
+        expect(removeCalled).toBe(false);
+        expect(testRecord.stopped).toBe(false);
+        expect(records.has(testRecord)).toBe(true);
+        expect(res.failed.some(f => f.dataDir === '/tmp/test_timeout_fail')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // 2. Async checkPortOpen timeout yields unknown
+      const asyncTimeoutRes = await checkPortOpen(54323, 1);
+      expect(['unknown', 'closed']).toContain(asyncTimeoutRes.status);
+      if (asyncTimeoutRes.status === 'unknown') {
+        expect(asyncTimeoutRes.reason).toContain('timed out');
+      }
+    });
+
+    it('C. WSL inspection tools unavailable yields unknown status and pipeline exit status cannot be mistaken for port closure', () => {
+      // C1. ss and netstat unavailable: output marker HACKMATE_PORT:UNKNOWN_NO_TOOLS
+      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          return Buffer.from('HACKMATE_PORT:UNKNOWN_NO_TOOLS\n');
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const probeRes = checkPortOpenSync(54324, true);
+        expect(probeRes.status).toBe('unknown');
+        expect(probeRes.status).not.toBe('closed');
+        expect(probeRes.reason).toContain('Neither ss nor netstat');
+
+        // Pipeline exit status of 1 from a broken command cannot be mistaken for closed
+        execSpy.mockImplementation((cmd: string) => {
+          if (cmd === 'wsl') {
+            const err: any = new Error('Shell pipeline syntax error');
+            err.status = 1;
+            throw err;
+          }
+          return Buffer.from('');
+        });
+
+        const brokenPipelineRes = checkPortOpenSync(54324, true);
+        expect(brokenPipelineRes.status).toBe('unknown');
+        expect(brokenPipelineRes.status).not.toBe('closed');
+
+        // Preserves directory
+        const records = new Set<ActiveInstanceRecord>();
+        let removeCalled = false;
+
+        const testRecord: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_notools_dir',
+          port: 54324,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        records.add(testRecord);
+
+        const res = performEmergencyCleanupSync(records, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalled = true;
+          },
+        });
+
+        expect(removeCalled).toBe(false);
+        expect(testRecord.stopped).toBe(false);
+        expect(records.has(testRecord)).toBe(true);
+        expect(res.failed.some(f => f.dataDir === '/wsl/test_notools_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    it('D. native PID inspection distinguishes definitive absence (ENOENT) from filesystem errors (EACCES/EPERM)', () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_pid_'));
+      try {
+        // D1. Non-existent postmaster.pid -> definitive absence (ENOENT)
+        const absentRes = inspectPidFileSync(tempDir);
+        expect(absentRes.status).toBe('absent');
+
+        // D2. Present postmaster.pid -> present
+        fs.writeFileSync(path.join(tempDir, 'postmaster.pid'), '12345\n');
+        const presentRes = inspectPidFileSync(tempDir);
+        expect(presentRes.status).toBe('present');
+
+        // D3. EACCES permission denied -> unknown (never treated as absent!)
+        const statSpy = vi.spyOn(fs, 'statSync').mockImplementation(() => {
+          const err: any = new Error('EACCES: permission denied');
+          err.code = 'EACCES';
+          throw err;
+        });
+
+        try {
+          const eaccesRes = inspectPidFileSync(tempDir);
+          expect(eaccesRes.status).toBe('unknown');
+          expect(eaccesRes.status).not.toBe('absent');
+          expect(eaccesRes.reason).toContain('EACCES');
+
+          // Combined shutdown verification must fail closed
+          const verifyRes = verifyShutdownSync(tempDir, 54325, false);
+          expect(verifyRes.confirmedStopped).toBe(false);
+          expect(verifyRes.pidStatus).toBe('unknown');
+        } finally {
+          statSpy.mockRestore();
+        }
+
+        // D4. EPERM operation not permitted -> unknown
+        const epermSpy = vi.spyOn(fs, 'statSync').mockImplementation(() => {
+          const err: any = new Error('EPERM: operation not permitted');
+          err.code = 'EPERM';
+          throw err;
+        });
+
+        try {
+          const epermRes = inspectPidFileSync(tempDir);
+          expect(epermRes.status).toBe('unknown');
+          expect(epermRes.status).not.toBe('absent');
+        } finally {
+          epermSpy.mockRestore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('E. missing or invalid port strictly prevents shutdown confirmation and aborts data directory deletion', async () => {
+      // E1. Port validation
+      expect(isValidPort(undefined)).toBe(false);
+      expect(isValidPort(null)).toBe(false);
+      expect(isValidPort(0)).toBe(false);
+      expect(isValidPort(-1)).toBe(false);
+      expect(isValidPort(80)).toBe(false); // below ephemeral boundary (< 1024)
+      expect(isValidPort(65536)).toBe(false); // exceeds valid 16-bit port
+      expect(isValidPort(NaN)).toBe(false);
+      expect(isValidPort(54321)).toBe(true);
+
+      // E2. confirmStoppedSync rejects missing or invalid ports
+      expect(confirmStoppedSync('/tmp/dir', false, undefined)).toBe(false);
+      expect(confirmStoppedSync('/tmp/dir', false, 0)).toBe(false);
+      expect(confirmStoppedSync('/tmp/dir', false, -5)).toBe(false);
+
+      const verifyRes = verifyShutdownSync('/tmp/dir', 0, false);
+      expect(verifyRes.confirmedStopped).toBe(false);
+      expect(verifyRes.portStatus).toBe('unknown');
+      expect(verifyRes.reason).toContain('Invalid or missing port');
+
+      // E3. performEmergencyCleanupSync aborts directory removal when port is invalid
+      const records = new Set<ActiveInstanceRecord>();
+      let removeCalled = false;
+
+      const invalidPortRecord: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_invalid_port_dir',
+        port: 0, // invalid port!
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'ready',
+        lifecycleState: 'running',
+        serverStarted: true,
+        serverStopped: false,
+        stopped: false,
+      };
+      records.add(invalidPortRecord);
+
+      const res = performEmergencyCleanupSync(records, {
+        removeDirSync: () => {
+          removeCalled = true;
+        },
+      });
+
+      expect(removeCalled).toBe(false);
+      expect(invalidPortRecord.stopped).toBe(false);
+      expect(invalidPortRecord.lifecycleState).toBe('cleanup_failed');
+      expect(records.has(invalidPortRecord)).toBe(true);
+      expect(res.failed.some(f => f.dataDir === '/tmp/test_invalid_port_dir')).toBe(true);
+      const failure = res.failed.find(f => f.dataDir === '/tmp/test_invalid_port_dir');
+      expect(failure?.error).toContain('missing or invalid port');
+
+      // E4. performTeardown aborts when port is invalid
+      await expect(
+        performTeardown({
+          dataDir: '/tmp/test_teardown_invalid_port',
+          port: 0,
+          isWsl: false,
+          pgCtlPath: 'pg_ctl',
+          serverStarted: true,
+        })
+      ).rejects.toThrow(/missing or invalid port/);
+    });
+
+    it('F. unknown PID or port state prevents emergency cleanup and leaves instance tracked with actionable failure', () => {
+      // F1. Unknown PID result
+      const recordsPid = new Set<ActiveInstanceRecord>();
+      let removeCalledPid = false;
+
+      const testRecordPid: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_unknown_pid',
+        port: 54326,
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'ready',
+        lifecycleState: 'running',
+        serverStarted: true,
+        serverStopped: false,
+        stopped: false,
+      };
+      recordsPid.add(testRecordPid);
+
+      const resPid = performEmergencyCleanupSync(recordsPid, {
+        confirmStoppedSync: () => ({
+          confirmedStopped: false,
+          pidStatus: 'unknown',
+          portStatus: 'closed',
+          reason: 'I/O failure reading PID file',
+        }),
+        tryKillPostmasterSync: () => false,
+        removeDirSync: () => {
+          removeCalledPid = true;
+        },
+      });
+
+      expect(removeCalledPid).toBe(false);
+      expect(testRecordPid.stopped).toBe(false);
+      expect(testRecordPid.lifecycleState).toBe('cleanup_failed');
+      expect(recordsPid.has(testRecordPid)).toBe(true);
+      expect(resPid.failed.some(f => f.dataDir === '/tmp/test_unknown_pid')).toBe(true);
+      expect(resPid.failed.find(f => f.dataDir === '/tmp/test_unknown_pid')?.error).toContain('I/O failure');
+
+      // F2. Unknown port result
+      const recordsPort = new Set<ActiveInstanceRecord>();
+      let removeCalledPort = false;
+
+      const testRecordPort: ActiveInstanceRecord = {
+        dataDir: '/tmp/test_unknown_port',
+        port: 54327,
+        isWsl: false,
+        pgCtlPath: 'pg_ctl',
+        stage: 'ready',
+        lifecycleState: 'running',
+        serverStarted: true,
+        serverStopped: false,
+        stopped: false,
+      };
+      recordsPort.add(testRecordPort);
+
+      const resPort = performEmergencyCleanupSync(recordsPort, {
+        confirmStoppedSync: () => ({
+          confirmedStopped: false,
+          pidStatus: 'absent',
+          portStatus: 'unknown',
+          reason: 'Network inspection tool returned unexpected state',
+        }),
+        tryKillPostmasterSync: () => false,
+        removeDirSync: () => {
+          removeCalledPort = true;
+        },
+      });
+
+      expect(removeCalledPort).toBe(false);
+      expect(testRecordPort.stopped).toBe(false);
+      expect(testRecordPort.lifecycleState).toBe('cleanup_failed');
+      expect(recordsPort.has(testRecordPort)).toBe(true);
+      expect(resPort.failed.some(f => f.dataDir === '/tmp/test_unknown_port')).toBe(true);
+      expect(resPort.failed.find(f => f.dataDir === '/tmp/test_unknown_port')?.error).toContain('Network inspection tool');
+    });
+
+    it('G. genuine shutdown success with positively confirmed absent PID and closed port completes cleanup and unregisters record', async () => {
+      // Actual loopback socket test
+      const srv = net.createServer();
+      const testPort = await new Promise<number>((resolve, reject) => {
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address() as net.AddressInfo;
+          resolve(addr.port);
+        });
+        srv.on('error', reject);
+      });
+
+      // 1. Genuine OPEN port test
+      const openSync = checkPortOpenSync(testPort, false);
+      expect(openSync.status).toBe('open');
+      const openAsync = await checkPortOpen(testPort);
+      expect(openAsync.status).toBe('open');
+
+      // 2. Close socket -> genuine CLOSED port test
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+
+      const closedSync = checkPortOpenSync(testPort, false);
+      expect(closedSync.status).toBe('closed');
+      const closedAsync = await checkPortOpen(testPort);
+      expect(closedAsync.status).toBe('closed');
+
+      // 3. Genuine absent PID + closed port allows complete shutdown
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_genuine_'));
+      try {
+        const verifyRes = verifyShutdownSync(tempDir, testPort, false);
+        expect(verifyRes.confirmedStopped).toBe(true);
+        expect(verifyRes.pidStatus).toBe('absent');
+        expect(verifyRes.portStatus).toBe('closed');
+
+        expect(confirmStoppedSync(tempDir, false, testPort)).toBe(true);
+
+        const records = new Set<ActiveInstanceRecord>();
+        const testRecord: ActiveInstanceRecord = {
+          dataDir: tempDir,
+          port: testPort,
+          isWsl: false,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        records.add(testRecord);
+
+        let removeCalled = false;
+        const res = performEmergencyCleanupSync(records, {
+          stopServerSync: () => {},
+          removeDirSync: (dir) => {
+            removeCalled = true;
+            fs.rmSync(dir, { recursive: true, force: true });
+          },
+        });
+
+        expect(removeCalled).toBe(true);
+        expect(testRecord.stopped).toBe(true);
+        expect(testRecord.lifecycleState).toBe('stopped');
+        expect(records.has(testRecord)).toBe(false);
+        expect(res.succeeded).toContain(tempDir);
+        expect(res.failed).toHaveLength(0);
+      } finally {
+        if (fs.existsSync(tempDir)) {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    it('2. confirms stopped when PID file is absent and port is closed (native and WSL protocol markers)', () => {
       // 2a. Native: non-existent PID file and closed port
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_stopped_'));
       try {
@@ -971,18 +1414,14 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
 
-      // 2b. WSL: exit status 1 indicates PID file absence
+      // 2b. WSL: explicit markers HACKMATE_PID:ABSENT and HACKMATE_PORT:CLOSED
       const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string, args: any) => {
-        if (cmd === 'wsl' && args && args[0] === 'test') {
-          const err: any = new Error('File not found');
-          err.status = 1;
-          throw err;
+        const fullArgs = Array.isArray(args) ? args.join(' ') : String(args || '');
+        if (cmd === 'wsl' && fullArgs.includes('HACKMATE_PID')) {
+          return Buffer.from('HACKMATE_PID:ABSENT\n');
         }
-        if (cmd === 'wsl' && args && args[0] === 'sh') {
-          // Port check: exit 1 means port not listening
-          const err: any = new Error('Port closed');
-          err.status = 1;
-          throw err;
+        if (cmd === 'wsl' && (fullArgs.includes('ss') || fullArgs.includes('HACKMATE_PORT'))) {
+          return Buffer.from('HACKMATE_PORT:CLOSED\n');
         }
         return Buffer.from('');
       });
@@ -1031,7 +1470,6 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
         const res = performEmergencyCleanupSync(records, {
           stopServerSync: () => {},
-          confirmStoppedSync: (dir, isWsl, p) => confirmStoppedSync(dir, isWsl, p),
           tryKillPostmasterSync: () => false,
           removeDirSync: () => {
             removeCalled = true;
@@ -1051,7 +1489,7 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
     it('4. fails closed and preserves data directory when WSL PID inspection encounters command/execution failure (exit status != 1)', () => {
       // WSL command failure with status 2 or execution error fails closed
-      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string, args: any) => {
+      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
         if (cmd === 'wsl') {
           const err: any = new Error('WSL command failed: syntax/communication error');
           err.status = 2; // Not status 1 (status 1 = file absent)
@@ -1083,7 +1521,6 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
 
         const res = performEmergencyCleanupSync(records, {
           stopServerSync: () => {},
-          confirmStoppedSync: (dir, isWsl, p) => confirmStoppedSync(dir, isWsl, p),
           tryKillPostmasterSync: () => false,
           removeDirSync: () => {
             removeCalled = true;
