@@ -179,8 +179,9 @@ export async function provisionIsolatedPostgres(): Promise<IsolatedPostgresInsta
     };
   } else {
     dataDir = path.join(os.tmpdir(), dirName);
+    const socketOption = process.platform === 'win32' ? '' : ` -k "${dataDir}"`;
     initdbCmd = `"${binaries.initdbPath}" -D "${dataDir}" -U postgres --auth=trust --no-instructions`;
-    startCmd = `"${binaries.pgCtlPath}" -D "${dataDir}" -o "-p ${port} -h 127.0.0.1" -w start`;
+    startCmd = `"${binaries.pgCtlPath}" -D "${dataDir}" -o "-p ${port} -h 127.0.0.1${socketOption}" -w start`;
     createdbCmd = `"${binaries.createdbPath}" -h 127.0.0.1 -p ${port} -U postgres hackmate_test`;
     stopCmd = `"${binaries.pgCtlPath}" -D "${dataDir}" -m immediate -w stop`;
     rmDirCmd = () => {
