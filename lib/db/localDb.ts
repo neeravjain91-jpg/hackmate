@@ -995,6 +995,12 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     forceOverwrite?: boolean
   ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
     return this.withLock<{ file: WorkspaceFileDetail; conflict: boolean; currentRevision?: number }>(async (data) => {
+      if (forceOverwrite !== undefined && typeof forceOverwrite !== 'boolean') {
+        throw new Error('Invalid forceOverwrite parameter. Must be a boolean (true or false).');
+      }
+
+      const isForce = forceOverwrite === true;
+
       if (
         baseRevision !== undefined &&
         (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
@@ -1002,7 +1008,7 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         throw new Error('Invalid base revision number. Must be a positive integer.');
       }
 
-      if (baseRevision === undefined && !forceOverwrite) {
+      if (baseRevision === undefined && !isForce) {
         throw new Error('Concurrency check required: baseRevision must be specified for workspace saves.');
       }
 
@@ -1020,8 +1026,8 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         throw new Error('Forbidden. Only project members can edit workspace files.');
       }
 
-      // CONFLICT DETECTION: Optimistic concurrency control
-      if (baseRevision !== undefined && node.current_revision !== baseRevision) {
+      // CONFLICT DETECTION: Optimistic concurrency control (bypassed if forceOverwrite is true)
+      if (!isForce && baseRevision !== undefined && node.current_revision !== baseRevision) {
         const latestRev = (data.workspace_revisions || [])
           .filter((r) => r.node_id === fileId)
           .sort((a, b) => b.revision_number - a.revision_number)[0];
@@ -1113,7 +1119,13 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         throw new Error('Invalid target revision number. Must be a positive integer.');
       }
 
-      if (!forceOverwrite && (baseRevision === undefined || typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)) {
+      if (forceOverwrite !== undefined && typeof forceOverwrite !== 'boolean') {
+        throw new Error('Invalid forceOverwrite parameter. Must be a boolean (true or false).');
+      }
+
+      const isForce = forceOverwrite === true;
+
+      if (!isForce && (baseRevision === undefined || typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)) {
         throw new Error('Concurrency check required: baseRevision must be specified for workspace restoration.');
       }
 
@@ -1135,7 +1147,7 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
       }
 
       // Concurrency check: Ensure no newer revision was saved unless forceOverwrite is enabled
-      if (!forceOverwrite && baseRevision !== undefined && node.current_revision !== baseRevision) {
+      if (!isForce && baseRevision !== undefined && node.current_revision !== baseRevision) {
         throw new Error(
           `Conflict: File has been updated to revision ${node.current_revision} by another teammate.`
         );

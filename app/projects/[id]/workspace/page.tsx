@@ -165,12 +165,14 @@ export default function WorkspacePage({ params }: { params: { id: string } }) {
     setSaveStatus('saving');
 
     try {
+      const isForce = forceOverwrite === true;
       const res = await fetch(`/api/projects/${params.id}/workspace/files/${activeFile.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content: fileContent,
-          baseRevision: forceOverwrite ? undefined : baseRevision,
+          baseRevision: isForce ? undefined : baseRevision,
+          forceOverwrite: isForce,
         }),
       });
 

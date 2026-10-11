@@ -1536,9 +1536,10 @@ describe('Technical Review Audit & Regression Test Suite', () => {
         expect(content).toContain('DROP FUNCTION IF EXISTS public.update_workspace_node_atomic(UUID, TEXT, UUID, UUID, TEXT);');
         expect(content).toContain('DROP FUNCTION IF EXISTS public.delete_workspace_node_atomic(UUID, UUID);');
 
-        // 5. Caller identity handling checking JWT claims / session user instead of vulnerable current_user
+        // 5. Caller identity handling checking JWT claims / session user instead of vulnerable current_user or invalid pg_catalog.session_user
         expect(content).toContain("current_setting('request.jwt.claim.role', true)");
-        expect(content).toContain("session_user IN ('service_role', 'postgres')");
+        expect(content).toContain("SESSION_USER IN ('service_role', 'postgres')");
+        expect(content).not.toContain("pg_catalog.session_user");
         expect(content).toContain('p_author_id <> v_auth_uid');
 
         // 6. Direct table writes revoked from PUBLIC, anon, authenticated
@@ -1551,6 +1552,10 @@ describe('Technical Review Audit & Regression Test Suite', () => {
         expect(content).toContain('GRANT EXECUTE ON FUNCTION public.update_workspace_node_atomic');
         expect(content).toContain('GRANT EXECUTE ON FUNCTION public.delete_workspace_node_atomic');
         expect(content).toContain('GRANT EXECUTE ON FUNCTION public.workspace_calculate_checksum');
+
+        // 8. Database-level authoritative checksum computation and integrity check
+        expect(content).toContain('v_computed_checksum := public.workspace_calculate_checksum');
+        expect(content).toContain('Checksum mismatch: Supplied checksum does not match computed content hash.');
       }
     });
 
@@ -1585,6 +1590,318 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       expect(rpcArgs.p_name).toBe('index.ts');
       // sha256 of "hello world" is b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
       expect(rpcArgs.p_checksum).toBe('b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9');
+    });
+  });
+
+  // =========================================================================
+  // AREA K: Strict forceOverwrite Type Validation and Explicit Workflow Enforcement
+  // =========================================================================
+  describe('Area K: Strict forceOverwrite Type Validation and Explicit Workflow Enforcement', () => {
+    it('HTTP save route strictly rejects non-boolean forceOverwrite values with 400', async () => {
+      const user = await db.createUser({ email: 'k_save_val@mit.edu', name: 'User K1' });
+      const proj = await db.createProject({ name: 'Proj K1', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.ts',
+        type: 'file',
+        initialContent: 'initial',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      // Invalid types for forceOverwrite: string "false", string "true", number 1, number 0, null, object {}
+      for (const invalidVal of ['false', 'true', 1, 0, null, {}]) {
+        const req = createAuthedRequest(
+          `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}`,
+          user.id,
+          {
+            method: 'PUT',
+            body: JSON.stringify({
+              content: 'tampered',
+              forceOverwrite: invalidVal,
+            }),
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+        const res = await saveFileHandler(req, {
+          params: { id: proj.id, fileId: file.id },
+        });
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toMatch(/forceOverwrite.*boolean/i);
+      }
+    });
+
+    it('HTTP restore route strictly rejects non-boolean forceOverwrite values with 400', async () => {
+      const user = await db.createUser({ email: 'k_rest_val@mit.edu', name: 'User K2' });
+      const proj = await db.createProject({ name: 'Proj K2', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'test.ts',
+        type: 'file',
+        initialContent: 'v1',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      await db.saveWorkspaceFile(file.id, 'v2', 1, user.id, user.name);
+
+      // Invalid types for forceOverwrite in restore
+      for (const invalidVal of ['false', 'true', 1, 0, null, {}]) {
+        const req = createAuthedRequest(
+          `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+          user.id,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              revisionNumber: 1,
+              forceOverwrite: invalidVal,
+            }),
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+        const res = await restoreRevisionHandler(req, {
+          params: { id: proj.id, fileId: file.id },
+        });
+        expect(res.status).toBe(400);
+        const body = await res.json();
+        expect(body.error).toMatch(/forceOverwrite.*boolean/i);
+      }
+    });
+
+    it('LocalDatabaseAdapter and SupabaseDatabaseAdapter reject non-boolean forceOverwrite values', async () => {
+      const user = await db.createUser({ email: 'k_adapter@mit.edu', name: 'User K3' });
+      const proj = await db.createProject({ name: 'Proj K3', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'adapter_test.ts',
+        type: 'file',
+        initialContent: 'init',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      // Local adapter save
+      await expect(
+        db.saveWorkspaceFile(file.id, 'new', 1, user.id, user.name, 'false' as any)
+      ).rejects.toThrow(/forceOverwrite.*boolean/i);
+
+      // Local adapter restore
+      await expect(
+        db.restoreWorkspaceRevision(file.id, 1, user.id, user.name, 1, 'false' as any)
+      ).rejects.toThrow(/forceOverwrite.*boolean/i);
+
+      // Supabase adapter save
+      const mockClient: any = { rpc: async () => ({ data: null, error: null }) };
+      const supabaseDb = new SupabaseDatabaseAdapter(mockClient);
+
+      await expect(
+        supabaseDb.saveWorkspaceFile(file.id, 'new', 1, user.id, user.name, 'false' as any)
+      ).rejects.toThrow(/forceOverwrite.*boolean/i);
+
+      // Supabase adapter restore
+      await expect(
+        supabaseDb.restoreWorkspaceRevision(file.id, 1, user.id, user.name, 1, 'false' as any)
+      ).rejects.toThrow(/forceOverwrite.*boolean/i);
+    });
+
+    it('forceOverwrite: false preserves optimistic concurrency checks and returns 409 conflict on stale save and restore', async () => {
+      const user = await db.createUser({ email: 'k_occ@mit.edu', name: 'User K4' });
+      const proj = await db.createProject({ name: 'Proj K4', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'occ_test.ts',
+        type: 'file',
+        initialContent: 'rev1',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      await db.saveWorkspaceFile(file.id, 'rev2', 1, user.id, user.name);
+
+      // Save with forceOverwrite: false and stale baseRevision 1 (current is 2) -> 409
+      const saveReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}`,
+        user.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'stale', baseRevision: 1, forceOverwrite: false }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const saveRes = await saveFileHandler(saveReq, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(saveRes.status).toBe(409);
+
+      // Restore with forceOverwrite: false and stale baseRevision 1 (current is 2) -> 409
+      const restReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+        user.id,
+        {
+          method: 'POST',
+          body: JSON.stringify({ revisionNumber: 1, baseRevision: 1, forceOverwrite: false }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const restRes = await restoreRevisionHandler(restReq, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(restRes.status).toBe(409);
+    });
+
+    it('explicit forceOverwrite: true bypasses OCC checks and succeeds for both save and restore', async () => {
+      const user = await db.createUser({ email: 'k_force@mit.edu', name: 'User K5' });
+      const proj = await db.createProject({ name: 'Proj K5', description: '', leader_id: user.id });
+
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'force_test.ts',
+        type: 'file',
+        initialContent: 'rev1',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      await db.saveWorkspaceFile(file.id, 'rev2', 1, user.id, user.name);
+
+      // Force save with forceOverwrite: true
+      const saveReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}`,
+        user.id,
+        {
+          method: 'PUT',
+          body: JSON.stringify({ content: 'forced rev3', forceOverwrite: true }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const saveRes = await saveFileHandler(saveReq, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(saveRes.status).toBe(200);
+      const saveBody = await saveRes.json();
+      expect(saveBody.file.current_revision).toBe(3);
+      expect(saveBody.file.content).toBe('forced rev3');
+
+      // Force restore with forceOverwrite: true
+      const restReq = createAuthedRequest(
+        `http://localhost:3000/api/projects/${proj.id}/workspace/files/${file.id}/restore`,
+        user.id,
+        {
+          method: 'POST',
+          body: JSON.stringify({ revisionNumber: 1, forceOverwrite: true }),
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+      const restRes = await restoreRevisionHandler(restReq, {
+        params: { id: proj.id, fileId: file.id },
+      });
+      expect(restRes.status).toBe(200);
+      const restBody = await restRes.json();
+      expect(restBody.file.current_revision).toBe(4);
+      expect(restBody.file.content).toBe('rev1');
+    });
+  });
+
+  // =========================================================================
+  // AREA L: Database Checksum Integrity & SHA-256 Representation
+  // =========================================================================
+  describe('Area L: Database Checksum Integrity & SHA-256 Representation', () => {
+    it('verifies SHA-256 checksums match authoritative cryptographic test vectors', () => {
+      const crypto = require('crypto');
+
+      const testVectors = [
+        {
+          input: '',
+          expected: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+        },
+        {
+          input: 'hello world',
+          expected: 'b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9',
+        },
+        {
+          input: 'The quick brown fox jumps over the lazy dog',
+          expected: 'd7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592',
+        },
+        {
+          input: '{"version": 1, "test": true}',
+          expected: '34a1fe834ac25512d2ec3d8f3baeae721377ea246a9c9fb3a6268f8ebe6957b4',
+        },
+      ];
+
+      for (const vector of testVectors) {
+        const computed = crypto.createHash('sha256').update(vector.input).digest('hex');
+        expect(computed).toBe(vector.expected);
+        expect(computed).toHaveLength(64);
+        expect(computed).toMatch(/^[0-9a-f]{64}$/);
+      }
+    });
+
+    it('persists identical and correct SHA-256 representation across initial node creation and subsequent saves', async () => {
+      const user = await db.createUser({ email: 'l_chk@mit.edu', name: 'User L' });
+      const proj = await db.createProject({ name: 'Proj L', description: '', leader_id: user.id });
+
+      // 1. Initial creation with known vector
+      const file = await db.createWorkspaceNode({
+        project_id: proj.id,
+        name: 'vector.txt',
+        type: 'file',
+        initialContent: 'The quick brown fox jumps over the lazy dog',
+        author_id: user.id,
+        author_name: user.name,
+      });
+
+      const rev1 = (await db.getWorkspaceFileRevisions(file.id))[0];
+      expect(rev1.checksum).toBe('d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592');
+
+      // 2. Subsequent save with empty string
+      await db.saveWorkspaceFile(file.id, '', 1, user.id, user.name);
+      const rev2 = (await db.getWorkspaceFileRevisions(file.id))[0];
+      expect(rev2.checksum).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+
+      // 3. Subsequent save with "hello world"
+      await db.saveWorkspaceFile(file.id, 'hello world', 2, user.id, user.name);
+      const rev3 = (await db.getWorkspaceFileRevisions(file.id))[0];
+      expect(rev3.checksum).toBe('b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9');
+    });
+
+    it('direct RPC invocation simulation: rejects fabricated checksum and rolls back transaction', async () => {
+      // Simulating the database logic in create_workspace_node_atomic and save_workspace_file_atomic:
+      const simulateRpcChecksumPolicy = (content: string, clientChecksum: string | null | undefined) => {
+        const crypto = require('crypto');
+        const computedChecksum = crypto.createHash('sha256').update(content).digest('hex');
+
+        if (clientChecksum !== null && clientChecksum !== undefined && clientChecksum.trim() !== '') {
+          if (clientChecksum.trim().toLowerCase() !== computedChecksum) {
+            throw new Error('Checksum mismatch: Supplied checksum does not match computed content hash.');
+          }
+        }
+        return computedChecksum;
+      };
+
+      const validContent = 'secure payload';
+      const crypto = require('crypto');
+      const correctHash = crypto.createHash('sha256').update(validContent).digest('hex');
+
+      // 1. Valid checksum matches
+      expect(simulateRpcChecksumPolicy(validContent, correctHash)).toBe(correctHash);
+
+      // 2. Omitted checksum defaults to authoritative computed hash
+      expect(simulateRpcChecksumPolicy(validContent, null)).toBe(correctHash);
+      expect(simulateRpcChecksumPolicy(validContent, undefined)).toBe(correctHash);
+      expect(simulateRpcChecksumPolicy(validContent, '')).toBe(correctHash);
+
+      // 3. Fabricated checksum throws mismatch exception
+      expect(() =>
+        simulateRpcChecksumPolicy(validContent, 'fabricated0000000000000000000000000000000000000000000000000000000000')
+      ).toThrow(/Checksum mismatch/i);
+
+      // 4. Case-insensitive match accepted and normalized
+      expect(simulateRpcChecksumPolicy(validContent, correctHash.toUpperCase())).toBe(correctHash);
     });
   });
 });

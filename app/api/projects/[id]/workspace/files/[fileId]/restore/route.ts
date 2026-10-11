@@ -46,7 +46,17 @@ export async function POST(
       );
     }
 
-    if (!forceOverwrite) {
+    // Validate forceOverwrite strictly as boolean if provided
+    if (forceOverwrite !== undefined && typeof forceOverwrite !== 'boolean') {
+      return NextResponse.json(
+        { error: 'Invalid forceOverwrite parameter. Must be a boolean (true or false).' },
+        { status: 400 }
+      );
+    }
+
+    const isForce = forceOverwrite === true;
+
+    if (!isForce) {
       if (
         baseRevision === undefined ||
         typeof baseRevision !== 'number' ||
@@ -74,7 +84,7 @@ export async function POST(
       user.id,
       user.name,
       baseRevision,
-      Boolean(forceOverwrite)
+      isForce
     );
 
     return NextResponse.json({ file: restoredFile });

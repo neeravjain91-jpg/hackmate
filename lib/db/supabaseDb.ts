@@ -677,6 +677,12 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     author_name: string,
     forceOverwrite?: boolean
   ): Promise<{ file: WorkspaceFileDetail; conflict?: boolean; currentRevision?: number }> {
+    if (forceOverwrite !== undefined && typeof forceOverwrite !== 'boolean') {
+      throw new Error('Invalid forceOverwrite parameter. Must be a boolean (true or false).');
+    }
+
+    const isForce = forceOverwrite === true;
+
     if (
       baseRevision !== undefined &&
       (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
@@ -684,7 +690,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       throw new Error('Invalid base revision number. Must be a positive integer.');
     }
 
-    if (baseRevision === undefined && !forceOverwrite) {
+    if (baseRevision === undefined && !isForce) {
       throw new Error('Concurrency check required: baseRevision must be specified for workspace saves.');
     }
 
@@ -701,7 +707,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       p_author_id: author_id,
       p_author_name: author_name,
       p_checksum: checksum,
-      p_force_overwrite: forceOverwrite ?? false,
+      p_force_overwrite: isForce,
     });
 
     if (rpcErr) {
@@ -755,7 +761,13 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       throw new Error('Invalid target revision number. Must be a positive integer.');
     }
 
-    if (!forceOverwrite && (baseRevision === undefined || typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)) {
+    if (forceOverwrite !== undefined && typeof forceOverwrite !== 'boolean') {
+      throw new Error('Invalid forceOverwrite parameter. Must be a boolean (true or false).');
+    }
+
+    const isForce = forceOverwrite === true;
+
+    if (!isForce && (baseRevision === undefined || typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)) {
       throw new Error('Concurrency check required: baseRevision must be specified for workspace restoration.');
     }
 
@@ -769,7 +781,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     const node = await this.getWorkspaceNode(fileId);
     if (!node || node.type !== 'file') throw new Error('Workspace file not found.');
 
-    if (!forceOverwrite && baseRevision !== undefined && node.current_revision !== baseRevision) {
+    if (!isForce && baseRevision !== undefined && node.current_revision !== baseRevision) {
       throw new Error(`Conflict: File has been updated to revision ${node.current_revision} by another teammate.`);
     }
 
@@ -790,7 +802,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       baseRevision,
       author_id,
       `${author_name} (Restored Rev #${targetRevisionNumber})`,
-      forceOverwrite ?? false
+      isForce
     );
 
     if (saved.conflict) {

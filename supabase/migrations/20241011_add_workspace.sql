@@ -249,7 +249,8 @@ DECLARE
     v_new_node public.workspace_nodes%ROWTYPE;
     v_now TIMESTAMPTZ := pg_catalog.timezone('utc'::text, pg_catalog.now());
     v_size INTEGER := 0;
-    v_checksum TEXT := p_checksum;
+    v_computed_checksum TEXT;
+    v_checksum TEXT;
     v_clean_name TEXT;
 BEGIN
     -- Resolve trustworthy auth context
@@ -268,7 +269,7 @@ BEGIN
         v_jwt_role := NULL;
     END;
 
-    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+    IF v_jwt_role = 'service_role' OR SESSION_USER IN ('service_role', 'postgres') THEN
         v_is_service_role := TRUE;
     END IF;
 
@@ -333,9 +334,15 @@ BEGIN
         IF v_size > 10 * 1024 * 1024 THEN
             RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
         END IF;
-        IF v_checksum IS NULL OR v_checksum = '' THEN
-            v_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_initial_content, ''));
+
+        -- Authoritative checksum computation and integrity verification
+        v_computed_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_initial_content, ''));
+        IF p_checksum IS NOT NULL AND pg_catalog.trim(p_checksum) <> '' THEN
+            IF pg_catalog.lower(pg_catalog.trim(p_checksum)) <> v_computed_checksum THEN
+                RAISE EXCEPTION 'Checksum mismatch: Supplied checksum does not match computed content hash.';
+            END IF;
         END IF;
+        v_checksum := v_computed_checksum;
     ELSE
         v_size := 0;
         v_checksum := NULL;
@@ -421,7 +428,8 @@ DECLARE
     v_next_rev INTEGER;
     v_now TIMESTAMPTZ := pg_catalog.timezone('utc'::text, pg_catalog.now());
     v_content_size INTEGER;
-    v_checksum TEXT := p_checksum;
+    v_computed_checksum TEXT;
+    v_checksum TEXT;
 BEGIN
     -- Resolve trustworthy auth context
     BEGIN
@@ -439,7 +447,7 @@ BEGIN
         v_jwt_role := NULL;
     END;
 
-    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+    IF v_jwt_role = 'service_role' OR SESSION_USER IN ('service_role', 'postgres') THEN
         v_is_service_role := TRUE;
     END IF;
 
@@ -483,12 +491,12 @@ BEGIN
         RAISE EXCEPTION 'Forbidden: File does not belong to the specified project.';
     END IF;
 
-    -- Concurrency check: baseRevision cannot be omitted unless force_overwrite is explicitly granted
+    -- Concurrency check: baseRevision cannot be omitted unless force_overwrite is explicitly TRUE
     IF p_base_revision IS NULL AND (p_force_overwrite IS NOT TRUE) THEN
         RAISE EXCEPTION 'Concurrency check required: baseRevision must be specified for workspace saves.';
     END IF;
 
-    IF p_base_revision IS NOT NULL AND v_node.current_revision <> p_base_revision THEN
+    IF (p_force_overwrite IS NOT TRUE) AND p_base_revision IS NOT NULL AND v_node.current_revision <> p_base_revision THEN
         RETURN pg_catalog.jsonb_build_object(
             'conflict', true,
             'currentRevision', v_node.current_revision,
@@ -501,9 +509,14 @@ BEGIN
         RAISE EXCEPTION 'File content exceeds the maximum size limit of 10MB.';
     END IF;
 
-    IF v_checksum IS NULL OR v_checksum = '' THEN
-        v_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_content, ''));
+    -- Authoritative checksum computation and integrity verification
+    v_computed_checksum := public.workspace_calculate_checksum(pg_catalog.coalesce(p_content, ''));
+    IF p_checksum IS NOT NULL AND pg_catalog.trim(p_checksum) <> '' THEN
+        IF pg_catalog.lower(pg_catalog.trim(p_checksum)) <> v_computed_checksum THEN
+            RAISE EXCEPTION 'Checksum mismatch: Supplied checksum does not match computed content hash.';
+        END IF;
     END IF;
+    v_checksum := v_computed_checksum;
 
     v_next_rev := v_node.current_revision + 1;
 
@@ -594,7 +607,7 @@ BEGIN
         v_jwt_role := NULL;
     END;
 
-    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+    IF v_jwt_role = 'service_role' OR SESSION_USER IN ('service_role', 'postgres') THEN
         v_is_service_role := TRUE;
     END IF;
 
@@ -790,7 +803,7 @@ BEGIN
         v_jwt_role := NULL;
     END;
 
-    IF v_jwt_role = 'service_role' OR pg_catalog.session_user IN ('service_role', 'postgres') THEN
+    IF v_jwt_role = 'service_role' OR SESSION_USER IN ('service_role', 'postgres') THEN
         v_is_service_role := TRUE;
     END IF;
 

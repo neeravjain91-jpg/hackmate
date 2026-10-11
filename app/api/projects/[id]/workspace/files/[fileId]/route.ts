@@ -71,6 +71,16 @@ export async function PUT(
       return NextResponse.json({ error: 'File content exceeds the maximum size limit of 10MB.' }, { status: 400 });
     }
 
+    // Validate forceOverwrite strictly as boolean if provided
+    if (forceOverwrite !== undefined && typeof forceOverwrite !== 'boolean') {
+      return NextResponse.json(
+        { error: 'Invalid forceOverwrite parameter. Must be a boolean (true or false).' },
+        { status: 400 }
+      );
+    }
+
+    const isForce = forceOverwrite === true;
+
     if (
       baseRevision !== undefined &&
       (typeof baseRevision !== 'number' || !Number.isInteger(baseRevision) || baseRevision < 1)
@@ -78,7 +88,7 @@ export async function PUT(
       return NextResponse.json({ error: 'Valid positive integer baseRevision is required.' }, { status: 400 });
     }
 
-    if (baseRevision === undefined && !forceOverwrite) {
+    if (baseRevision === undefined && !isForce) {
       return NextResponse.json(
         { error: 'Concurrency check required: baseRevision must be specified for workspace saves.' },
         { status: 400 }
@@ -91,7 +101,7 @@ export async function PUT(
       baseRevision,
       user.id,
       user.name,
-      Boolean(forceOverwrite)
+      isForce
     );
 
     if (result.conflict) {
