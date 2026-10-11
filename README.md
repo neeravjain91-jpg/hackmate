@@ -98,12 +98,17 @@ HackMate is a web collaboration platform engineered specifically for hackathon t
 │       └── index.ts (Storage adapter factory)
 ├── supabase/
 │   └── migrations/
-│       ├── 20241010_init_hackmate.sql (PostgreSQL schema, triggers, RLS)
-│       └── 20241011_add_workspace.sql (Workspace nodes & revisions schema)
+│       ├── 20241010_init_hackmate.sql (Initial HackMate database schema, triggers, RLS)
+│       ├── 20241011_add_workspace.sql (Common Development Workspace nodes & revisions schema)
+│       └── 20241012_harden_workspace_security_and_rpc.sql (Workspace security and atomic RPC hardening)
 ├── tests/
 │   ├── hackmate.test.ts (Core specification tests: Tests 1–11)
 │   ├── api.test.ts (HTTP route handler end-to-end test suite)
-│   └── workspace.test.ts (Common Development Workspace acceptance tests: W1–W9)
+│   ├── workspace.test.ts (Common Development Workspace acceptance tests: W1–W9)
+│   ├── workspace_review.test.ts (Workspace concurrency, path traversal & authorization tests)
+│   ├── auth_session.test.ts (Production AUTH_SECRET hardening & session validation)
+│   ├── postgres_safety.test.ts (PostgreSQL test harness isolation & teardown safety)
+│   └── postgres_integration.test.ts (Disposable PostgreSQL migration & RPC integration)
 ├── .env.example (Environment template)
 └── _satellite_embedding_archive/ (Preserved historical workspace files)
 ```
@@ -137,6 +142,12 @@ MAX_UPLOAD_SIZE_MB=50
 AUTH_SECRET=hackmate-local-session-secret-change-in-production
 ```
 
+> [!NOTE]
+> For production deployments (`NODE_ENV=production`), `AUTH_SECRET` must be at least 32 bytes and cannot use default or placeholder values. Generate a cryptographically secure random secret using:
+> ```bash
+> openssl rand -base64 32
+> ```
+
 ### 3. Run the Development Server
 ```bash
 npm run dev
@@ -154,6 +165,11 @@ HackMate includes an automated Vitest test suite executing the specification's a
 npm test
 ```
 
+### Run PostgreSQL Disposable Integration Harness
+```bash
+npm run test:postgres
+```
+
 ### Run Production Build & Typecheck
 ```bash
 npx tsc --noEmit
@@ -164,21 +180,51 @@ npm run build
 
 ## 6. Supabase Cloud Configuration (Optional)
 
-To connect HackMate to a live Supabase project:
+HackMate defaults to the zero-config **Local Persistent Driver** (`STORAGE_DRIVER=local`), requiring no external services or cloud accounts.
 
-1. Create a new Supabase project at [https://supabase.com](https://supabase.com).
-2. Run the migration script in the Supabase SQL Editor:
-   ```bash
-   supabase/migrations/20241010_init_hackmate.sql
-   ```
-3. Set the environment variables in `.env.local`:
+If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=supabase`):
+
+> [!IMPORTANT]
+> The database migrations **must be applied sequentially in the exact order below** via the Supabase SQL Editor (or Supabase CLI) before using the Common Development Workspace. The final migration contains critical database security and atomic RPC hardening; omitting migrations or applying them out of order will leave a deployment without the complete workspace schema and required security functions.
+
+1. **Create Supabase Project & Storage Bucket**:
+   - Create a new project at [https://supabase.com](https://supabase.com).
+   - In Supabase Storage, create a private bucket named `hackmate-contributions`.
+
+2. **Apply Database Migrations (in exact sequential order)**:
+   - **Step 1 — Initial HackMate database schema**:
+     ```bash
+     supabase/migrations/20241010_init_hackmate.sql
+     ```
+     Provisions foundational schemas (`users`, `projects`, `project_members`, `tasks`, `contributions`, `contribution_files`), membership triggers, storage metadata, and Row Level Security (RLS) policies.
+
+   - **Step 2 — Common Development Workspace schema**:
+     ```bash
+     supabase/migrations/20241011_add_workspace.sql
+     ```
+     Creates hierarchical workspace file tree nodes (`workspace_nodes`), immutable file revisions (`workspace_revisions`), and project workspace constraints.
+
+   - **Step 3 — Workspace security and atomic RPC hardening**:
+     ```bash
+     supabase/migrations/20241012_harden_workspace_security_and_rpc.sql
+     ```
+     Applies critical security hardening and atomic stored procedures (`create_workspace_node_atomic`, `save_workspace_file_atomic`, `restore_workspace_file_atomic`) with transaction isolation, advisory concurrency locking, checksum validation, project membership verification, and hardened RLS policies.
+
+3. **Configure Environment Variables in `.env.local`**:
    ```env
    STORAGE_DRIVER=supabase
    NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
    NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
    SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
    SUPABASE_STORAGE_BUCKET=hackmate-contributions
+
+   # Production Authentication Secret (minimum 32 bytes)
+   # Generate using: openssl rand -base64 32
+   AUTH_SECRET=<your-production-auth-secret>
    ```
+
+> [!NOTE]
+> Database migrations and RPC functions are verified against disposable PostgreSQL instances in automated CI quality gates (`npm run test:postgres`). Live Supabase cloud connectivity requires providing active project credentials as detailed above.
 
 ---
 

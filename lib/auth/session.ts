@@ -6,17 +6,88 @@ import { getDatabaseAdapter } from '../db';
 export const SESSION_COOKIE_NAME = 'hackmate_session';
 const SESSION_EXPIRY_DAYS = 7;
 
-function getAuthSecret(): string {
+/**
+ * Minimum required byte length for production AUTH_SECRET.
+ * Cryptographically strong HMAC-SHA256 signing requires at least 256 bits (32 bytes) of entropy.
+ */
+export const MIN_AUTH_SECRET_BYTES = 32;
+
+/**
+ * Built-in zero-configuration development secret for local offline development.
+ * Strictly forbidden in production.
+ */
+export const DEFAULT_DEV_AUTH_SECRET = 'hackmate-default-dev-secret-change-in-production-1234567890';
+
+/**
+ * Example template secret from .env.example.
+ * Strictly forbidden in production.
+ */
+export const EXAMPLE_ENV_AUTH_SECRET = 'hackmate-local-session-secret-change-in-production';
+
+const KNOWN_PLACEHOLDER_SECRETS: readonly string[] = [
+  DEFAULT_DEV_AUTH_SECRET,
+  EXAMPLE_ENV_AUTH_SECRET,
+];
+
+/**
+ * Retrieves and validates the authentication secret used for HMAC-SHA256 session tokens.
+ *
+ * Requirements:
+ * - Production (`NODE_ENV === 'production'`) requires an explicitly set, non-empty secret.
+ * - Production secrets must be at least 32 bytes (`Buffer.byteLength(secret, 'utf8') >= 32`).
+ * - Production rejects default development, placeholder, and example secrets.
+ * - Production fails closed immediately rather than falling back to the development secret.
+ * - Secret values or substrings are never logged or leaked in error messages.
+ * - Local development remains zero-config and functional with the default development secret.
+ *
+ * To generate a cryptographically secure random 32-byte secret for production:
+ * ```bash
+ * openssl rand -base64 32
+ * ```
+ */
+export function getAuthSecret(): string {
   const secret = process.env.AUTH_SECRET;
   const isProduction = process.env.NODE_ENV === 'production';
-  const isDefaultOrWeak = !secret || secret === 'hackmate-default-dev-secret-change-in-production-1234567890' || secret.includes('change-in-production');
 
-  if (isProduction && isDefaultOrWeak) {
-    throw new Error('SECURITY VIOLATION: A robust AUTH_SECRET environment variable must be explicitly configured in production.');
+  if (isProduction) {
+    if (!secret || secret.trim().length === 0) {
+      throw new Error(
+        'SECURITY VIOLATION: AUTH_SECRET must be explicitly configured in production. Generate a secure secret of at least 32 bytes using: openssl rand -base64 32'
+      );
+    }
+
+    const trimmed = secret.trim();
+    const lower = trimmed.toLowerCase();
+
+    const isPlaceholder =
+      KNOWN_PLACEHOLDER_SECRETS.includes(trimmed) ||
+      lower.includes('change-in-production') ||
+      lower.includes('change-this-in-production') ||
+      lower.includes('your-super-secret') ||
+      lower.includes('placeholder') ||
+      lower === 'secret' ||
+      lower === 'password';
+
+    if (isPlaceholder) {
+      throw new Error(
+        'SECURITY VIOLATION: AUTH_SECRET cannot use default, placeholder, or example secrets in production. Generate a strong secret of at least 32 bytes using: openssl rand -base64 32'
+      );
+    }
+
+    if (Buffer.byteLength(trimmed, 'utf8') < MIN_AUTH_SECRET_BYTES) {
+      throw new Error(
+        `SECURITY VIOLATION: AUTH_SECRET must be at least ${MIN_AUTH_SECRET_BYTES} bytes in production. Generate a strong secret using: openssl rand -base64 32`
+      );
+    }
+
+    return trimmed;
   }
 
-  return secret || 'hackmate-default-dev-secret-change-in-production-1234567890';
+  return secret && secret.trim().length > 0
+    ? secret.trim()
+    : DEFAULT_DEV_AUTH_SECRET;
 }
+
 
 export function createSessionToken(userId: string): string {
   const expiresAt = Date.now() + SESSION_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
