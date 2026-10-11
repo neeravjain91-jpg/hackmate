@@ -7,8 +7,14 @@ export const SESSION_COOKIE_NAME = 'hackmate_session';
 const SESSION_EXPIRY_DAYS = 7;
 
 /**
- * Minimum required byte length for production AUTH_SECRET.
- * Cryptographically strong HMAC-SHA256 signing requires at least 256 bits (32 bytes) of entropy.
+ * Configured minimum length (in UTF-8 bytes) for production AUTH_SECRET.
+ *
+ * Enforcing a 32-byte minimum length ensures an adequate byte ceiling, but length
+ * alone does not establish cryptographic entropy. Production operators must generate
+ * secrets using a cryptographically secure random generator, such as:
+ * ```bash
+ * openssl rand -base64 32
+ * ```
  */
 export const MIN_AUTH_SECRET_BYTES = 32;
 
