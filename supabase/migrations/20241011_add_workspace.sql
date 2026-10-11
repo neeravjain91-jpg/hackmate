@@ -299,10 +299,11 @@ BEGIN
     END IF;
 
     v_clean_name := pg_catalog.trim(p_name);
+    -- Filenames cannot be empty, '.' or '..', or contain forward or backward slashes.
+    -- PostgreSQL text types cannot store NUL (0x00) bytes; backslashes (including literal \0) are rejected via chr(92).
     IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR
-       pg_catalog.position('/' in v_clean_name) > 0 OR
-       pg_catalog.position('\' in v_clean_name) > 0 OR
-       pg_catalog.position(E'\0' in v_clean_name) > 0 THEN
+       pg_catalog.strpos(v_clean_name, '/') > 0 OR
+       pg_catalog.strpos(v_clean_name, pg_catalog.chr(92)) > 0 THEN
         RAISE EXCEPTION 'Invalid file or folder name. Name cannot be empty or contain path separators.';
     END IF;
 
@@ -651,10 +652,11 @@ BEGIN
     v_old_path := v_node.path;
     v_clean_name := pg_catalog.coalesce(pg_catalog.trim(p_name), v_node.name);
 
+    -- Filenames cannot be empty, '.' or '..', or contain forward or backward slashes.
+    -- PostgreSQL text types cannot store NUL (0x00) bytes; backslashes (including literal \0) are rejected via chr(92).
     IF v_clean_name = '' OR v_clean_name = '.' OR v_clean_name = '..' OR
-       pg_catalog.position('/' in v_clean_name) > 0 OR
-       pg_catalog.position('\' in v_clean_name) > 0 OR
-       pg_catalog.position(E'\0' in v_clean_name) > 0 THEN
+       pg_catalog.strpos(v_clean_name, '/') > 0 OR
+       pg_catalog.strpos(v_clean_name, pg_catalog.chr(92)) > 0 THEN
         RAISE EXCEPTION 'Invalid file or folder name. Name cannot be empty or contain path separators.';
     END IF;
 

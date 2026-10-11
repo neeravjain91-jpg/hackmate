@@ -1904,4 +1904,264 @@ describe('Technical Review Audit & Regression Test Suite', () => {
       expect(simulateRpcChecksumPolicy(validContent, correctHash.toUpperCase())).toBe(correctHash);
     });
   });
+
+  // =========================================================================
+  // AREA M: Filename Path Separator Validation and SQL Syntax Audit
+  // =========================================================================
+  describe('Area M: Filename Path Separator Validation and SQL Syntax Audit', () => {
+    describe('[Static Migration SQL Audit]', () => {
+      it('both migration files replace pg_catalog.position with pg_catalog.strpos and remove redundant E\'\\0\'', () => {
+        const migrations = [
+          path.join(process.cwd(), 'supabase', 'migrations', '20241011_add_workspace.sql'),
+          path.join(process.cwd(), 'supabase', 'migrations', '20241012_harden_workspace_security_and_rpc.sql'),
+        ];
+
+        for (const migPath of migrations) {
+          expect(fs.existsSync(migPath)).toBe(true);
+          const sql = fs.readFileSync(migPath, 'utf-8');
+
+          // Must NOT contain schema-qualified position with special IN syntax
+          expect(sql).not.toMatch(/pg_catalog\.position\s*\(/i);
+          expect(sql).not.toMatch(/position\s*\([^)]*in\s+v_clean_name\)/i);
+
+          // Must NOT contain redundant E'\0'
+          expect(sql).not.toContain("E'\\0'");
+
+          // Must use pg_catalog.strpos(v_clean_name, '/') > 0
+          const forwardSlashMatches = sql.match(/pg_catalog\.strpos\s*\(\s*v_clean_name\s*,\s*'\/'\s*\)\s*>\s*0/g);
+          expect(forwardSlashMatches).not.toBeNull();
+          expect(forwardSlashMatches!.length).toBeGreaterThanOrEqual(2);
+
+          // Must use pg_catalog.strpos(v_clean_name, pg_catalog.chr(92)) > 0
+          const backslashMatches = sql.match(
+            /pg_catalog\.strpos\s*\(\s*v_clean_name\s*,\s*pg_catalog\.chr\s*\(\s*92\s*\)\s*\)\s*>\s*0/g
+          );
+          expect(backslashMatches).not.toBeNull();
+          expect(backslashMatches!.length).toBeGreaterThanOrEqual(2);
+        }
+      });
+    });
+
+    describe('[Observable Application & Local Adapter Tests]', () => {
+      it('rejects file and folder creation with names containing forward slash (/)', async () => {
+        const user = await db.createUser({ email: 'm_slash@mit.edu', name: 'User M1' });
+        const proj = await db.createProject({ name: 'Proj M1', description: '', leader_id: user.id });
+
+        const invalidNames = ['foo/bar.ts', '/leading.ts', 'trailing/', 'a/b/c'];
+        for (const name of invalidNames) {
+          // Direct DB adapter test
+          await expect(
+            db.createWorkspaceNode({
+              project_id: proj.id,
+              name,
+              type: 'file',
+              author_id: user.id,
+              author_name: user.name,
+            })
+          ).rejects.toThrow(/Invalid file or folder name/i);
+
+          // API route test
+          const req = createAuthedRequest(
+            `http://localhost:3000/api/projects/${proj.id}/workspace/nodes`,
+            user.id,
+            {
+              method: 'POST',
+              body: JSON.stringify({ name, type: 'file' }),
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+          const res = await createNodeHandler(req, { params: { id: proj.id } });
+          expect(res.status).toBe(400);
+          const body = await res.json();
+          expect(body.error).toMatch(/Invalid file or folder name/i);
+        }
+      });
+
+      it('rejects file and folder creation with names containing single or multiple backslashes (\\)', async () => {
+        const user = await db.createUser({ email: 'm_backslash@mit.edu', name: 'User M2' });
+        const proj = await db.createProject({ name: 'Proj M2', description: '', leader_id: user.id });
+
+        // Note: includes single backslash, consecutive backslashes, and literal \0 sequence
+        const invalidNames = ['foo\\bar.ts', '\\leading.ts', 'trailing\\', 'test\\0file.ts', 'deep\\\\name.ts'];
+        for (const name of invalidNames) {
+          await expect(
+            db.createWorkspaceNode({
+              project_id: proj.id,
+              name,
+              type: 'file',
+              author_id: user.id,
+              author_name: user.name,
+            })
+          ).rejects.toThrow(/Invalid file or folder name/i);
+
+          const req = createAuthedRequest(
+            `http://localhost:3000/api/projects/${proj.id}/workspace/nodes`,
+            user.id,
+            {
+              method: 'POST',
+              body: JSON.stringify({ name, type: 'folder' }),
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+          const res = await createNodeHandler(req, { params: { id: proj.id } });
+          expect(res.status).toBe(400);
+        }
+      });
+
+      it('rejects empty names, whitespace-only names, and dot relative path names', async () => {
+        const user = await db.createUser({ email: 'm_empty@mit.edu', name: 'User M3' });
+        const proj = await db.createProject({ name: 'Proj M3', description: '', leader_id: user.id });
+
+        const invalidNames = ['', '   ', '.', '..', ' . ', ' .. '];
+        for (const name of invalidNames) {
+          await expect(
+            db.createWorkspaceNode({
+              project_id: proj.id,
+              name,
+              type: 'file',
+              author_id: user.id,
+              author_name: user.name,
+            })
+          ).rejects.toThrow(/Invalid file or folder name/i);
+        }
+      });
+
+      it('accepts valid ordinary filenames and folder names with typical conventions', async () => {
+        const user = await db.createUser({ email: 'm_valid@mit.edu', name: 'User M4' });
+        const proj = await db.createProject({ name: 'Proj M4', description: '', leader_id: user.id });
+
+        const validNames = [
+          'main.ts',
+          'app.component.spec.tsx',
+          'README-2024.md',
+          'data_source_v2.json',
+          'spaced file name.txt',
+          '.env.example',
+          'src',
+          'sub-folder_01',
+        ];
+
+        for (const name of validNames) {
+          const node = await db.createWorkspaceNode({
+            project_id: proj.id,
+            name,
+            type: name.includes('.') ? 'file' : 'folder',
+            author_id: user.id,
+            author_name: user.name,
+          });
+          expect(node).toBeDefined();
+          expect(node.name).toBe(name.trim());
+        }
+      });
+
+      it('rejects node rename with invalid path separators (/ and \\)', async () => {
+        const user = await db.createUser({ email: 'm_rename_invalid@mit.edu', name: 'User M5' });
+        const proj = await db.createProject({ name: 'Proj M5', description: '', leader_id: user.id });
+
+        const file = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'original.ts',
+          type: 'file',
+          author_id: user.id,
+          author_name: user.name,
+        });
+
+        const invalidRenameNames = ['renamed/file.ts', 'renamed\\file.ts', '..', ''];
+        for (const badName of invalidRenameNames) {
+          // Direct DB
+          await expect(
+            db.updateWorkspaceNode(file.id, { name: badName }, user.id, user.name)
+          ).rejects.toThrow(/Invalid name/i);
+
+          // API route
+          const req = createAuthedRequest(
+            `http://localhost:3000/api/projects/${proj.id}/workspace/nodes/${file.id}`,
+            user.id,
+            {
+              method: 'PATCH',
+              body: JSON.stringify({ name: badName }),
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+          const res = await updateNodeHandler(req, { params: { id: proj.id, nodeId: file.id } });
+          expect(res.status).toBe(400);
+        }
+      });
+
+      it('continues to support folder rename and move operations with proper path updates', async () => {
+        const user = await db.createUser({ email: 'm_folder_ops@mit.edu', name: 'User M6' });
+        const proj = await db.createProject({ name: 'Proj M6', description: '', leader_id: user.id });
+
+        // 1. Create parent folder and nested child folder and file
+        const parentFolder = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'parent',
+          type: 'folder',
+          author_id: user.id,
+          author_name: user.name,
+        });
+        expect(parentFolder.path).toBe('/parent');
+
+        const childFolder = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'child',
+          type: 'folder',
+          parent_id: parentFolder.id,
+          author_id: user.id,
+          author_name: user.name,
+        });
+        expect(childFolder.path).toBe('/parent/child');
+
+        const childFile = await db.createWorkspaceNode({
+          project_id: proj.id,
+          name: 'child_file.ts',
+          type: 'file',
+          parent_id: childFolder.id,
+          author_id: user.id,
+          author_name: user.name,
+        });
+        expect(childFile.path).toBe('/parent/child/child_file.ts');
+
+        // 2. Rename parent folder -> descendant paths must update
+        const renamedParent = await db.updateWorkspaceNode(
+          parentFolder.id,
+          { name: 'renamed_parent' },
+          user.id,
+          user.name
+        );
+        expect(renamedParent.name).toBe('renamed_parent');
+        expect(renamedParent.path).toBe('/renamed_parent');
+
+        const childFolderAfter = await db.getWorkspaceNode(childFolder.id);
+        const childFileAfter = await db.getWorkspaceNode(childFile.id);
+        expect(childFolderAfter?.path).toBe('/renamed_parent/child');
+        expect(childFileAfter?.path).toBe('/renamed_parent/child/child_file.ts');
+
+        // Verify tree hierarchy also reflects updated path and structure
+        const treeAfterRename = await db.getWorkspaceTree(proj.id);
+        expect(treeAfterRename).toHaveLength(1);
+        expect(treeAfterRename[0].path).toBe('/renamed_parent');
+        expect(treeAfterRename[0].children?.[0].path).toBe('/renamed_parent/child');
+        expect(treeAfterRename[0].children?.[0].children?.[0].path).toBe('/renamed_parent/child/child_file.ts');
+
+        // 3. Move child folder to root -> descendant file path must update
+        const movedChild = await db.updateWorkspaceNode(
+          childFolder.id,
+          { parent_id: null },
+          user.id,
+          user.name
+        );
+        expect(movedChild.parent_id).toBeNull();
+        expect(movedChild.path).toBe('/child');
+
+        const childFileAfterMove = await db.getWorkspaceNode(childFile.id);
+        expect(childFileAfterMove?.path).toBe('/child/child_file.ts');
+
+        const treeAfterMove = await db.getWorkspaceTree(proj.id);
+        const rootChild = treeAfterMove.find((n) => n.id === childFolder.id);
+        expect(rootChild?.path).toBe('/child');
+        expect(rootChild?.children?.[0].path).toBe('/child/child_file.ts');
+      });
+    });
+  });
 });
