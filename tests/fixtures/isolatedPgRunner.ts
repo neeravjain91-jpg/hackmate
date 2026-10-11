@@ -283,17 +283,40 @@ export function probePortSyncWsl(port: number, timeoutMs = 2000): PortProbeResul
     );
     return parsePortProbeOutput(String(stdoutBuf));
   } catch (err: any) {
+    if (err?.code === 'ETIMEDOUT') {
+      return {
+        status: 'unknown',
+        reason: `WSL port probe process timed out after ${timeoutMs}ms`,
+        error: err,
+      };
+    }
     if (err && err.stdout) {
       const parsed = parsePortProbeOutput(String(err.stdout));
       if (
-        parsed.status !== 'unknown' ||
-        parsed.reason?.includes('WSL port inspection utility') ||
-        parsed.reason?.includes('Neither ss nor netstat')
+        parsed.status === 'unknown' &&
+        (parsed.reason?.includes('WSL port inspection utility') ||
+          parsed.reason?.includes('Neither ss nor netstat'))
       ) {
         return parsed;
       }
     }
-    return { status: 'unknown', reason: `WSL port probe failed: ${err?.message || String(err)}`, error: err };
+    if (
+      err?.code === 'ENOENT' ||
+      err?.code === 'EACCES' ||
+      err?.code === 'ENOMEM' ||
+      String(err?.message).includes('spawn')
+    ) {
+      return {
+        status: 'unknown',
+        reason: `WSL port probe process spawn failure: ${err.message}`,
+        error: err,
+      };
+    }
+    return {
+      status: 'unknown',
+      reason: `WSL port probe failed: ${err?.message || String(err)}`,
+      error: err,
+    };
   }
 }
 

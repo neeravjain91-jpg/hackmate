@@ -1302,6 +1302,164 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         execSpy.mockRestore();
       }
 
+      // C5a. Thrown execFileSync error with captured HACKMATE_PORT:CLOSED marker must NOT return closed (must return unknown)
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          const err: any = new Error('Command failed: unexpected exit during port inspection');
+          err.status = 1;
+          err.stdout = 'HACKMATE_PORT:CLOSED\n';
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const throwClosedRes = checkPortOpenSync(54329, true);
+        expect(throwClosedRes.status).toBe('unknown');
+        expect(throwClosedRes.status).not.toBe('closed');
+        expect(throwClosedRes.status).not.toBe('open');
+
+        // Cannot authorize shutdown confirmation
+        const verifyRes = verifyShutdownSync('/wsl/mock_throw_closed_dir', 54329, true);
+        expect(verifyRes.confirmedStopped).toBe(false);
+        expect(verifyRes.portStatus).toBe('unknown');
+
+        // Cannot authorize data directory deletion; retains tracking record in cleanup_failed
+        const recordsThrowClosed = new Set<ActiveInstanceRecord>();
+        let removeCalledThrowClosed = false;
+        const testRecordThrowClosed: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_throw_closed_dir',
+          port: 54329,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        recordsThrowClosed.add(testRecordThrowClosed);
+
+        const resThrowClosed = performEmergencyCleanupSync(recordsThrowClosed, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalledThrowClosed = true;
+          },
+        });
+
+        expect(removeCalledThrowClosed).toBe(false);
+        expect(testRecordThrowClosed.stopped).toBe(false);
+        expect(testRecordThrowClosed.lifecycleState).toBe('cleanup_failed');
+        expect(recordsThrowClosed.has(testRecordThrowClosed)).toBe(true);
+        expect(resThrowClosed.failed.some(f => f.dataDir === '/wsl/test_throw_closed_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // C5b. Thrown execFileSync error with captured HACKMATE_PORT:OPEN marker must NOT return open (must return unknown)
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          const err: any = new Error('Command failed: crashed after emitting open marker');
+          err.status = 1;
+          err.stdout = 'HACKMATE_PORT:OPEN\n';
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const throwOpenRes = checkPortOpenSync(54330, true);
+        expect(throwOpenRes.status).toBe('unknown');
+        expect(throwOpenRes.status).not.toBe('open');
+        expect(throwOpenRes.status).not.toBe('closed');
+
+        const verifyRes = verifyShutdownSync('/wsl/mock_throw_open_dir', 54330, true);
+        expect(verifyRes.confirmedStopped).toBe(false);
+        expect(verifyRes.portStatus).toBe('unknown');
+
+        const recordsThrowOpen = new Set<ActiveInstanceRecord>();
+        let removeCalledThrowOpen = false;
+        const testRecordThrowOpen: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_throw_open_dir',
+          port: 54330,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        recordsThrowOpen.add(testRecordThrowOpen);
+
+        const resThrowOpen = performEmergencyCleanupSync(recordsThrowOpen, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalledThrowOpen = true;
+          },
+        });
+
+        expect(removeCalledThrowOpen).toBe(false);
+        expect(testRecordThrowOpen.stopped).toBe(false);
+        expect(testRecordThrowOpen.lifecycleState).toBe('cleanup_failed');
+        expect(recordsThrowOpen.has(testRecordThrowOpen)).toBe(true);
+        expect(resThrowOpen.failed.some(f => f.dataDir === '/wsl/test_throw_open_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // C5c. Execution-timeout scenario (ETIMEDOUT) where captured output contains HACKMATE_PORT:CLOSED
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          const err: any = new Error('Command timed out');
+          err.code = 'ETIMEDOUT';
+          err.stdout = 'HACKMATE_PORT:CLOSED\n';
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const timeoutClosedRes = checkPortOpenSync(54331, true);
+        expect(timeoutClosedRes.status).toBe('unknown');
+        expect(timeoutClosedRes.status).not.toBe('closed');
+        expect(timeoutClosedRes.reason).toContain('timed out');
+
+        const verifyRes = verifyShutdownSync('/wsl/mock_timeout_closed_dir', 54331, true);
+        expect(verifyRes.confirmedStopped).toBe(false);
+        expect(verifyRes.portStatus).toBe('unknown');
+
+        const recordsTimeoutClosed = new Set<ActiveInstanceRecord>();
+        let removeCalledTimeoutClosed = false;
+        const testRecordTimeoutClosed: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_timeout_closed_dir',
+          port: 54331,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        recordsTimeoutClosed.add(testRecordTimeoutClosed);
+
+        const resTimeoutClosed = performEmergencyCleanupSync(recordsTimeoutClosed, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalledTimeoutClosed = true;
+          },
+        });
+
+        expect(removeCalledTimeoutClosed).toBe(false);
+        expect(testRecordTimeoutClosed.stopped).toBe(false);
+        expect(testRecordTimeoutClosed.lifecycleState).toBe('cleanup_failed');
+        expect(recordsTimeoutClosed.has(testRecordTimeoutClosed)).toBe(true);
+        expect(resTimeoutClosed.failed.some(f => f.dataDir === '/wsl/test_timeout_closed_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
       // C6. Production-generated script execution with fake utilities in CI across all platforms:
       const getShExecutor = (): { command: string; baseArgs: string[] } => {
         if (process.platform === 'win32') {
