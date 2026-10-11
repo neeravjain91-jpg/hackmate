@@ -202,13 +202,39 @@ export function probePortSyncWsl(port: number, timeoutMs = 2000): PortProbeResul
   }
 
   const wslScript =
+    `has_tool=0; ` +
     `if command -v ss >/dev/null 2>&1; then ` +
-    `if ss -tln 2>/dev/null | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
-    `echo 'HACKMATE_PORT:OPEN'; else echo 'HACKMATE_PORT:CLOSED'; fi; exit 0; fi; ` +
+    `  has_tool=1; ` +
+    `  raw=\\$(ss -tln 2>/dev/null); ` +
+    `  st=\\$?; ` +
+    `  if [ "\\$st" = "0" ]; then ` +
+    `    if echo "\\$raw" | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
+    `      echo 'HACKMATE_PORT:OPEN'; ` +
+    `    else ` +
+    `      echo 'HACKMATE_PORT:CLOSED'; ` +
+    `    fi; ` +
+    `    exit 0; ` +
+    `  fi; ` +
+    `fi; ` +
     `if command -v netstat >/dev/null 2>&1; then ` +
-    `if netstat -tln 2>/dev/null | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
-    `echo 'HACKMATE_PORT:OPEN'; else echo 'HACKMATE_PORT:CLOSED'; fi; exit 0; fi; ` +
-    `echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; exit 1`;
+    `  has_tool=1; ` +
+    `  raw=\\$(netstat -tln 2>/dev/null); ` +
+    `  st=\\$?; ` +
+    `  if [ "\\$st" = "0" ]; then ` +
+    `    if echo "\\$raw" | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
+    `      echo 'HACKMATE_PORT:OPEN'; ` +
+    `    else ` +
+    `      echo 'HACKMATE_PORT:CLOSED'; ` +
+    `    fi; ` +
+    `    exit 0; ` +
+    `  fi; ` +
+    `fi; ` +
+    `if [ "\\$has_tool" = "0" ]; then ` +
+    `  echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; ` +
+    `else ` +
+    `  echo 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED'; ` +
+    `fi; ` +
+    `exit 1;`;
 
   try {
     const stdoutBuf = childProcess.execFileSync(
@@ -230,6 +256,9 @@ export function probePortSyncWsl(port: number, timeoutMs = 2000): PortProbeResul
     if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
       return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
     }
+    if (stdout.includes('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED')) {
+      return { status: 'unknown', reason: 'WSL port inspection utility (ss/netstat) failed during execution' };
+    }
     return { status: 'unknown', reason: `Unrecognized WSL port probe output: ${stdout.trim()}` };
   } catch (err: any) {
     if (err && err.stdout) {
@@ -238,6 +267,9 @@ export function probePortSyncWsl(port: number, timeoutMs = 2000): PortProbeResul
       if (stdout.includes('HACKMATE_PORT:CLOSED')) return { status: 'closed' };
       if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
         return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
+      }
+      if (stdout.includes('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED')) {
+        return { status: 'unknown', reason: 'WSL port inspection utility (ss/netstat) failed during execution' };
       }
     }
     return { status: 'unknown', reason: `WSL port probe failed: ${err?.message || String(err)}`, error: err };

@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import net from 'net';
+import { EventEmitter } from 'events';
 import childProcess, { execSync } from 'child_process';
 import { Client } from 'pg';
 import {
@@ -1066,48 +1067,51 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         execSpy.mockRestore();
       }
 
-      // 2. Async checkPortOpen timeout yields unknown
-      const asyncTimeoutRes = await checkPortOpen(54323, 1);
-      expect(['unknown', 'closed']).toContain(asyncTimeoutRes.status);
-      if (asyncTimeoutRes.status === 'unknown') {
+      // 2. Async checkPortOpen timeout deterministically yields unknown (never allowed to be closed)
+      const createConnSpy = vi.spyOn(net, 'createConnection').mockImplementation(() => {
+        const fakeSocket = new EventEmitter() as any;
+        fakeSocket.destroy = vi.fn();
+        fakeSocket.setTimeout = vi.fn((ms: number) => {
+          setTimeout(() => {
+            fakeSocket.emit('timeout');
+          }, ms);
+          return fakeSocket;
+        });
+        return fakeSocket;
+      });
+
+      try {
+        const asyncTimeoutRes = await checkPortOpen(54323, 10);
+        expect(asyncTimeoutRes.status).toBe('unknown');
+        expect(asyncTimeoutRes.status).not.toBe('closed');
         expect(asyncTimeoutRes.reason).toContain('timed out');
+      } finally {
+        createConnSpy.mockRestore();
       }
     });
 
-    it('C. WSL inspection tools unavailable yields unknown status and pipeline exit status cannot be mistaken for port closure', () => {
-      // C1. ss and netstat unavailable: output marker HACKMATE_PORT:UNKNOWN_NO_TOOLS
-      const execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+    it('C. WSL inspection distinguishes failures from closures and prevents premature data directory deletion', async () => {
+      // C1. Both ss and netstat unavailable: output marker HACKMATE_PORT:UNKNOWN_NO_TOOLS
+      let execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
         if (cmd === 'wsl') {
-          return Buffer.from('HACKMATE_PORT:UNKNOWN_NO_TOOLS\n');
+          const err: any = new Error('Command failed');
+          err.status = 1;
+          err.stdout = 'HACKMATE_PORT:UNKNOWN_NO_TOOLS\n';
+          throw err;
         }
         return Buffer.from('');
       });
 
       try {
-        const probeRes = checkPortOpenSync(54324, true);
-        expect(probeRes.status).toBe('unknown');
-        expect(probeRes.status).not.toBe('closed');
-        expect(probeRes.reason).toContain('Neither ss nor netstat');
+        const noToolsRes = checkPortOpenSync(54324, true);
+        expect(noToolsRes.status).toBe('unknown');
+        expect(noToolsRes.status).not.toBe('closed');
+        expect(noToolsRes.reason).toContain('Neither ss nor netstat');
 
-        // Pipeline exit status of 1 from a broken command cannot be mistaken for closed
-        execSpy.mockImplementation((cmd: string) => {
-          if (cmd === 'wsl') {
-            const err: any = new Error('Shell pipeline syntax error');
-            err.status = 1;
-            throw err;
-          }
-          return Buffer.from('');
-        });
-
-        const brokenPipelineRes = checkPortOpenSync(54324, true);
-        expect(brokenPipelineRes.status).toBe('unknown');
-        expect(brokenPipelineRes.status).not.toBe('closed');
-
-        // Preserves directory
-        const records = new Set<ActiveInstanceRecord>();
-        let removeCalled = false;
-
-        const testRecord: ActiveInstanceRecord = {
+        // Preserves directory and retains record
+        const recordsNoTools = new Set<ActiveInstanceRecord>();
+        let removeCalledNoTools = false;
+        const testRecordNoTools: ActiveInstanceRecord = {
           dataDir: '/wsl/test_notools_dir',
           port: 54324,
           isWsl: true,
@@ -1118,21 +1122,239 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
           serverStopped: false,
           stopped: false,
         };
-        records.add(testRecord);
+        recordsNoTools.add(testRecordNoTools);
 
-        const res = performEmergencyCleanupSync(records, {
+        const resNoTools = performEmergencyCleanupSync(recordsNoTools, {
           stopServerSync: () => {},
           removeDirSync: () => {
-            removeCalled = true;
+            removeCalledNoTools = true;
           },
         });
 
-        expect(removeCalled).toBe(false);
-        expect(testRecord.stopped).toBe(false);
-        expect(records.has(testRecord)).toBe(true);
-        expect(res.failed.some(f => f.dataDir === '/wsl/test_notools_dir')).toBe(true);
+        expect(removeCalledNoTools).toBe(false);
+        expect(testRecordNoTools.stopped).toBe(false);
+        expect(testRecordNoTools.lifecycleState).toBe('cleanup_failed');
+        expect(recordsNoTools.has(testRecordNoTools)).toBe(true);
+        expect(resNoTools.failed.some(f => f.dataDir === '/wsl/test_notools_dir')).toBe(true);
       } finally {
         execSpy.mockRestore();
+      }
+
+      // C2. ss exists but fails during execution: output marker HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          const err: any = new Error('Command failed: ss runtime error');
+          err.status = 1;
+          err.stdout = 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED\n';
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const ssFailRes = checkPortOpenSync(54325, true);
+        expect(ssFailRes.status).toBe('unknown');
+        expect(ssFailRes.status).not.toBe('closed');
+        expect(ssFailRes.reason).toContain('failed during execution');
+
+        // Preserves directory and retains record
+        const recordsSsFail = new Set<ActiveInstanceRecord>();
+        let removeCalledSsFail = false;
+        const testRecordSsFail: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_ss_fail_dir',
+          port: 54325,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        recordsSsFail.add(testRecordSsFail);
+
+        const resSsFail = performEmergencyCleanupSync(recordsSsFail, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalledSsFail = true;
+          },
+        });
+
+        expect(removeCalledSsFail).toBe(false);
+        expect(testRecordSsFail.stopped).toBe(false);
+        expect(testRecordSsFail.lifecycleState).toBe('cleanup_failed');
+        expect(recordsSsFail.has(testRecordSsFail)).toBe(true);
+        expect(resSsFail.failed.some(f => f.dataDir === '/wsl/test_ss_fail_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // C3. netstat exists but fails during execution: output marker HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          const err: any = new Error('Command failed: netstat runtime error');
+          err.status = 1;
+          err.stdout = 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED\n';
+          throw err;
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const nsFailRes = checkPortOpenSync(54326, true);
+        expect(nsFailRes.status).toBe('unknown');
+        expect(nsFailRes.status).not.toBe('closed');
+        expect(nsFailRes.reason).toContain('failed during execution');
+
+        const recordsNsFail = new Set<ActiveInstanceRecord>();
+        let removeCalledNsFail = false;
+        const testRecordNsFail: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_ns_fail_dir',
+          port: 54326,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        recordsNsFail.add(testRecordNsFail);
+
+        const resNsFail = performEmergencyCleanupSync(recordsNsFail, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalledNsFail = true;
+          },
+        });
+
+        expect(removeCalledNsFail).toBe(false);
+        expect(testRecordNsFail.stopped).toBe(false);
+        expect(testRecordNsFail.lifecycleState).toBe('cleanup_failed');
+        expect(recordsNsFail.has(testRecordNsFail)).toBe(true);
+        expect(resNsFail.failed.some(f => f.dataDir === '/wsl/test_ns_fail_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // C4. Valid inspection confirms an OPEN port (HACKMATE_PORT:OPEN) -> cannot authorize deletion
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          return Buffer.from('HACKMATE_PORT:OPEN\n');
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const openRes = checkPortOpenSync(54327, true);
+        expect(openRes.status).toBe('open');
+
+        // Verification fails closed
+        const verifyRes = verifyShutdownSync('/wsl/mock_open_dir', 54327, true);
+        expect(verifyRes.confirmedStopped).toBe(false);
+        expect(verifyRes.portStatus).toBe('open');
+
+        const recordsOpen = new Set<ActiveInstanceRecord>();
+        let removeCalledOpen = false;
+        const testRecordOpen: ActiveInstanceRecord = {
+          dataDir: '/wsl/test_open_dir',
+          port: 54327,
+          isWsl: true,
+          pgCtlPath: 'pg_ctl',
+          stage: 'ready',
+          lifecycleState: 'running',
+          serverStarted: true,
+          serverStopped: false,
+          stopped: false,
+        };
+        recordsOpen.add(testRecordOpen);
+
+        const resOpen = performEmergencyCleanupSync(recordsOpen, {
+          stopServerSync: () => {},
+          removeDirSync: () => {
+            removeCalledOpen = true;
+          },
+        });
+
+        expect(removeCalledOpen).toBe(false);
+        expect(testRecordOpen.stopped).toBe(false);
+        expect(testRecordOpen.lifecycleState).toBe('cleanup_failed');
+        expect(recordsOpen.has(testRecordOpen)).toBe(true);
+        expect(resOpen.failed.some(f => f.dataDir === '/wsl/test_open_dir')).toBe(true);
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // C5. Valid inspection confirms a CLOSED port (HACKMATE_PORT:CLOSED)
+      execSpy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+        if (cmd === 'wsl') {
+          return Buffer.from('HACKMATE_PORT:CLOSED\n');
+        }
+        return Buffer.from('');
+      });
+
+      try {
+        const closedRes = checkPortOpenSync(54328, true);
+        expect(closedRes.status).toBe('closed');
+      } finally {
+        execSpy.mockRestore();
+      }
+
+      // C6. Live shell command-status-handling test: verifies execution status check prevents false closure
+      if (process.platform === 'win32') {
+        const testPort = 59998;
+        // Failing ss simulation: must output HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED and exit 1
+        const scriptFailingSs =
+          `has_tool=0; ` +
+          `if true; then ` +
+          `  has_tool=1; ` +
+          `  raw=\\$(false 2>/dev/null); ` +
+          `  st=\\$?; ` +
+          `  if [ "\\$st" = "0" ]; then ` +
+          `    if echo "\\$raw" | grep -E "[: ]${testPort}([[:space:]]|$)" >/dev/null 2>&1; then ` +
+          `      echo 'HACKMATE_PORT:OPEN'; ` +
+          `    else ` +
+          `      echo 'HACKMATE_PORT:CLOSED'; ` +
+          `    fi; ` +
+          `    exit 0; ` +
+          `  fi; ` +
+          `fi; ` +
+          `if false; then has_tool=1; fi; ` +
+          `if [ "\\$has_tool" = "0" ]; then echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; else echo 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED'; fi; exit 1;`;
+
+        let exitStatus = 0;
+        let scriptOutput = '';
+        try {
+          scriptOutput = String(childProcess.execFileSync('wsl', ['sh', '-c', scriptFailingSs], { encoding: 'utf8' }));
+        } catch (err: any) {
+          exitStatus = err.status;
+          scriptOutput = err.stdout ? String(err.stdout) : '';
+        }
+
+        expect(exitStatus).toBe(1);
+        expect(scriptOutput).toContain('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED');
+        expect(scriptOutput).not.toContain('HACKMATE_PORT:CLOSED');
+
+        // Successful ss simulation: outputs HACKMATE_PORT:CLOSED when port is not listening
+        const scriptSucceedingSs =
+          `has_tool=0; ` +
+          `if true; then ` +
+          `  has_tool=1; ` +
+          `  raw=\\$(echo "LISTEN 0 128 127.0.0.1:5432" 2>/dev/null); ` +
+          `  st=\\$?; ` +
+          `  if [ "\\$st" = "0" ]; then ` +
+          `    if echo "\\$raw" | grep -E "[: ]${testPort}([[:space:]]|$)" >/dev/null 2>&1; then ` +
+          `      echo 'HACKMATE_PORT:OPEN'; ` +
+          `    else ` +
+          `      echo 'HACKMATE_PORT:CLOSED'; ` +
+          `    fi; ` +
+          `    exit 0; ` +
+          `  fi; ` +
+          `fi; ` +
+          `exit 1;`;
+
+        const closedOutput = String(childProcess.execFileSync('wsl', ['sh', '-c', scriptSucceedingSs], { encoding: 'utf8' }));
+        expect(closedOutput.trim()).toBe('HACKMATE_PORT:CLOSED');
       }
     });
 
