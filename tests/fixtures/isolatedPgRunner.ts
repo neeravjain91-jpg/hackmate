@@ -192,6 +192,74 @@ setTimeout(() => {
 }
 
 /**
+ * Generates the POSIX shell script used to probe port status in WSL or Linux environments.
+ * The script inspects available utilities (ss, netstat), captures command output and exit status separately,
+ * validates grep return codes (0 = open, 1 = closed, >=2 = error), and emits explicit protocol markers.
+ */
+export function getWslPortProbeScript(port: number): string {
+  return (
+    `has_tool=0; ` +
+    `if command -v ss >/dev/null 2>&1; then ` +
+    `  has_tool=1; ` +
+    `  raw=$(ss -tln 2>/dev/null); ` +
+    `  st=$?; ` +
+    `  if [ "$st" = "0" ]; then ` +
+    `    echo "$raw" | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; ` +
+    `    grep_st=$?; ` +
+    `    if [ "$grep_st" = "0" ]; then ` +
+    `      echo 'HACKMATE_PORT:OPEN'; ` +
+    `      exit 0; ` +
+    `    elif [ "$grep_st" = "1" ]; then ` +
+    `      echo 'HACKMATE_PORT:CLOSED'; ` +
+    `      exit 0; ` +
+    `    fi; ` +
+    `  fi; ` +
+    `fi; ` +
+    `if command -v netstat >/dev/null 2>&1; then ` +
+    `  has_tool=1; ` +
+    `  raw=$(netstat -tln 2>/dev/null); ` +
+    `  st=$?; ` +
+    `  if [ "$st" = "0" ]; then ` +
+    `    echo "$raw" | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; ` +
+    `    grep_st=$?; ` +
+    `    if [ "$grep_st" = "0" ]; then ` +
+    `      echo 'HACKMATE_PORT:OPEN'; ` +
+    `      exit 0; ` +
+    `    elif [ "$grep_st" = "1" ]; then ` +
+    `      echo 'HACKMATE_PORT:CLOSED'; ` +
+    `      exit 0; ` +
+    `    fi; ` +
+    `  fi; ` +
+    `fi; ` +
+    `if [ "$has_tool" = "0" ]; then ` +
+    `  echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; ` +
+    `else ` +
+    `  echo 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED'; ` +
+    `fi; ` +
+    `exit 1;`
+  );
+}
+
+/**
+ * Parses the stdout/stderr string produced by port probe execution into a structured PortProbeResult.
+ */
+export function parsePortProbeOutput(stdout: string): PortProbeResult {
+  if (stdout.includes('HACKMATE_PORT:OPEN')) {
+    return { status: 'open' };
+  }
+  if (stdout.includes('HACKMATE_PORT:CLOSED')) {
+    return { status: 'closed' };
+  }
+  if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
+    return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
+  }
+  if (stdout.includes('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED')) {
+    return { status: 'unknown', reason: 'WSL port inspection utility (ss/netstat) failed during execution' };
+  }
+  return { status: 'unknown', reason: `Unrecognized WSL port probe output: ${stdout.trim()}` };
+}
+
+/**
  * Probes a local TCP port synchronously in WSL.
  * Verifies inspection utilities exist, avoids false closures from pipeline failures,
  * and uses unambiguous protocol markers.
@@ -201,75 +269,28 @@ export function probePortSyncWsl(port: number, timeoutMs = 2000): PortProbeResul
     return { status: 'unknown', reason: `Invalid port: ${port}` };
   }
 
-  const wslScript =
-    `has_tool=0; ` +
-    `if command -v ss >/dev/null 2>&1; then ` +
-    `  has_tool=1; ` +
-    `  raw=\\$(ss -tln 2>/dev/null); ` +
-    `  st=\\$?; ` +
-    `  if [ "\\$st" = "0" ]; then ` +
-    `    if echo "\\$raw" | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
-    `      echo 'HACKMATE_PORT:OPEN'; ` +
-    `    else ` +
-    `      echo 'HACKMATE_PORT:CLOSED'; ` +
-    `    fi; ` +
-    `    exit 0; ` +
-    `  fi; ` +
-    `fi; ` +
-    `if command -v netstat >/dev/null 2>&1; then ` +
-    `  has_tool=1; ` +
-    `  raw=\\$(netstat -tln 2>/dev/null); ` +
-    `  st=\\$?; ` +
-    `  if [ "\\$st" = "0" ]; then ` +
-    `    if echo "\\$raw" | grep -E "[: ]${port}([[:space:]]|$)" >/dev/null 2>&1; then ` +
-    `      echo 'HACKMATE_PORT:OPEN'; ` +
-    `    else ` +
-    `      echo 'HACKMATE_PORT:CLOSED'; ` +
-    `    fi; ` +
-    `    exit 0; ` +
-    `  fi; ` +
-    `fi; ` +
-    `if [ "\\$has_tool" = "0" ]; then ` +
-    `  echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; ` +
-    `else ` +
-    `  echo 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED'; ` +
-    `fi; ` +
-    `exit 1;`;
+  const wslScript = getWslPortProbeScript(port);
 
   try {
     const stdoutBuf = childProcess.execFileSync(
       'wsl',
-      ['sh', '-c', wslScript],
+      ['-e', 'sh', '-c', wslScript],
       {
         timeout: timeoutMs,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       }
     );
-    const stdout = String(stdoutBuf);
-    if (stdout.includes('HACKMATE_PORT:OPEN')) {
-      return { status: 'open' };
-    }
-    if (stdout.includes('HACKMATE_PORT:CLOSED')) {
-      return { status: 'closed' };
-    }
-    if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
-      return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
-    }
-    if (stdout.includes('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED')) {
-      return { status: 'unknown', reason: 'WSL port inspection utility (ss/netstat) failed during execution' };
-    }
-    return { status: 'unknown', reason: `Unrecognized WSL port probe output: ${stdout.trim()}` };
+    return parsePortProbeOutput(String(stdoutBuf));
   } catch (err: any) {
     if (err && err.stdout) {
-      const stdout = String(err.stdout);
-      if (stdout.includes('HACKMATE_PORT:OPEN')) return { status: 'open' };
-      if (stdout.includes('HACKMATE_PORT:CLOSED')) return { status: 'closed' };
-      if (stdout.includes('HACKMATE_PORT:UNKNOWN_NO_TOOLS')) {
-        return { status: 'unknown', reason: 'Neither ss nor netstat utility is available in WSL' };
-      }
-      if (stdout.includes('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED')) {
-        return { status: 'unknown', reason: 'WSL port inspection utility (ss/netstat) failed during execution' };
+      const parsed = parsePortProbeOutput(String(err.stdout));
+      if (
+        parsed.status !== 'unknown' ||
+        parsed.reason?.includes('WSL port inspection utility') ||
+        parsed.reason?.includes('Neither ss nor netstat')
+      ) {
+        return parsed;
       }
     }
     return { status: 'unknown', reason: `WSL port probe failed: ${err?.message || String(err)}`, error: err };

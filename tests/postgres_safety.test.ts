@@ -32,6 +32,8 @@ import {
   checkPortOpen,
   probePortSyncNative,
   probePortSyncWsl,
+  getWslPortProbeScript,
+  parsePortProbeOutput,
   inspectPidFileSync,
   inspectPidFileAsync,
   inspectPidFileWslSync,
@@ -1300,61 +1302,246 @@ describe('PostgreSQL Harness Target Safety & Isolation', () => {
         execSpy.mockRestore();
       }
 
-      // C6. Live shell command-status-handling test: verifies execution status check prevents false closure
-      if (process.platform === 'win32') {
-        const testPort = 59998;
-        // Failing ss simulation: must output HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED and exit 1
-        const scriptFailingSs =
-          `has_tool=0; ` +
-          `if true; then ` +
-          `  has_tool=1; ` +
-          `  raw=\\$(false 2>/dev/null); ` +
-          `  st=\\$?; ` +
-          `  if [ "\\$st" = "0" ]; then ` +
-          `    if echo "\\$raw" | grep -E "[: ]${testPort}([[:space:]]|$)" >/dev/null 2>&1; then ` +
-          `      echo 'HACKMATE_PORT:OPEN'; ` +
-          `    else ` +
-          `      echo 'HACKMATE_PORT:CLOSED'; ` +
-          `    fi; ` +
-          `    exit 0; ` +
-          `  fi; ` +
-          `fi; ` +
-          `if false; then has_tool=1; fi; ` +
-          `if [ "\\$has_tool" = "0" ]; then echo 'HACKMATE_PORT:UNKNOWN_NO_TOOLS'; else echo 'HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED'; fi; exit 1;`;
+      // C6. Production-generated script execution with fake utilities in CI across all platforms:
+      const getShExecutor = (): { command: string; baseArgs: string[] } => {
+        if (process.platform === 'win32') {
+          const gitSh = 'C:\\Program Files\\Git\\bin\\sh.exe';
+          if (fs.existsSync(gitSh)) {
+            return { command: gitSh, baseArgs: ['-c'] };
+          }
+          return { command: 'sh', baseArgs: ['-c'] };
+        }
+        return { command: '/bin/sh', baseArgs: ['-c'] };
+      };
 
-        let exitStatus = 0;
-        let scriptOutput = '';
-        try {
-          scriptOutput = String(childProcess.execFileSync('wsl', ['sh', '-c', scriptFailingSs], { encoding: 'utf8' }));
-        } catch (err: any) {
-          exitStatus = err.status;
-          scriptOutput = err.stdout ? String(err.stdout) : '';
+      const toPosix = (p: string) =>
+        p.replace(/^[A-Za-z]:/, (m) => '/' + m[0].toLowerCase()).replace(/\\/g, '/');
+
+      const executeProdScript = (
+        port: number,
+        binDir?: string,
+        isolatedEnvPath?: string
+      ): { exitStatus: number; stdout: string; result: PortProbeResult } => {
+        const prodScript = getWslPortProbeScript(port);
+        const executor = getShExecutor();
+        let fullScript = prodScript;
+        if (isolatedEnvPath) {
+          fullScript = `export PATH="${isolatedEnvPath}"; ${prodScript}`;
+        } else if (binDir) {
+          fullScript = `export PATH="${toPosix(binDir)}:$PATH"; ${prodScript}`;
         }
 
-        expect(exitStatus).toBe(1);
-        expect(scriptOutput).toContain('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED');
-        expect(scriptOutput).not.toContain('HACKMATE_PORT:CLOSED');
+        let exitStatus = 0;
+        let stdout = '';
+        try {
+          stdout = childProcess.execFileSync(
+            executor.command,
+            [...executor.baseArgs, fullScript],
+            {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'pipe'],
+            }
+          );
+        } catch (err: any) {
+          exitStatus = err.status ?? 1;
+          stdout = err.stdout ? String(err.stdout) : '';
+        }
 
-        // Successful ss simulation: outputs HACKMATE_PORT:CLOSED when port is not listening
-        const scriptSucceedingSs =
-          `has_tool=0; ` +
-          `if true; then ` +
-          `  has_tool=1; ` +
-          `  raw=\\$(echo "LISTEN 0 128 127.0.0.1:5432" 2>/dev/null); ` +
-          `  st=\\$?; ` +
-          `  if [ "\\$st" = "0" ]; then ` +
-          `    if echo "\\$raw" | grep -E "[: ]${testPort}([[:space:]]|$)" >/dev/null 2>&1; then ` +
-          `      echo 'HACKMATE_PORT:OPEN'; ` +
-          `    else ` +
-          `      echo 'HACKMATE_PORT:CLOSED'; ` +
-          `    fi; ` +
-          `    exit 0; ` +
-          `  fi; ` +
-          `fi; ` +
-          `exit 1;`;
+        const result = parsePortProbeOutput(stdout);
+        return { exitStatus, stdout: stdout.trim(), result };
+      };
 
-        const closedOutput = String(childProcess.execFileSync('wsl', ['sh', '-c', scriptSucceedingSs], { encoding: 'utf8' }));
-        expect(closedOutput.trim()).toBe('HACKMATE_PORT:CLOSED');
+      const tempFakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_fake_bin_'));
+      try {
+        const testPort = 59801;
+
+        // 1. ss succeeds and port is listening -> open (exit 0)
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'ss'),
+          `#!/bin/sh\necho "LISTEN 0 128 127.0.0.1:${testPort} 0.0.0.0:*"\nexit 0\n`,
+          { mode: 0o755 }
+        );
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'netstat'),
+          `#!/bin/sh\nexit 1\n`,
+          { mode: 0o755 }
+        );
+
+        const case1 = executeProdScript(testPort, tempFakeBin);
+        expect(case1.exitStatus).toBe(0);
+        expect(case1.stdout).toContain('HACKMATE_PORT:OPEN');
+        expect(case1.result.status).toBe('open');
+
+        // 2. ss succeeds and output does not contain the target port -> closed (exit 0)
+        // Proves that template literal escaping bug is fixed and valid closed port is produced
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'ss'),
+          `#!/bin/sh\necho "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*"\nexit 0\n`,
+          { mode: 0o755 }
+        );
+        const case2 = executeProdScript(testPort, tempFakeBin);
+        expect(case2.exitStatus).toBe(0);
+        expect(case2.stdout).toContain('HACKMATE_PORT:CLOSED');
+        expect(case2.result.status).toBe('closed');
+
+        // 3. ss fails and netstat also fails -> unknown (exit 1)
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'ss'),
+          `#!/bin/sh\nexit 1\n`,
+          { mode: 0o755 }
+        );
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'netstat'),
+          `#!/bin/sh\nexit 1\n`,
+          { mode: 0o755 }
+        );
+        const case3 = executeProdScript(testPort, tempFakeBin);
+        expect(case3.exitStatus).toBe(1);
+        expect(case3.stdout).toContain('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED');
+        expect(case3.result.status).toBe('unknown');
+        expect(case3.result.status).not.toBe('closed');
+
+        // 4. ss fails but netstat successfully establishes the port state:
+        // 4a. netstat establishes open port -> open (exit 0)
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'ss'),
+          `#!/bin/sh\nexit 1\n`,
+          { mode: 0o755 }
+        );
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'netstat'),
+          `#!/bin/sh\necho "tcp 0 0 127.0.0.1:${testPort} 0.0.0.0:* LISTEN"\nexit 0\n`,
+          { mode: 0o755 }
+        );
+        const case4a = executeProdScript(testPort, tempFakeBin);
+        expect(case4a.exitStatus).toBe(0);
+        expect(case4a.stdout).toContain('HACKMATE_PORT:OPEN');
+        expect(case4a.result.status).toBe('open');
+
+        // 4b. netstat establishes closed port -> closed (exit 0)
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'netstat'),
+          `#!/bin/sh\necho "tcp 0 0 127.0.0.1:5432 0.0.0.0:* LISTEN"\nexit 0\n`,
+          { mode: 0o755 }
+        );
+        const case4b = executeProdScript(testPort, tempFakeBin);
+        expect(case4b.exitStatus).toBe(0);
+        expect(case4b.stdout).toContain('HACKMATE_PORT:CLOSED');
+        expect(case4b.result.status).toBe('closed');
+
+        // 5. Neither inspection utility is available -> unknown (exit 1)
+        const emptyFakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'pg_test_empty_bin_'));
+        let case5: { exitStatus: number; stdout: string; result: PortProbeResult };
+        try {
+          fs.writeFileSync(
+            path.join(emptyFakeBin, 'grep'),
+            `#!/bin/sh\nexec /usr/bin/grep "$@"\n`,
+            { mode: 0o755 }
+          );
+          case5 = executeProdScript(testPort, undefined, toPosix(emptyFakeBin));
+          expect(case5.exitStatus).toBe(1);
+          expect(case5.stdout).toContain('HACKMATE_PORT:UNKNOWN_NO_TOOLS');
+          expect(case5.result.status).toBe('unknown');
+          expect(case5.result.status).not.toBe('closed');
+          expect(case5.result.reason).toContain('Neither ss nor netstat');
+        } finally {
+          fs.rmSync(emptyFakeBin, { recursive: true, force: true });
+        }
+
+        // 6. The matching command itself fails (grep exit >= 2) -> unknown (exit 1), NEVER closed!
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'ss'),
+          `#!/bin/sh\necho "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*"\nexit 0\n`,
+          { mode: 0o755 }
+        );
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'netstat'),
+          `#!/bin/sh\necho "LISTEN 0 128 127.0.0.1:5432 0.0.0.0:*"\nexit 0\n`,
+          { mode: 0o755 }
+        );
+        fs.writeFileSync(
+          path.join(tempFakeBin, 'grep'),
+          `#!/bin/sh\nexit 2\n`,
+          { mode: 0o755 }
+        );
+        const case6 = executeProdScript(testPort, tempFakeBin);
+        expect(case6.exitStatus).toBe(1);
+        expect(case6.stdout).toContain('HACKMATE_PORT:UNKNOWN_INSPECTION_FAILED');
+        expect(case6.stdout).not.toContain('HACKMATE_PORT:CLOSED');
+        expect(case6.result.status).toBe('unknown');
+        expect(case6.result.status).not.toBe('closed');
+
+        // 7. Each ambiguous or failed inspection prevents data-directory removal and preserves cleanup record
+        for (const failedCase of [case3, case5, case6]) {
+          const spy = vi.spyOn(childProcess, 'execFileSync').mockImplementation((cmd: string) => {
+            if (cmd === 'wsl') {
+              const err: any = new Error('Command failed: simulated inspection failure');
+              err.status = failedCase.exitStatus;
+              err.stdout = `${failedCase.stdout}\n`;
+              throw err;
+            }
+            return Buffer.from('');
+          });
+
+          try {
+            const records = new Set<ActiveInstanceRecord>();
+            let removeCalled = false;
+            const failRecord: ActiveInstanceRecord = {
+              dataDir: `/wsl/test_failed_${failedCase.stdout.replace(/[^a-zA-Z0-9]/g, '_')}`,
+              port: testPort,
+              isWsl: true,
+              pgCtlPath: 'pg_ctl',
+              stage: 'ready',
+              lifecycleState: 'running',
+              serverStarted: true,
+              serverStopped: false,
+              stopped: false,
+            };
+            records.add(failRecord);
+
+            const cleanupRes = performEmergencyCleanupSync(records, {
+              stopServerSync: () => {},
+              removeDirSync: () => {
+                removeCalled = true;
+              },
+            });
+
+            // Blocked directory removal
+            expect(removeCalled).toBe(false);
+            expect(failRecord.stopped).toBe(false);
+            expect(failRecord.lifecycleState).toBe('cleanup_failed');
+            expect(records.has(failRecord)).toBe(true);
+            expect(cleanupRes.failed.some((f) => f.dataDir === failRecord.dataDir)).toBe(true);
+          } finally {
+            spy.mockRestore();
+          }
+        }
+
+        // 8. Confirm valid closed port result was produced by real shell execution (case2 & case4b),
+        // confirming that template-literal escaping bug is completely eliminated.
+        expect(case2.result.status).toBe('closed');
+        expect(case4b.result.status).toBe('closed');
+
+        // 9. On Windows systems where WSL is installed, test live execution of the production script
+        if (process.platform === 'win32') {
+          let wslAvailable = false;
+          try {
+            childProcess.execFileSync('wsl', ['-e', 'true'], { stdio: 'ignore' });
+            wslAvailable = true;
+          } catch {}
+
+          if (wslAvailable) {
+            const liveScript = getWslPortProbeScript(59998);
+            const liveOut = String(
+              childProcess.execFileSync('wsl', ['-e', 'sh', '-c', liveScript], { encoding: 'utf8' })
+            );
+            expect(liveOut.trim()).toBe('HACKMATE_PORT:CLOSED');
+            expect(liveOut).not.toContain('syntax error');
+            expect(liveOut).not.toContain('Recv-Q: not found');
+          }
+        }
+      } finally {
+        fs.rmSync(tempFakeBin, { recursive: true, force: true });
       }
     });
 
