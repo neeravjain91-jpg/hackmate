@@ -1,3 +1,26 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import { NextRequest } from 'next/server';
+import { POST as registerHandler } from '@/app/api/auth/register/route';
+import { POST as loginHandler } from '@/app/api/auth/login/route';
+import { GET as meHandler } from '@/app/api/auth/me/route';
+import { GET as getProjectsHandler, POST as createProjectHandler } from '@/app/api/projects/route';
+import { POST as joinProjectHandler } from '@/app/api/projects/join/route';
+import { GET as getProjectDetailHandler } from '@/app/api/projects/[id]/route';
+import { GET as getTasksHandler, POST as createTaskHandler } from '@/app/api/projects/[id]/tasks/route';
+import { PATCH as updateTaskHandler } from '@/app/api/projects/[id]/tasks/[taskId]/route';
+import { GET as getContributionsHandler, POST as publishContributionHandler } from '@/app/api/projects/[id]/contributions/route';
+import { GET as downloadFileHandler } from '@/app/api/projects/[id]/files/[fileId]/download/route';
+import { GET as cleanupRateLimitsHandler } from '@/app/api/cron/cleanup-rate-limits/route';
+import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
+import { resetDatabaseAdapter } from '@/lib/db';
+import { resetStorageAdapter } from '@/lib/storage';
+
+const TEST_DIR = path.join(process.cwd(), 'data');
+const TEST_DB_PATH = path.join(TEST_DIR, 'hackmate.json');
+const TEST_STORAGE_DIR = path.join(TEST_DIR, 'storage');
+
 describe('Rate-limit cleanup endpoint authentication', () => {
   let oldSecret: string | undefined;
   beforeEach(() => { oldSecret = process.env.CRON_SECRET; delete process.env.CRON_SECRET; });
