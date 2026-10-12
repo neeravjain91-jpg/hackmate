@@ -28,7 +28,6 @@ describe('email confirmation callback contract', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    process.env.NODE_ENV = 'test';
     verifyOtp = vi.fn();
     db = {
       isUserVerified: vi.fn().mockResolvedValue(true),
@@ -42,8 +41,8 @@ describe('email confirmation callback contract', () => {
   });
 
   afterEach(() => {
-    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = originalNodeEnv;
+    // NODE_ENV is controlled by Vitest and is intentionally not mutated here.
+    void originalNodeEnv;
   });
 
   it('requires token_hash and explicit type=email, then calls verifyOtp with type=email', async () => {
