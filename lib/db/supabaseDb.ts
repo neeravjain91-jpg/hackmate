@@ -80,7 +80,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     }
 
     // Fail closed if administrative user lookup is unavailable
-    if (!this.client.auth?.admin?.getUserById) {
+    if (typeof this.client.auth?.admin?.getUserById !== 'function') {
       return false;
     }
 
