@@ -9,8 +9,12 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized. Please sign in.' }, { status: 401 });
     }
 
+    const { searchParams } = new URL(request.url);
+    const limit = searchParams.get('limit') ? parseInt(searchParams.get('limit')!, 10) : undefined;
+    const offset = searchParams.get('offset') ? parseInt(searchParams.get('offset')!, 10) : undefined;
+
     const db = getDatabaseAdapter();
-    const projects = await db.getUserProjects(user.id);
+    const projects = await db.getUserProjects(user.id, { limit, offset });
     return NextResponse.json({ projects });
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Failed to fetch projects.' }, { status: 500 });

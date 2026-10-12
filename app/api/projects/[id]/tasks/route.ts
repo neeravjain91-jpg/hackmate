@@ -23,7 +23,11 @@ export async function GET(
       );
     }
 
-    const tasks = await db.getProjectTasks(projectId);
+    const { searchParams } = new URL(request.url);
+    const limit = searchParams.get('limit') ? parseInt(searchParams.get('limit')!, 10) : undefined;
+    const offset = searchParams.get('offset') ? parseInt(searchParams.get('offset')!, 10) : undefined;
+
+    const tasks = await db.getProjectTasks(projectId, { limit, offset });
     return NextResponse.json({ tasks });
   } catch (err: any) {
     return NextResponse.json({ error: err.message || 'Failed to fetch tasks.' }, { status: 500 });

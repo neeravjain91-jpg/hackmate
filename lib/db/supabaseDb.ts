@@ -18,7 +18,7 @@ import {
   WorkspaceFileDetail,
   WorkspaceTreeItem,
 } from '../types';
-import { IDatabaseAdapter } from './types';
+import { IDatabaseAdapter, PaginationOptions } from './types';
 
 export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   private client: SupabaseClient;
@@ -51,16 +51,40 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   }
 
   async createUser(userData: {
+    id?: string;
     email: string;
     name: string;
+    password?: string;
     password_hash?: string;
     avatar_url?: string | null;
   }): Promise<UserProfile> {
-    const id = uuidv4();
+    let userId = userData.id;
+
+    if (!userId && userData.password && this.client.auth?.admin?.createUser) {
+      const { data: authData, error: authError } = await this.client.auth.admin.createUser({
+        email: userData.email.toLowerCase(),
+        password: userData.password,
+        email_confirm: true,
+        user_metadata: {
+          name: userData.name,
+          avatar_url: userData.avatar_url || null,
+        },
+      });
+
+      if (authError || !authData?.user) {
+        throw new Error(authError?.message || 'Failed to create user in Supabase Auth.');
+      }
+      userId = authData.user.id;
+    }
+
+    if (!userId) {
+      userId = uuidv4();
+    }
+
     const { data, error } = await this.client
       .from('profiles')
-      .insert({
-        id,
+      .upsert({
+        id: userId,
         email: userData.email.toLowerCase(),
         name: userData.name,
         avatar_url: userData.avatar_url || null,
@@ -72,6 +96,32 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       throw new Error(`Failed to create profile: ${error.message}`);
     }
     return data as UserProfile;
+  }
+
+  async authenticateUser(email: string, password: string): Promise<UserProfile | null> {
+    if (!this.client.auth?.signInWithPassword) {
+      return null;
+    }
+
+    const { data, error } = await this.client.auth.signInWithPassword({
+      email: email.toLowerCase(),
+      password,
+    });
+
+    if (error || !data?.user) {
+      return null;
+    }
+
+    const profile = await this.getUserById(data.user.id);
+    if (profile) return profile;
+
+    return {
+      id: data.user.id,
+      email: data.user.email || email.toLowerCase(),
+      name: (data.user.user_metadata?.name as string) || email.split('@')[0],
+      avatar_url: (data.user.user_metadata?.avatar_url as string) || null,
+      created_at: data.user.created_at || new Date().toISOString(),
+    };
   }
 
   // --- Projects ---
@@ -158,7 +208,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     return data as Project;
   }
 
-  async getUserProjects(userId: string): Promise<ProjectWithDetails[]> {
+  async getUserProjects(userId: string, pagination?: PaginationOptions): Promise<ProjectWithDetails[]> {
     const { data: memberships, error } = await this.client
       .from('project_members')
       .select('project_id, role')
@@ -166,8 +216,14 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
     if (error || !memberships) return [];
 
-    const projectIds = memberships.map((m) => m.project_id);
+    let projectIds = memberships.map((m) => m.project_id);
     if (projectIds.length === 0) return [];
+
+    if (pagination?.limit !== undefined) {
+      const offset = pagination.offset || 0;
+      projectIds = projectIds.slice(offset, offset + pagination.limit);
+      if (projectIds.length === 0) return [];
+    }
 
     const { data: projects } = await this.client
       .from('projects')
@@ -359,11 +415,18 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     return data as Task;
   }
 
-  async getProjectTasks(projectId: string): Promise<Task[]> {
-    const { data, error } = await this.client
+  async getProjectTasks(projectId: string, pagination?: PaginationOptions): Promise<Task[]> {
+    let query = this.client
       .from('tasks')
       .select('*, assignee:profiles!tasks_assigned_to_fkey(id, email, name, avatar_url), creator:profiles!tasks_created_by_fkey(id, email, name, avatar_url)')
       .eq('project_id', projectId);
+
+    if (pagination?.limit !== undefined) {
+      const from = pagination.offset || 0;
+      query = query.range(from, from + pagination.limit - 1);
+    }
+
+    const { data, error } = await query;
 
     if (error || !data) return [];
     return data as Task[];
@@ -448,7 +511,8 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
   async getProjectContributions(
     projectId: string,
-    filters?: { search?: string; contributorId?: string; taskId?: string }
+    filters?: { search?: string; contributorId?: string; taskId?: string },
+    pagination?: PaginationOptions
   ): Promise<Contribution[]> {
     let query = this.client
       .from('contributions')
@@ -463,6 +527,11 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       query = query.eq('task_id', filters.taskId);
     }
 
+    if (pagination?.limit !== undefined && !filters?.search) {
+      const from = pagination.offset || 0;
+      query = query.range(from, from + pagination.limit - 1);
+    }
+
     const { data, error } = await query;
     if (error || !data) return [];
 
@@ -475,6 +544,11 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
           c.description.toLowerCase().includes(s) ||
           c.contributor_name.toLowerCase().includes(s)
       );
+
+      if (pagination?.limit !== undefined) {
+        const start = pagination.offset || 0;
+        list = list.slice(start, start + pagination.limit);
+      }
     }
 
     return list;
@@ -734,12 +808,19 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     };
   }
 
-  async getWorkspaceFileRevisions(fileId: string): Promise<WorkspaceRevision[]> {
-    const { data, error } = await this.client
+  async getWorkspaceFileRevisions(fileId: string, pagination?: PaginationOptions): Promise<WorkspaceRevision[]> {
+    let query = this.client
       .from('workspace_revisions')
       .select('*')
       .eq('node_id', fileId)
       .order('revision_number', { ascending: false });
+
+    if (pagination?.limit !== undefined) {
+      const from = pagination.offset || 0;
+      query = query.range(from, from + pagination.limit - 1);
+    }
+
+    const { data, error } = await query;
 
     if (error || !data) return [];
     return data as WorkspaceRevision[];

@@ -151,3 +151,6 @@ GRANT ALL ON TABLE public.profiles TO test_runner, postgres;
 GRANT ALL ON TABLE public.projects TO test_runner, postgres;
 GRANT ALL ON TABLE public.project_members TO test_runner, postgres;
 
+CREATE INDEX IF NOT EXISTS idx_project_members_user ON public.project_members(user_id);
+
+

@@ -19,7 +19,8 @@ import {
   WorkspaceFileDetail,
   WorkspaceTreeItem,
 } from '../types';
-import { IDatabaseAdapter } from './types';
+import bcrypt from 'bcryptjs';
+import { IDatabaseAdapter, PaginationOptions } from './types';
 import { isVercelEnvironment } from './config';
 
 interface Schema {
@@ -124,8 +125,10 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
   }
 
   async createUser(userData: {
+    id?: string;
     email: string;
     name: string;
+    password?: string;
     password_hash?: string;
     avatar_url?: string | null;
   }): Promise<UserProfile> {
@@ -135,18 +138,41 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         throw new Error('User with this email already exists.');
       }
 
+      let passwordHash = userData.password_hash;
+      if (!passwordHash && userData.password) {
+        const salt = await bcrypt.genSalt(10);
+        passwordHash = await bcrypt.hash(userData.password, salt);
+      }
+
       const newUser: UserAuthRecord = {
-        id: uuidv4(),
+        id: userData.id || uuidv4(),
         email: userData.email.trim(),
         name: userData.name.trim(),
         avatar_url: userData.avatar_url || null,
-        password_hash: userData.password_hash,
+        password_hash: passwordHash,
         created_at: new Date().toISOString(),
       };
 
       data.users.push(newUser);
       const { password_hash, ...profile } = newUser;
       return { result: profile, dataToSave: data };
+    });
+  }
+
+  async authenticateUser(email: string, password: string): Promise<UserProfile | null> {
+    return this.withLock(async (data) => {
+      const user = data.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
+      if (!user || !user.password_hash) {
+        return { result: null };
+      }
+
+      const isValid = await bcrypt.compare(password, user.password_hash);
+      if (!isValid) {
+        return { result: null };
+      }
+
+      const { password_hash, ...profile } = user;
+      return { result: profile };
     });
   }
 
@@ -243,14 +269,14 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     });
   }
 
-  async getUserProjects(userId: string): Promise<ProjectWithDetails[]> {
+  async getUserProjects(userId: string, pagination?: PaginationOptions): Promise<ProjectWithDetails[]> {
     return this.withLock(async (data) => {
       const memberships = data.project_members.filter((pm) => pm.user_id === userId);
       const projectIds = memberships.map((m) => m.project_id);
 
       const projects = data.projects.filter((p) => projectIds.includes(p.id));
 
-      const detailedProjects: ProjectWithDetails[] = projects.map((project) => {
+      let detailedProjects: ProjectWithDetails[] = projects.map((project) => {
         const members = data.project_members
           .filter((pm) => pm.project_id === project.id)
           .map((pm) => {
@@ -272,6 +298,12 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
           contributionsCount,
         };
       });
+
+      if (pagination) {
+        const start = pagination.offset || 0;
+        const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
+        detailedProjects = detailedProjects.slice(start, end);
+      }
 
       return { result: detailedProjects };
     });
@@ -487,9 +519,9 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     });
   }
 
-  async getProjectTasks(projectId: string): Promise<Task[]> {
+  async getProjectTasks(projectId: string, pagination?: PaginationOptions): Promise<Task[]> {
     return this.withLock(async (data) => {
-      const tasks = data.tasks
+      let tasks = data.tasks
         .filter((t) => t.project_id === projectId)
         .map((task) => {
           const assignee = data.users.find((u) => u.id === task.assigned_to);
@@ -500,6 +532,12 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
             creator: creator ? { id: creator.id, email: creator.email, name: creator.name, avatar_url: creator.avatar_url, created_at: creator.created_at } : undefined,
           };
         });
+
+      if (pagination) {
+        const start = pagination.offset || 0;
+        const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
+        tasks = tasks.slice(start, end);
+      }
 
       return { result: tasks };
     });
@@ -602,7 +640,8 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
 
   async getProjectContributions(
     projectId: string,
-    filters?: { search?: string; contributorId?: string; taskId?: string }
+    filters?: { search?: string; contributorId?: string; taskId?: string },
+    pagination?: PaginationOptions
   ): Promise<Contribution[]> {
     return this.withLock(async (data) => {
       let list = data.contributions.filter((c) => c.project_id === projectId);
@@ -628,6 +667,12 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
 
       // Sort latest first
       list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+      if (pagination) {
+        const start = pagination.offset || 0;
+        const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
+        list = list.slice(start, end);
+      }
 
       const enriched: Contribution[] = list.map((c) => {
         const files = data.contribution_files.filter((cf) => cf.contribution_id === c.id);
@@ -1098,11 +1143,17 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     });
   }
 
-  async getWorkspaceFileRevisions(fileId: string): Promise<WorkspaceRevision[]> {
+  async getWorkspaceFileRevisions(fileId: string, pagination?: PaginationOptions): Promise<WorkspaceRevision[]> {
     return this.withLock(async (data) => {
-      const revisions = (data.workspace_revisions || [])
+      let revisions = (data.workspace_revisions || [])
         .filter((r) => r.node_id === fileId)
         .sort((a, b) => b.revision_number - a.revision_number);
+
+      if (pagination) {
+        const start = pagination.offset || 0;
+        const end = pagination.limit !== undefined ? start + pagination.limit : undefined;
+        revisions = revisions.slice(start, end);
+      }
 
       return { result: revisions };
     });

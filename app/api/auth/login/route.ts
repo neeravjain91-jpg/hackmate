@@ -1,10 +1,24 @@
 import { NextRequest, NextResponse } from 'next/server';
-import bcrypt from 'bcryptjs';
 import { getDatabaseAdapter, sanitizeApiError } from '@/lib/db';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
+import { checkRateLimit, getClientIp } from '@/lib/auth/rateLimit';
 
 export async function POST(request: NextRequest) {
   try {
+    const clientIp = getClientIp(request);
+    const rateCheck = checkRateLimit(`login:${clientIp}`, { max: 10, windowMs: 60 * 1000 });
+    if (!rateCheck.allowed) {
+      return NextResponse.json(
+        { error: 'Too many login attempts. Please try again later.' },
+        {
+          status: 429,
+          headers: {
+            'Retry-After': Math.ceil((rateCheck.resetAt - Date.now()) / 1000).toString(),
+          },
+        }
+      );
+    }
+
     const body = await request.json();
     const { email, password } = body;
 
@@ -16,26 +30,17 @@ export async function POST(request: NextRequest) {
     }
 
     const db = getDatabaseAdapter();
-    const user = await db.getUserByEmail(email);
+    const user = await db.authenticateUser(email, password);
 
-    if (!user || !user.password_hash) {
+    if (!user) {
       return NextResponse.json(
         { error: 'Invalid email or password.' },
         { status: 401 }
       );
     }
 
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      return NextResponse.json(
-        { error: 'Invalid email or password.' },
-        { status: 401 }
-      );
-    }
-
-    const { password_hash, ...profile } = user;
     const token = createSessionToken(user.id);
-    const response = NextResponse.json({ user: profile });
+    const response = NextResponse.json({ user });
 
     response.cookies.set({
       name: SESSION_COOKIE_NAME,

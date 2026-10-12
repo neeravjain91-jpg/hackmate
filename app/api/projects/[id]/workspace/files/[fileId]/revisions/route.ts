@@ -20,7 +20,11 @@ export async function GET(
       return NextResponse.json({ error: 'Forbidden.' }, { status: 403 });
     }
 
-    const revisions = await db.getWorkspaceFileRevisions(fileId);
+    const { searchParams } = new URL(request.url);
+    const limit = searchParams.get('limit') ? parseInt(searchParams.get('limit')!, 10) : undefined;
+    const offset = searchParams.get('offset') ? parseInt(searchParams.get('offset')!, 10) : undefined;
+
+    const revisions = await db.getWorkspaceFileRevisions(fileId, { limit, offset });
     if (revisions.length > 0) {
       if (revisions[0].project_id !== projectId) {
         return NextResponse.json({ error: 'File not found in this project.' }, { status: 404 });

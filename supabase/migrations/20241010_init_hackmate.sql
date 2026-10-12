@@ -284,3 +284,12 @@ CREATE POLICY "Project members can upload private contribution files"
         bucket_id = 'hackmate-contributions' AND
         is_project_member((storage.foldername(name))[1]::uuid, auth.uid())
     );
+
+-- 9. PERFORMANCE INDEXES (High-Traffic Multi-User Optimization)
+CREATE INDEX IF NOT EXISTS idx_project_members_user ON public.project_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON public.tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to ON public.tasks(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_contributions_project ON public.contributions(project_id);
+CREATE INDEX IF NOT EXISTS idx_contribution_files_project ON public.contribution_files(project_id);
+CREATE INDEX IF NOT EXISTS idx_contribution_files_contrib ON public.contribution_files(contribution_id);
+

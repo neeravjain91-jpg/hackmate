@@ -36,3 +36,4 @@ export function setDatabaseAdapter(adapter: IDatabaseAdapter | null): void {
 
 export { resolveStorageDriver, isVercelEnvironment, sanitizeApiError } from './config';
 export type { StorageDriver } from './config';
+export type { IDatabaseAdapter, PaginationOptions } from './types';

@@ -258,3 +258,48 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 | Search & View Shared Library | ✓ | ✓ | ✓ | ✗ (403) |
 | Download Contribution Files | ✓ | ✓ | ✓ | ✗ (403) |
 | Join Project past 6-member limit | ✗ (409) | ✗ (409) | ✗ (409) | ✗ (409) |
+
+---
+
+## 8. Backup & Disaster Recovery Procedures
+
+### Supabase Production Backups
+1. **Automated Point-in-Time Recovery (PITR)**:
+   - In the Supabase project dashboard (**Database > Backups**), enable Point-in-Time Recovery (PITR) to maintain continuous physical WAL logging and allow minute-by-minute restoration.
+2. **Scheduled Snapshot Dumps**:
+   - Operators should automate daily logical schema and data exports using `pg_dump` over the direct PostgreSQL connection:
+     ```bash
+     pg_dump -h db.<project-ref>.supabase.co -U postgres -d postgres -F c -b -v -f "hackmate_backup_$(date +%Y%m%d_%H%M%S).dump"
+     ```
+   - Store dump artifacts in an encrypted off-site cloud storage bucket (AWS S3 Glacier or Google Cloud Storage) with a 30-day lifecycle retention policy.
+3. **Disaster Recovery Restore**:
+   - To restore from a logical backup file into a recovery target database:
+     ```bash
+     pg_restore -h db.<recovery-ref>.supabase.co -U postgres -d postgres -v -c "hackmate_backup_<timestamp>.dump"
+     ```
+4. **Contribution Object Storage Recovery**:
+   - Enable object versioning on the `hackmate-contributions` bucket in Supabase / S3 to guard against accidental deletions or overwrites.
+   - Retain cross-region replication for mission-critical file assets.
+
+---
+
+## 9. Campus Launch Bottlenecks & Scaling Analysis
+
+During a high-traffic college campus launch or hackathon kickoff (hundreds of students concurrently creating projects, submitting tasks, and editing files), operators should monitor and prepare for these identified system bottlenecks:
+
+1. **Serverless Connection Pool Exhaustion**:
+   - *Risk*: Next.js API routes deployed on Vercel scale horizontally across dozens of concurrent serverless container instances. Each instance creating separate persistent PostgreSQL connections can exhaust database connection slots.
+   - *Mitigation*: Ensure `NEXT_PUBLIC_SUPABASE_URL` and backend connections route through Supabase's transaction pooler (Supavisor on port 6543) rather than the direct connection port (5432).
+2. **Concurrent Team Roster Contention (Atomic 6-Member Cap)**:
+   - *Behavior*: `check_project_member_limit()` acquires a row-level lock on `public.projects (FOR UPDATE)` to serialize concurrent joins and enforce the 6-member team ceiling without race conditions.
+   - *Impact*: Under extreme concurrent joins for the same project, requests serialize cleanly. Requests exceeding 6 members immediately fail closed with an explicit 409 Conflict.
+3. **Common Development Workspace Revision Conflicts**:
+   - *Behavior*: Workspace file saves enforce optimistic concurrency control via `baseRevision` comparisons in `save_workspace_file_atomic()`.
+   - *Impact*: When multiple students concurrently edit the same workspace file, the second writer receives a `409 Conflict` containing the latest revision. Students must pull the current version before resubmitting.
+4. **Authentication & Registration Rate Limits**:
+   - *Protection*: `/api/auth/register` and `/api/auth/login` enforce sliding-window IP rate limiting (10 requests per minute). Excess requests receive `429 Too Many Requests` with a `Retry-After` header to mitigate credential stuffing and DoS spikes.
+5. **Unbounded Query Degradation (Mitigated via Pagination)**:
+   - *Optimization*: Database list endpoints (`/api/projects`, `/api/projects/[id]/tasks`, `/api/projects/[id]/contributions`, and workspace revisions) support `?limit=...&offset=...` query parameters, backed by secondary PostgreSQL indexes on foreign keys (`project_id`, `user_id`, `assigned_to`, `contributor_id`).
+6. **Health & Uptime Monitoring**:
+   - *Probe*: Uptime monitors should poll `/api/health`, which performs a live query probe against storage and database backends and reports response latency.
+
