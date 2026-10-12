@@ -1194,6 +1194,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
         // Run verification on Instance B
         const mockDb: any = {
+          isUserVerified: vi.fn().mockResolvedValue(true),
           getUserById: vi.fn().mockResolvedValue({
             id: userId,
             email: 'crossinstance@uni.edu',
