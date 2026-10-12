@@ -20,7 +20,11 @@ const TEST_DIR = path.join(process.cwd(), 'data', 'test_auth_adapter');
 const TEST_DB_PATH = path.join(TEST_DIR, 'hackmate_test.json');
 
 describe('Multi-User Production Authentication & Storage Alignment', () => {
+  const originalAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+
   beforeEach(() => {
+    // Production-mode tests use an explicit canonical HTTPS origin.
+    process.env.NEXT_PUBLIC_APP_URL = 'https://hackmate.test';
     delete process.env.VERCEL;
     delete process.env.STORAGE_DRIVER;
     resetRateLimiter();
@@ -34,6 +38,8 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
   afterEach(() => {
     delete process.env.VERCEL;
     delete process.env.STORAGE_DRIVER;
+    if (originalAppUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
+    else process.env.NEXT_PUBLIC_APP_URL = originalAppUrl;
     resetRateLimiter();
     resetDatabaseAdapter();
     if (fs.existsSync(TEST_DIR)) {
