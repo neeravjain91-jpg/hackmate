@@ -7,11 +7,13 @@ import { LocalDatabaseAdapter } from '@/lib/db/localDb';
 import { checkRateLimit, resetRateLimiter, getClientIp } from '@/lib/auth/rateLimit';
 import { POST as registerHandler } from '@/app/api/auth/register/route';
 import { GET as callbackHandler } from '@/app/api/auth/callback/route';
+import { GET as cronCleanupHandler } from '@/app/api/cron/cleanup-rate-limits/route';
 import { POST as refreshHandler } from '@/app/api/auth/refresh/route';
 import { GET as meHandler } from '@/app/api/auth/me/route';
 import { GET as healthHandler } from '@/app/api/health/route';
 import { createSessionToken, SESSION_COOKIE_NAME, getCurrentUserFromRequest } from '@/lib/auth/session';
 import { resetDatabaseAdapter, setDatabaseAdapter } from '@/lib/db';
+import { getCanonicalAppUrl } from '@/lib/auth/url';
 
 const TEST_DIR = path.join(process.cwd(), 'data', 'test_auth_adapter');
 const TEST_DB_PATH = path.join(TEST_DIR, 'hackmate_test.json');
@@ -964,6 +966,299 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
         }
       }
     });
+
+    it('callback fails closed and issues NO session cookie if profile creation fails', async () => {
+      const mockAdapter: any = {
+        getUserById: vi.fn().mockResolvedValue(null),
+        createUser: vi.fn().mockRejectedValue(new Error('FATAL: Database disk full')),
+      };
+      setDatabaseAdapter(mockAdapter);
+
+      const authClient: any = {
+        auth: {
+          verifyOtp: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: 'fail-profile-uuid',
+                email: 'failcreate@uni.edu',
+                user_metadata: { name: 'Fail User' },
+              },
+            },
+            error: null,
+          }),
+        },
+      };
+
+      const originalUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+      const originalKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+      process.env.NEXT_PUBLIC_SUPABASE_URL = 'http://localhost:54321';
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'mock-anon-key';
+
+      try {
+        vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=token123&type=signup');
+        const res = await callbackHandler(req);
+
+        // Redirects to login with failure error
+        expect(res.status).toBe(307);
+        const location = res.headers.get('location') || '';
+        expect(location).toContain('/login?error=profile_creation_failed');
+        // Crucial: no internal error leaked in URL
+        expect(location).not.toContain('FATAL');
+        expect(location).not.toContain('disk+full');
+        // Crucial: NO session cookie issued
+        expect(res.headers.get('set-cookie')).toBeNull();
+      } finally {
+        if (originalUrl) process.env.NEXT_PUBLIC_SUPABASE_URL = originalUrl;
+        else delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+        if (originalKey) process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = originalKey;
+        else delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('callback fails closed and issues NO session cookie if profile retrieval fails after creation', async () => {
+      const mockAdapter: any = {
+        getUserById: vi.fn().mockResolvedValue(null),
+        createUser: vi.fn().mockResolvedValue({
+          id: 'retrieval-fail-uuid',
+          email: 'retrievalfail@uni.edu',
+          name: 'Retrieval User',
+        }),
+      };
+      setDatabaseAdapter(mockAdapter);
+
+      const authClient: any = {
+        auth: {
+          verifyOtp: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: 'retrieval-fail-uuid',
+                email: 'retrievalfail@uni.edu',
+                user_metadata: { name: 'Retrieval User' },
+              },
+            },
+            error: null,
+          }),
+        },
+      };
+
+      const originalUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+      const originalKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+      process.env.NEXT_PUBLIC_SUPABASE_URL = 'http://localhost:54321';
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'mock-anon-key';
+
+      try {
+        vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=token456&type=signup');
+        const res = await callbackHandler(req);
+
+        expect(res.status).toBe(307);
+        expect(res.headers.get('location')).toContain('/login?error=profile_retrieval_failed');
+        expect(res.headers.get('set-cookie')).toBeNull();
+      } finally {
+        if (originalUrl) process.env.NEXT_PUBLIC_SUPABASE_URL = originalUrl;
+        else delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+        if (originalKey) process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = originalKey;
+        else delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('callback rejects with profile_mismatch if existing profile email does not match verified user', async () => {
+      const mockAdapter: any = {
+        getUserById: vi.fn().mockResolvedValue({
+          id: 'victim-uuid-123',
+          email: 'victim@uni.edu',
+          name: 'Victim User',
+        }),
+      };
+      setDatabaseAdapter(mockAdapter);
+
+      const authClient: any = {
+        auth: {
+          verifyOtp: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: 'victim-uuid-123',
+                email: 'attacker@evil.com', // Mismatched email claiming victim profile ID
+                user_metadata: { name: 'Attacker' },
+              },
+            },
+            error: null,
+          }),
+        },
+      };
+
+      const originalUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+      const originalKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+      process.env.NEXT_PUBLIC_SUPABASE_URL = 'http://localhost:54321';
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'mock-anon-key';
+
+      try {
+        vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=hijacktoken&type=signup');
+        const res = await callbackHandler(req);
+
+        expect(res.status).toBe(307);
+        expect(res.headers.get('location')).toContain('/login?error=profile_mismatch');
+        expect(res.headers.get('set-cookie')).toBeNull();
+      } finally {
+        if (originalUrl) process.env.NEXT_PUBLIC_SUPABASE_URL = originalUrl;
+        else delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+        if (originalKey) process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = originalKey;
+        else delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('proves reliable cross-instance email verification using separate client instances', async () => {
+      // Instance A (Registration Serverless Container):
+      const userId = 'cross-instance-user-999';
+      const instanceASignUpSpy = vi.fn().mockResolvedValue({
+        data: {
+          user: {
+            id: userId,
+            email: 'crossinstance@uni.edu',
+            identities: [{ id: userId }],
+            email_confirmed_at: null,
+          },
+        },
+        error: null,
+      });
+
+      const clientInstanceA: any = {
+        auth: {
+          signUp: instanceASignUpSpy,
+        },
+      };
+
+      // Instance B (Verification Callback Serverless Container):
+      const instanceBVerifyOtpSpy = vi.fn().mockResolvedValue({
+        data: {
+          user: {
+            id: userId,
+            email: 'crossinstance@uni.edu',
+            user_metadata: { name: 'Cross Instance Student' },
+          },
+        },
+        error: null,
+      });
+
+      const clientInstanceB: any = {
+        auth: {
+          verifyOtp: instanceBVerifyOtpSpy,
+        },
+      };
+
+      const originalEnv = process.env.NODE_ENV;
+      const originalAutoConfirm = process.env.AUTH_AUTO_CONFIRM_EMAILS;
+      const originalSecret = process.env.AUTH_SECRET;
+      (process.env as any).NODE_ENV = 'production';
+      process.env.AUTH_AUTO_CONFIRM_EMAILS = 'false';
+      process.env.AUTH_SECRET = 'random-high-entropy-production-secret-999988887777';
+
+      try {
+        const adminClientA: any = {
+          auth: { admin: {} },
+          from: (table: string) => ({
+            upsert: (payload: any) => ({
+              select: () => ({
+                single: () =>
+                  Promise.resolve({
+                    data: {
+                      id: payload.id,
+                      email: payload.email,
+                      name: payload.name,
+                      avatar_url: payload.avatar_url,
+                      created_at: new Date().toISOString(),
+                    },
+                    error: null,
+                  }),
+              }),
+            }),
+          }),
+        };
+        const adapterA = new SupabaseDatabaseAdapter(adminClientA, () => clientInstanceA);
+        const created = await adapterA.createUser({
+          email: 'crossinstance@uni.edu',
+          password: 'Password123!',
+          name: 'Cross Instance Student',
+        });
+        expect(created.requiresVerification).toBe(true);
+        expect(instanceASignUpSpy).toHaveBeenCalled();
+
+        // Run verification on Instance B
+        const mockDb: any = {
+          getUserById: vi.fn().mockResolvedValue({
+            id: userId,
+            email: 'crossinstance@uni.edu',
+            name: 'Cross Instance Student',
+          }),
+        };
+        setDatabaseAdapter(mockDb);
+
+        vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(clientInstanceB);
+
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=crossinstancetoken&type=signup');
+        const res = await callbackHandler(req);
+
+        expect(instanceBVerifyOtpSpy).toHaveBeenCalledWith({
+          token_hash: 'crossinstancetoken',
+          type: 'signup',
+        });
+        expect(res.status).toBe(307);
+        expect(res.headers.get('location')).toContain('/dashboard?verified=true');
+        expect(res.headers.get('set-cookie')).toContain(SESSION_COOKIE_NAME);
+      } finally {
+        (process.env as any).NODE_ENV = originalEnv;
+        if (originalAutoConfirm !== undefined) process.env.AUTH_AUTO_CONFIRM_EMAILS = originalAutoConfirm;
+        else delete process.env.AUTH_AUTO_CONFIRM_EMAILS;
+        if (originalSecret !== undefined) process.env.AUTH_SECRET = originalSecret;
+        else delete process.env.AUTH_SECRET;
+        vi.restoreAllMocks();
+      }
+    });
+
+    it('validates verification redirect origins and ignores attacker-controlled Host and X-Forwarded-Host headers', async () => {
+      let passedRedirectTo = '';
+      const mockAdapter: any = {
+        getUserByEmail: vi.fn().mockResolvedValue(null),
+        createUser: vi.fn().mockImplementation((_userData: any, options: any) => {
+          passedRedirectTo = options?.emailRedirectTo;
+          return Promise.resolve({
+            id: 'host-check-uuid',
+            email: 'attackercheck@uni.edu',
+            name: 'Test',
+            requiresVerification: true,
+          });
+        }),
+      };
+      setDatabaseAdapter(mockAdapter);
+
+      const maliciousReq = new NextRequest('http://localhost:3000/api/auth/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          host: 'attacker-poisoning.com',
+          'x-forwarded-host': 'phishing-site.evil.org',
+          'x-forwarded-proto': 'http',
+        },
+        body: JSON.stringify({
+          email: 'attackercheck@uni.edu',
+          password: 'Password123!',
+          name: 'Test',
+        }),
+      });
+
+      const res = await registerHandler(maliciousReq);
+      expect(res.status).toBe(201);
+
+      // Verify emailRedirectTo did NOT use attacker headers
+      expect(passedRedirectTo).not.toContain('attacker-poisoning.com');
+      expect(passedRedirectTo).not.toContain('phishing-site.evil.org');
+      expect(passedRedirectTo).toBe(`${getCanonicalAppUrl()}/api/auth/callback`);
+    });
   });
 
   describe('12. Fail Closed on Profile Recovery Failures', () => {
@@ -1040,6 +1335,160 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
         if (originalEnableTest !== undefined) process.env.ENABLE_RATE_LIMIT_IN_TEST = originalEnableTest;
         else delete process.env.ENABLE_RATE_LIMIT_IN_TEST;
       }
+    });
+  });
+
+  describe('14. Scheduled Rate Limit Cleanup Maintenance', () => {
+    it('rejects unauthenticated requests to cron cleanup endpoint with 401', async () => {
+      const req = new NextRequest('http://localhost:3000/api/cron/cleanup-rate-limits');
+      const res = await cronCleanupHandler(req);
+      expect(res.status).toBe(401);
+      const data = await res.json();
+      expect(data.error).toContain('Unauthorized');
+    });
+
+    it('executes cleanup when authorized with CRON_SECRET Bearer token', async () => {
+      const originalSecret = process.env.CRON_SECRET;
+      process.env.CRON_SECRET = 'super-secret-cron-token-123';
+
+      try {
+        const req = new NextRequest('http://localhost:3000/api/cron/cleanup-rate-limits', {
+          headers: {
+            authorization: 'Bearer super-secret-cron-token-123',
+          },
+        });
+        const res = await cronCleanupHandler(req);
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.success).toBe(true);
+        expect(typeof data.deleted).toBe('number');
+      } finally {
+        if (originalSecret !== undefined) process.env.CRON_SECRET = originalSecret;
+        else delete process.env.CRON_SECRET;
+      }
+    });
+  });
+
+  describe('15. Upstash Redis Pipeline Response Validation & Fail-Closed Behavior', () => {
+    const originalEnv = process.env.NODE_ENV;
+    const originalVercel = process.env.VERCEL;
+    const originalEnableTest = process.env.ENABLE_RATE_LIMIT_IN_TEST;
+    const originalRedisUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const originalRedisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+    beforeEach(() => {
+      (process.env as any).NODE_ENV = 'production';
+      process.env.VERCEL = '1';
+      process.env.ENABLE_RATE_LIMIT_IN_TEST = 'true';
+      process.env.UPSTASH_REDIS_REST_URL = 'https://fake-redis.upstash.io';
+      process.env.UPSTASH_REDIS_REST_TOKEN = 'fake-token';
+    });
+
+    afterEach(() => {
+      (process.env as any).NODE_ENV = originalEnv;
+      if (originalVercel !== undefined) process.env.VERCEL = originalVercel;
+      else delete process.env.VERCEL;
+      if (originalEnableTest !== undefined) process.env.ENABLE_RATE_LIMIT_IN_TEST = originalEnableTest;
+      else delete process.env.ENABLE_RATE_LIMIT_IN_TEST;
+      if (originalRedisUrl !== undefined) process.env.UPSTASH_REDIS_REST_URL = originalRedisUrl;
+      else delete process.env.UPSTASH_REDIS_REST_URL;
+      if (originalRedisToken !== undefined) process.env.UPSTASH_REDIS_REST_TOKEN = originalRedisToken;
+      else delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      vi.restoreAllMocks();
+    });
+
+    it('falls through to PostgreSQL on Redis HTTP 500 server error', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+      } as any);
+
+      // Without PostgreSQL admin client, production fails closed
+      const res = await checkRateLimit('key-http-500', { max: 5 });
+      expect(res.allowed).toBe(false);
+      expect(res.remaining).toBe(0);
+    });
+
+    it('detects command-level errors in Redis pipeline even on HTTP 200 OK', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve([
+          { error: 'ERR syntax error' },
+          { result: 1 },
+          { result: 60 },
+        ]),
+      } as any);
+
+      const res = await checkRateLimit('key-cmd-error', { max: 5 });
+      expect(res.allowed).toBe(false);
+      expect(res.remaining).toBe(0);
+    });
+
+    it('handles malformed JSON response from Redis pipeline', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.reject(new Error('Unexpected token < in JSON')),
+      } as any);
+
+      const res = await checkRateLimit('key-bad-json', { max: 5 });
+      expect(res.allowed).toBe(false);
+      expect(res.remaining).toBe(0);
+    });
+
+    it('handles missing or incomplete pipeline results array', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve([{ result: 1 }]), // Only 1 element instead of 3
+      } as any);
+
+      const res = await checkRateLimit('key-missing-pipeline-items', { max: 5 });
+      expect(res.allowed).toBe(false);
+      expect(res.remaining).toBe(0);
+    });
+
+    it('rejects invalid or NaN count from Redis pipeline', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve([
+          { result: 'not-a-number' },
+          { result: 1 },
+          { result: 60 },
+        ]),
+      } as any);
+
+      const res = await checkRateLimit('key-nan-count', { max: 5 });
+      expect(res.allowed).toBe(false);
+      expect(res.remaining).toBe(0);
+    });
+
+    it('rejects invalid or negative TTL from Redis pipeline', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve([
+          { result: 1 },
+          { result: 1 },
+          { result: -10 }, // Invalid TTL < -2
+        ]),
+      } as any);
+
+      const res = await checkRateLimit('key-invalid-ttl', { max: 5 });
+      expect(res.allowed).toBe(false);
+      expect(res.remaining).toBe(0);
+    });
+
+    it('allows valid Redis pipeline response with correct count and TTL', async () => {
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve([
+          { result: 2 },
+          { result: 1 },
+          { result: 45 },
+        ]),
+      } as any);
+
+      const res = await checkRateLimit('key-valid-redis', { max: 5 });
+      expect(res.allowed).toBe(true);
+      expect(res.remaining).toBe(3);
     });
   });
 });

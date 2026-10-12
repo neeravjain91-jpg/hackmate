@@ -165,20 +165,20 @@ ALTER TABLE public.auth_rate_limits ENABLE ROW LEVEL SECURITY;
 CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_reset ON public.auth_rate_limits(reset_at);
 
 CREATE OR REPLACE FUNCTION public.check_rate_limit(
-    p_key TEXT,
-    p_max INT,
-    p_window_seconds INT
+    p_key pg_catalog.text,
+    p_max pg_catalog.int4,
+    p_window_seconds pg_catalog.int4
 )
-RETURNS JSONB AS $$
+RETURNS pg_catalog.jsonb AS $$
 DECLARE
-    v_now TIMESTAMPTZ := clock_timestamp();
-    v_count INT;
-    v_reset_at TIMESTAMPTZ;
-    v_allowed BOOLEAN;
-    v_remaining INT;
+    v_now pg_catalog.timestamptz := pg_catalog.clock_timestamp();
+    v_count pg_catalog.int4;
+    v_reset_at pg_catalog.timestamptz;
+    v_allowed pg_catalog.bool;
+    v_remaining pg_catalog.int4;
 BEGIN
     -- Validate parameters
-    IF p_key IS NULL OR length(trim(p_key)) < 1 OR length(p_key) > 255 THEN
+    IF p_key IS NULL OR pg_catalog.length(pg_catalog.btrim(p_key)) < 1 OR pg_catalog.length(p_key) > 255 THEN
         RAISE EXCEPTION 'Invalid rate limit key: must be between 1 and 255 characters';
     END IF;
 
@@ -195,14 +195,14 @@ BEGIN
     -- If key exists and expired (reset_at < v_now): start new window count=1 and reset_at = v_now + window
     -- If key exists and active (reset_at >= v_now): increment count, keep existing reset_at
     INSERT INTO public.auth_rate_limits (key, count, reset_at)
-    VALUES (p_key, 1, v_now + (p_window_seconds || ' seconds')::interval)
+    VALUES (p_key, 1, v_now + (p_window_seconds || ' seconds')::pg_catalog.interval)
     ON CONFLICT (key) DO UPDATE
     SET count = CASE
             WHEN public.auth_rate_limits.reset_at < v_now THEN 1
             ELSE public.auth_rate_limits.count + 1
         END,
         reset_at = CASE
-            WHEN public.auth_rate_limits.reset_at < v_now THEN v_now + (p_window_seconds || ' seconds')::interval
+            WHEN public.auth_rate_limits.reset_at < v_now THEN v_now + (p_window_seconds || ' seconds')::pg_catalog.interval
             ELSE public.auth_rate_limits.reset_at
         END
     RETURNING public.auth_rate_limits.count, public.auth_rate_limits.reset_at
@@ -216,33 +216,33 @@ BEGIN
         v_remaining := 0;
     END IF;
 
-    RETURN jsonb_build_object(
+    RETURN pg_catalog.jsonb_build_object(
         'allowed', v_allowed,
         'remaining', v_remaining,
-        'reset_at', extract(epoch from v_reset_at) * 1000
+        'reset_at', pg_catalog.date_part('epoch', v_reset_at) * 1000
     );
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
 
 -- Prune expired rate limit entries older than 1 hour
 CREATE OR REPLACE FUNCTION public.cleanup_expired_rate_limits()
-RETURNS INT AS $$
+RETURNS pg_catalog.int4 AS $$
 DECLARE
-    v_deleted INT;
+    v_deleted pg_catalog.int4;
 BEGIN
     DELETE FROM public.auth_rate_limits
-    WHERE reset_at < clock_timestamp() - INTERVAL '1 hour';
+    WHERE reset_at < pg_catalog.clock_timestamp() - '1 hour'::pg_catalog.interval;
     GET DIAGNOSTICS v_deleted = ROW_COUNT;
     RETURN v_deleted;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
 
 -- Revoke execution from PUBLIC, anon, and authenticated
-REVOKE ALL ON FUNCTION public.check_rate_limit(TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.check_rate_limit(pg_catalog.text, pg_catalog.int4, pg_catalog.int4) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.cleanup_expired_rate_limits() FROM PUBLIC, anon, authenticated;
 
 -- Grant execution to service_role, test_runner, postgres
-GRANT EXECUTE ON FUNCTION public.check_rate_limit(TEXT, INT, INT) TO service_role, test_runner, postgres;
+GRANT EXECUTE ON FUNCTION public.check_rate_limit(pg_catalog.text, pg_catalog.int4, pg_catalog.int4) TO service_role, test_runner, postgres;
 GRANT EXECUTE ON FUNCTION public.cleanup_expired_rate_limits() TO service_role, test_runner, postgres;
 GRANT ALL ON TABLE public.auth_rate_limits TO test_runner, postgres, service_role;
 

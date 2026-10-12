@@ -20,6 +20,7 @@ import {
 } from '../types';
 import { IDatabaseAdapter, PaginationOptions } from './types';
 import { getSupabaseAuthClient } from '../supabase';
+import { getCanonicalAppUrl } from '@/lib/auth/url';
 
 export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   private client: SupabaseClient;
@@ -118,7 +119,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
         const emailRedirectTo =
           options?.emailRedirectTo ||
-          `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/auth/callback`;
+          `${getCanonicalAppUrl()}/api/auth/callback`;
 
         const { data: signUpData, error: signUpError } = await authClient.auth.signUp({
           email: userData.email.toLowerCase(),

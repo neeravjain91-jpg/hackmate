@@ -276,9 +276,25 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 3. **Session Token Hardening & HTTP-Only Isolation**:
    * Authenticated sessions use cryptographically verified HMAC-SHA256 tokens stored exclusively in `HttpOnly`, `SameSite=Lax`, `Secure` cookies (`hackmate_session`).
    * `/api/auth/refresh` rotates the session cookie and strictly omits raw token strings from the JSON response body, preventing XSS-based token theft.
-4. **Distributed Multi-Instance Rate Limiting**:
-   * `/api/auth/login` and `/api/auth/register` utilize atomic rate limiting (10 requests/minute) backed by PostgreSQL RPC (`check_rate_limit`) with optional Upstash Redis support and local memory fallback.
-   * Client IPs are extracted through trusted proxy headers (`x-vercel-forwarded-for`, regex-validated `x-forwarded-for`, `x-real-ip`).
+4. **Distributed Multi-Instance Rate Limiting & Bounded Cleanup**:
+   * `/api/auth/login` and `/api/auth/register` utilize atomic rate limiting (10 requests/minute) backed by PostgreSQL RPC (`public.check_rate_limit`) with optional Upstash Redis pipeline support and local memory fallback.
+   * Client IPs are extracted through trusted hosting proxy headers (`x-vercel-forwarded-for`, `x-real-ip`). Node's native `net.isIP()` reliably parses IPv4 and IPv6 addresses without loopback fallback.
+   * **Atomic Concurrency**: A single atomic `INSERT ... ON CONFLICT (key) DO UPDATE ... RETURNING` prevents race conditions across concurrent serverless instances.
+   * **SECURITY DEFINER Hardening**: Functions run with restricted empty search path (`SET search_path = ''`) and full schema qualification to eliminate search-path hijacking risks. Execution is revoked from `PUBLIC, anon, authenticated` and granted exclusively to `service_role`.
+   * **Automated Cleanup Architecture (`public.cleanup_expired_rate_limits()`)**:
+     * *Non-Destructive Retention*: Prunes rate-limit records whose `reset_at` timestamp is older than 1 hour; active windows are never deleted.
+     * *Bounded Background Sweep*: Built-in opportunistic cleanup in `lib/auth/rateLimit.ts` throttles database cleanup to execute at most once per 15-minute cooldown window, running asynchronously without blocking client requests.
+     * *Protected Maintenance Endpoint*: An authenticated maintenance endpoint at `/api/cron/cleanup-rate-limits` requires `Authorization: Bearer <CRON_SECRET>` or Vercel Cron headers, blocking unauthenticated callers with HTTP 401.
+     * *Optional Database Scheduler (`pg_cron`)*: On Supabase, operators can automate hourly pruning directly within PostgreSQL:
+       ```sql
+       -- Optional pg_cron setup in Supabase SQL editor:
+       SELECT cron.schedule(
+           'cleanup-expired-rate-limits',
+           '0 * * * *',
+           'SELECT public.cleanup_expired_rate_limits();'
+       );
+       ```
+
 
 ---
 

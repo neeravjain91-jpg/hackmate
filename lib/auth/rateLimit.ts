@@ -96,19 +96,53 @@ export async function checkRateLimit(
           ['TTL', `ratelimit:${key}`],
         ]),
       });
+
       if (res.ok) {
-        const results = await res.json();
-        const count = Number(results[0]?.result ?? 1);
-        const ttl = Number(results[2]?.result ?? windowSeconds);
-        const resetAt = Date.now() + (ttl > 0 ? ttl * 1000 : windowMs);
-        return {
-          allowed: count <= max,
-          remaining: Math.max(0, max - count),
-          resetAt,
-        };
+        let results: any;
+        try {
+          results = await res.json();
+        } catch {
+          results = null;
+        }
+
+        // Validate results is a 3-element array
+        if (Array.isArray(results) && results.length >= 3) {
+          const [incrResult, expireResult, ttlResult] = results;
+
+          // Detect command-level errors in each pipeline step
+          const hasCommandError = Boolean(
+            incrResult?.error ||
+            expireResult?.error ||
+            ttlResult?.error
+          );
+
+          if (!hasCommandError) {
+            const count = typeof incrResult?.result === 'number'
+              ? incrResult.result
+              : Number(incrResult?.result);
+            const ttl = typeof ttlResult?.result === 'number'
+              ? ttlResult.result
+              : Number(ttlResult?.result);
+
+            // Validate that count is a valid positive integer and TTL is valid
+            if (
+              Number.isFinite(count) &&
+              count >= 1 &&
+              Number.isFinite(ttl) &&
+              ttl >= -2
+            ) {
+              const resetAt = Date.now() + (ttl > 0 ? ttl * 1000 : windowMs);
+              return {
+                allowed: count <= max,
+                remaining: Math.max(0, max - count),
+                resetAt,
+              };
+            }
+          }
+        }
       }
     } catch {
-      // Continue to PostgreSQL or fail-closed
+      // Backend error: fall through to persistent PostgreSQL fallback
     }
   }
 
@@ -116,6 +150,13 @@ export async function checkRateLimit(
   const supabase = getSupabaseAdminClient();
   if (supabase) {
     try {
+      // Bounded opportunistic maintenance: trigger background cleanup at most once per cooldown
+      const now = Date.now();
+      if (now - lastCleanupTimestamp > CLEANUP_COOLDOWN_MS) {
+        lastCleanupTimestamp = now;
+        void cleanupExpiredRateLimits().catch(() => {});
+      }
+
       const { data, error } = await supabase.rpc('check_rate_limit', {
         p_key: key,
         p_max: max,
@@ -182,6 +223,34 @@ export async function checkRateLimit(
   };
 }
 
+let lastCleanupTimestamp = 0;
+const CLEANUP_COOLDOWN_MS = 15 * 60 * 1000; // Run at most once every 15 minutes
+
+/**
+ * Invokes the database cleanup function to prune rate-limit records older than 1 hour.
+ * Protected by service-role authentication client.
+ */
+export async function cleanupExpiredRateLimits(): Promise<number | null> {
+  const supabase = getSupabaseAdminClient();
+  if (!supabase) return null;
+
+  try {
+    const { data, error } = await supabase.rpc('cleanup_expired_rate_limits');
+    if (!error && typeof data === 'number') {
+      return data;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function resetCleanupCooldownForTest(): void {
+  lastCleanupTimestamp = 0;
+}
+
 export function resetRateLimiter(): void {
   rateLimitMap.clear();
+  lastCleanupTimestamp = 0;
 }
+

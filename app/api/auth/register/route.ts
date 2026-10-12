@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getDatabaseAdapter, sanitizeApiError } from '@/lib/db';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
 import { checkRateLimit, getClientIp } from '@/lib/auth/rateLimit';
+import { getCanonicalAppUrl } from '@/lib/auth/url';
 
 export async function POST(request: NextRequest) {
   try {
@@ -52,9 +53,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000';
-    const proto = request.headers.get('x-forwarded-proto') || 'http';
-    const emailRedirectTo = `${proto}://${host}/api/auth/callback`;
+    const canonicalOrigin = getCanonicalAppUrl();
+    const emailRedirectTo = `${canonicalOrigin}/api/auth/callback`;
 
     const user = await db.createUser(
       {
