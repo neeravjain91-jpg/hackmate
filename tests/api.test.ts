@@ -1,3 +1,30 @@
+describe('Rate-limit cleanup endpoint authentication', () => {
+  let oldSecret: string | undefined;
+  beforeEach(() => { oldSecret = process.env.CRON_SECRET; delete process.env.CRON_SECRET; });
+  afterEach(() => { if (oldSecret === undefined) delete process.env.CRON_SECRET; else process.env.CRON_SECRET = oldSecret; });
+  it('rejects missing secret even when x-vercel-cron is forged', async () => {
+    const response = await cleanupRateLimitsHandler(new NextRequest('https://hackmate.test/api/cron/cleanup-rate-limits', { headers: { 'x-vercel-cron': '1' } }));
+    expect(response.status).toBe(401);
+  });
+  it('rejects missing and incorrect Authorization bearer values', async () => {
+    process.env.CRON_SECRET = 'cron-test-secret-that-is-long-enough';
+    const missing = await cleanupRateLimitsHandler(new NextRequest('https://hackmate.test/api/cron/cleanup-rate-limits'));
+    const wrong = await cleanupRateLimitsHandler(new NextRequest('https://hackmate.test/api/cron/cleanup-rate-limits', { headers: { authorization: 'Bearer wrong' } }));
+    expect(missing.status).toBe(401);
+    expect(wrong.status).toBe(401);
+  });
+  it('does not allow forged cron header to override an incorrect secret', async () => {
+    process.env.CRON_SECRET = 'cron-test-secret-that-is-long-enough';
+    const response = await cleanupRateLimitsHandler(new NextRequest('https://hackmate.test/api/cron/cleanup-rate-limits', { headers: { authorization: 'Bearer wrong', 'x-vercel-cron': '1' } }));
+    expect(response.status).toBe(401);
+  });
+  it('accepts exact Bearer secret (backend may return 503 without Supabase)', async () => {
+    process.env.CRON_SECRET = 'cron-test-secret-that-is-long-enough';
+    const response = await cleanupRateLimitsHandler(new NextRequest('https://hackmate.test/api/cron/cleanup-rate-limits', { headers: { authorization: `Bearer ${process.env.CRON_SECRET}` } }));
+    expect([200, 503]).toContain(response.status);
+  });
+});
+
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
@@ -12,6 +39,7 @@ import { GET as getTasksHandler, POST as createTaskHandler } from '@/app/api/pro
 import { PATCH as updateTaskHandler } from '@/app/api/projects/[id]/tasks/[taskId]/route';
 import { GET as getContributionsHandler, POST as publishContributionHandler } from '@/app/api/projects/[id]/contributions/route';
 import { GET as downloadFileHandler } from '@/app/api/projects/[id]/files/[fileId]/download/route';
+import { GET as cleanupRateLimitsHandler } from '@/app/api/cron/cleanup-rate-limits/route';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
 import { resetDatabaseAdapter } from '@/lib/db';
 import { resetStorageAdapter } from '@/lib/storage';
