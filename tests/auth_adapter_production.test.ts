@@ -1781,6 +1781,30 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       expect(data.error).toContain('Unauthorized');
       expect(res.headers.get('set-cookie')).toBeNull();
     });
+
+    it('prevents refreshing a session when verification status support is missing', async () => {
+      const mockDb: any = {
+        getUserById: vi.fn().mockResolvedValue({
+          id: 'verification-unknown-user',
+          email: 'student@uni.edu',
+          name: 'Verification Unknown',
+        }),
+        // Deliberately omit isUserVerified to prove session helpers fail closed.
+      };
+      setDatabaseAdapter(mockDb);
+
+      const token = createSessionToken('verification-unknown-user');
+      const req = new NextRequest('http://localhost:3000/api/auth/refresh', {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${token}`,
+        },
+      });
+
+      const res = await refreshHandler(req);
+      expect(res.status).toBe(401);
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
   });
 });
 
