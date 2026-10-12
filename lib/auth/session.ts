@@ -228,11 +228,13 @@ export async function getCurrentUserFromRequest(request: NextRequest | Request):
   const user = await db.getUserById(userId);
   if (!user) return null;
 
-  if (typeof db.isUserVerified === 'function') {
-    const isVerified = await db.isUserVerified(userId);
-    if (!isVerified) {
-      return null;
-    }
+  // Fail closed: a missing verification check is not evidence of verification.
+  if (typeof db.isUserVerified !== 'function') {
+    return null;
+  }
+  const isVerified = await db.isUserVerified(userId);
+  if (!isVerified) {
+    return null;
   }
 
   return user;
