@@ -34,5 +34,5 @@ export function setDatabaseAdapter(adapter: IDatabaseAdapter | null): void {
   dbInstance = adapter;
 }
 
-export { resolveStorageDriver, isVercelEnvironment } from './config';
+export { resolveStorageDriver, isVercelEnvironment, sanitizeApiError } from './config';
 export type { StorageDriver } from './config';

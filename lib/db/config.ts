@@ -28,7 +28,7 @@ export function resolveStorageDriver(): StorageDriver {
   const isVercel = isVercelEnvironment();
   const isProduction = process.env.NODE_ENV === 'production';
 
-  // 1. Vercel deployment safety checks: local filesystem is ephemeral
+  // 1. Vercel deployment safety checks: serverless local filesystem is ephemeral
   if (isVercel) {
     if (!rawDriver || rawDriver.trim().length === 0) {
       throw new Error(
@@ -41,6 +41,13 @@ export function resolveStorageDriver(): StorageDriver {
         'STORAGE CONFIGURATION ERROR: Local JSON storage is ephemeral on Vercel deployments and cannot be used for student collaboration. Please configure STORAGE_DRIVER=supabase along with NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.'
       );
     }
+    if (normalized !== 'supabase') {
+      const safeDriver = normalized.length > 32 ? `${normalized.slice(0, 32)}...` : normalized;
+      throw new Error(
+        `STORAGE CONFIGURATION ERROR: Unsupported STORAGE_DRIVER "${safeDriver}" on Vercel. Vercel deployments require STORAGE_DRIVER=supabase.`
+      );
+    }
+    return 'supabase';
   }
 
   // 2. Production configuration checks: prevent silent fallback to local JSON storage
@@ -65,4 +72,41 @@ export function resolveStorageDriver(): StorageDriver {
   }
 
   return normalized as StorageDriver;
+}
+
+/**
+ * Formats caught errors into safe, actionable API responses without exposing
+ * internal stack traces, filesystem paths (e.g. /var/task), or secret values.
+ */
+export function sanitizeApiError(
+  err: any,
+  fallbackMessage: string
+): { error: string; status: number } {
+  const message = typeof err?.message === 'string' ? err.message : '';
+
+  // 1. Explicit configuration and security violation errors: safe and actionable for operators
+  if (message.includes('STORAGE CONFIGURATION ERROR') || message.includes('SECURITY VIOLATION')) {
+    return { error: message, status: 503 };
+  }
+
+  // 2. File system, operating system, or network connection errors: sanitize completely
+  const isSystemError =
+    Boolean(err?.code && (String(err.code).startsWith('E') || typeof err.errno === 'number')) ||
+    message.includes('/var/task') ||
+    message.includes('ENOENT') ||
+    message.includes('EACCES') ||
+    message.includes('EROFS') ||
+    message.includes('mkdir');
+
+  if (isSystemError) {
+    return {
+      error: 'Database storage service is temporarily unavailable. Please check server configuration.',
+      status: 503,
+    };
+  }
+
+  return {
+    error: message || fallbackMessage,
+    status: 500,
+  };
 }

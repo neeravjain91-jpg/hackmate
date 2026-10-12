@@ -1,17 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+import { NextRequest } from 'next/server';
 import { getDatabaseAdapter, resetDatabaseAdapter } from '@/lib/db';
 import { getStorageAdapter, resetStorageAdapter } from '@/lib/storage';
-import { resolveStorageDriver, isVercelEnvironment } from '@/lib/db/config';
+import { resolveStorageDriver, isVercelEnvironment, sanitizeApiError } from '@/lib/db/config';
 import { resetSupabaseClients, setSupabaseAdminClient } from '@/lib/supabase';
 import { LocalDatabaseAdapter } from '@/lib/db/localDb';
 import { SupabaseDatabaseAdapter } from '@/lib/db/supabaseDb';
 import { LocalStorageAdapter } from '@/lib/storage/localStorage';
 import { SupabaseStorageAdapter } from '@/lib/storage/supabaseStorage';
+import { POST as registerHandler } from '@/app/api/auth/register/route';
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 function setNodeEnv(val: string | undefined): void {
   (process.env as Record<string, string | undefined>).NODE_ENV = val;
 }
+
+const TEST_SANDBOX_DIR = path.join(process.cwd(), 'data', 'test_sandbox');
+const TEST_SANDBOX_DB = path.join(TEST_SANDBOX_DIR, 'sandbox.json');
+const TEST_SANDBOX_STORAGE = path.join(TEST_SANDBOX_DIR, 'sandbox_storage');
 
 describe('Storage Driver Configuration & Production Safeguards', () => {
   const originalEnv = { ...process.env };
@@ -21,6 +29,9 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
     resetStorageAdapter();
     resetSupabaseClients();
     process.env = { ...originalEnv };
+    if (fs.existsSync(TEST_SANDBOX_DIR)) {
+      fs.rmSync(TEST_SANDBOX_DIR, { recursive: true, force: true });
+    }
   });
 
   afterEach(() => {
@@ -28,6 +39,9 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
     resetStorageAdapter();
     resetSupabaseClients();
     process.env = { ...originalEnv };
+    if (fs.existsSync(TEST_SANDBOX_DIR)) {
+      fs.rmSync(TEST_SANDBOX_DIR, { recursive: true, force: true });
+    }
   });
 
   describe('Local development and offline environments', () => {
@@ -196,6 +210,43 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
         /Local JSON storage is ephemeral on Vercel deployments/
       );
     });
+
+    it('rejects unsupported drivers on Vercel requiring STORAGE_DRIVER=supabase', () => {
+      process.env.STORAGE_DRIVER = 'redis';
+      process.env.VERCEL = '1';
+
+      expect(() => resolveStorageDriver()).toThrowError(
+        'STORAGE CONFIGURATION ERROR: Unsupported STORAGE_DRIVER "redis" on Vercel. Vercel deployments require STORAGE_DRIVER=supabase.'
+      );
+    });
+
+    it('prevents direct instantiation of LocalDatabaseAdapter and LocalStorageAdapter in Vercel environment', () => {
+      process.env.VERCEL = '1';
+
+      expect(() => new LocalDatabaseAdapter(TEST_SANDBOX_DB)).toThrowError(
+        /STORAGE CONFIGURATION ERROR: Local JSON database cannot be instantiated in a Vercel environment/
+      );
+      // Ensure filesystem was NOT touched
+      expect(fs.existsSync(TEST_SANDBOX_DIR)).toBe(false);
+
+      expect(() => new LocalStorageAdapter(TEST_SANDBOX_STORAGE)).toThrowError(
+        /STORAGE CONFIGURATION ERROR: Local disk storage cannot be instantiated in a Vercel environment/
+      );
+      expect(fs.existsSync(TEST_SANDBOX_STORAGE)).toBe(false);
+    });
+
+    it('ensures configuration failures on Vercel do NOT create the local database or storage directory', () => {
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'local';
+      process.env.LOCAL_DB_PATH = TEST_SANDBOX_DB;
+      process.env.LOCAL_STORAGE_DIR = TEST_SANDBOX_STORAGE;
+
+      expect(() => getDatabaseAdapter()).toThrowError(/ephemeral on Vercel/);
+      expect(() => getStorageAdapter()).toThrowError(/ephemeral on Vercel/);
+
+      expect(fs.existsSync(TEST_SANDBOX_DIR)).toBe(false);
+      expect(fs.existsSync(TEST_SANDBOX_STORAGE)).toBe(false);
+    });
   });
 
   describe('Supabase driver initialization and failure behavior', () => {
@@ -257,6 +308,47 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
 
       const storage = getStorageAdapter();
       expect(storage).toBeInstanceOf(SupabaseStorageAdapter);
+    });
+  });
+
+  describe('Registration API error responses and secret protection', () => {
+    it('returns an actionable 503 error on Vercel without creating local filesystem directories or leaking paths', async () => {
+      process.env.VERCEL = '1';
+      process.env.STORAGE_DRIVER = 'local';
+      process.env.LOCAL_DB_PATH = TEST_SANDBOX_DB;
+
+      const req = new NextRequest('http://localhost:3000/api/auth/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: 'student@university.edu',
+          password: 'securePassword123',
+          name: 'Student Developer',
+        }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      const res = await registerHandler(req);
+      expect(res.status).toBe(503);
+      const data = await res.json();
+
+      expect(data.error).toContain('STORAGE CONFIGURATION ERROR: Local JSON storage is ephemeral on Vercel deployments');
+      expect(data.error).not.toContain('/var/task');
+      expect(data.error).not.toContain('ENOENT');
+
+      // Crucial: verify that no data directory or file was created
+      expect(fs.existsSync(TEST_SANDBOX_DIR)).toBe(false);
+    });
+
+    it('sanitizeApiError masks internal system errors and strips filesystem paths', () => {
+      const rawEnoentError = new Error("ENOENT: no such file or directory, mkdir '/var/task/data'");
+      (rawEnoentError as any).code = 'ENOENT';
+
+      const sanitized = sanitizeApiError(rawEnoentError, 'Registration failed.');
+      expect(sanitized.status).toBe(503);
+      expect(sanitized.error).toBe('Database storage service is temporarily unavailable. Please check server configuration.');
+      expect(sanitized.error).not.toContain('/var/task');
+      expect(sanitized.error).not.toContain('ENOENT');
+      expect(sanitized.error).not.toContain('mkdir');
     });
   });
 });

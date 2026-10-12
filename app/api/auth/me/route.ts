@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentUserFromRequest } from '@/lib/auth/session';
+import { sanitizeApiError } from '@/lib/db';
 
 export async function GET(request: NextRequest) {
   try {
@@ -9,6 +10,7 @@ export async function GET(request: NextRequest) {
     }
     return NextResponse.json({ user });
   } catch (err: any) {
-    return NextResponse.json({ error: err.message || 'Internal error' }, { status: 500 });
+    const { error, status } = sanitizeApiError(err, 'Internal error');
+    return NextResponse.json({ error }, { status });
   }
 }

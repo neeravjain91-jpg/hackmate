@@ -221,19 +221,24 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 
      *(Note: File revision restoration is handled at the application adapter level: `SupabaseDatabaseAdapter.restoreWorkspaceRevision()` retrieves the historical revision from `workspace_revisions` and calls `saveWorkspaceFile()`, which executes `save_workspace_file_atomic` to create a new revision non-destructively.)*
 
-3. **Configure Environment Variables in `.env.local`**:
+3. **Configure Environment Variables (Vercel Deployments & `.env.local`)**:
+   For Vercel deployments, configure these exact environment variables in your Vercel Project Settings (or via `vercel env add`):
    ```env
    STORAGE_DRIVER=supabase
-   NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
-   NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-key>
-   SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
-   SUPABASE_STORAGE_BUCKET=hackmate-contributions
-
-   # Production Authentication Secret (minimum 32 bytes)
-   # Must be a cryptographically random secret; string validation rejects short, placeholder, and repeating patterns.
-   # Generate using: openssl rand -base64 32
-   AUTH_SECRET=<your-production-auth-secret>
+   NEXT_PUBLIC_SUPABASE_URL=<real Supabase project URL>
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=<real Supabase anon key>
+   SUPABASE_SERVICE_ROLE_KEY=<real Supabase service-role key>
+   AUTH_SECRET=<strong randomly generated production secret>
    ```
+
+   *(Optional: `SUPABASE_STORAGE_BUCKET=hackmate-contributions`, defaults to `hackmate-contributions`)*
+
+   > [!WARNING]
+   > - `SUPABASE_SERVICE_ROLE_KEY` is a sensitive backend administrative secret and must **never** be prefixed with `NEXT_PUBLIC_` or exposed to browser code.
+   > - `AUTH_SECRET` is mandatory for production and must be generated using a cryptographically secure random generator:
+   >   ```bash
+   >   openssl rand -base64 32
+   >   ```
 
 > [!NOTE]
 > Database migrations and RPC functions are verified against disposable PostgreSQL instances in automated CI quality gates (`npm run test:postgres`). Live Supabase cloud connectivity requires providing active project credentials as detailed above.

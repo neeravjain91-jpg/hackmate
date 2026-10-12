@@ -20,6 +20,7 @@ import {
   WorkspaceTreeItem,
 } from '../types';
 import { IDatabaseAdapter } from './types';
+import { isVercelEnvironment } from './config';
 
 interface Schema {
   users: UserAuthRecord[];
@@ -38,6 +39,11 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
   private memoryLock: Promise<void> = Promise.resolve();
 
   constructor(filePath?: string) {
+    if (isVercelEnvironment()) {
+      throw new Error(
+        'STORAGE CONFIGURATION ERROR: Local JSON database cannot be instantiated in a Vercel environment. Vercel deployments require an explicitly configured persistent database (STORAGE_DRIVER=supabase).'
+      );
+    }
     this.filePath = filePath || process.env.LOCAL_DB_PATH || path.join(process.cwd(), 'data', 'hackmate.json');
     this.workspacesBaseDir = path.join(path.dirname(this.filePath), 'workspaces');
     const dir = path.dirname(this.filePath);

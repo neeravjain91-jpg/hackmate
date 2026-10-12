@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import bcrypt from 'bcryptjs';
-import { getDatabaseAdapter } from '@/lib/db';
+import { getDatabaseAdapter, sanitizeApiError } from '@/lib/db';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
 
 export async function POST(request: NextRequest) {
@@ -49,9 +49,7 @@ export async function POST(request: NextRequest) {
 
     return response;
   } catch (err: any) {
-    return NextResponse.json(
-      { error: err.message || 'Login failed.' },
-      { status: 500 }
-    );
+    const { error, status } = sanitizeApiError(err, 'Login failed.');
+    return NextResponse.json({ error }, { status });
   }
 }
