@@ -876,7 +876,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = 'mock-anon-key';
 
       try {
-        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=validhash123&type=signup');
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=validhash123&type=email');
         // Inject auth client mock
         const { getSupabaseAuthClient } = await import('@/lib/supabase');
         vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
@@ -913,7 +913,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
       try {
         vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
-        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=expiredhash&type=signup');
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=expiredhash&type=email');
         const res = await callbackHandler(req);
 
         expect(res.status).toBe(307);
@@ -999,7 +999,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
       try {
         vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
-        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=token123&type=signup');
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=token123&type=email');
         const res = await callbackHandler(req);
 
         // Redirects to login with failure error
@@ -1054,7 +1054,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
       try {
         vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
-        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=token456&type=signup');
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=token456&type=email');
         const res = await callbackHandler(req);
 
         expect(res.status).toBe(307);
@@ -1101,7 +1101,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
       try {
         vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(authClient);
-        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=hijacktoken&type=signup');
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=hijacktoken&type=email');
         const res = await callbackHandler(req);
 
         expect(res.status).toBe(307);
@@ -1204,7 +1204,7 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
         vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(clientInstanceB);
 
-        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=crossinstancetoken&type=signup');
+        const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=crossinstancetoken&type=email');
         const res = await callbackHandler(req);
 
         expect(instanceBVerifyOtpSpy).toHaveBeenCalledWith({
