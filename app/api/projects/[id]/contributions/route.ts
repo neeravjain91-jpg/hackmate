@@ -84,6 +84,16 @@ export async function POST(
       return NextResponse.json({ error: 'Contribution title is required.' }, { status: 400 });
     }
 
+    if (taskId) {
+      const task = await db.getTaskById(taskId);
+      if (!task || task.project_id !== projectId) {
+        return NextResponse.json(
+          { error: 'Specified task does not exist in this project.' },
+          { status: 400 }
+        );
+      }
+    }
+
     // Extract uploaded files
     const fileEntries = formData.getAll('files');
     const filesToUpload: File[] = [];

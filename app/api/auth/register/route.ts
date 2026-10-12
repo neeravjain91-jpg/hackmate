@@ -6,7 +6,7 @@ import { checkRateLimit, getClientIp } from '@/lib/auth/rateLimit';
 export async function POST(request: NextRequest) {
   try {
     const clientIp = getClientIp(request);
-    const rateCheck = checkRateLimit(`register:${clientIp}`, { max: 10, windowMs: 60 * 1000 });
+    const rateCheck = await checkRateLimit(`register:${clientIp}`, { max: 10, windowMs: 60 * 1000 });
     if (!rateCheck.allowed) {
       return NextResponse.json(
         { error: 'Too many registration attempts. Please try again later.' },

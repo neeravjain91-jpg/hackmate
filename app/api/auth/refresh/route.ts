@@ -10,7 +10,7 @@ export async function POST(request: NextRequest) {
     }
 
     const token = createSessionToken(user.id);
-    const response = NextResponse.json({ user, token });
+    const response = NextResponse.json({ user, success: true });
 
     response.cookies.set({
       name: SESSION_COOKIE_NAME,

@@ -67,6 +67,14 @@ export async function POST(
       return NextResponse.json({ error: 'Assignee is required.' }, { status: 400 });
     }
 
+    const isAssigneeMember = await db.isProjectMember(projectId, assigned_to);
+    if (!isAssigneeMember) {
+      return NextResponse.json(
+        { error: 'Assigned user must be a member of this project.' },
+        { status: 400 }
+      );
+    }
+
     const task = await db.createTask({
       project_id: projectId,
       title: title.trim(),

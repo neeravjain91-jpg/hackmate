@@ -591,6 +591,13 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
         throw new Error('Only project members can publish contributions.');
       }
 
+      if (contributionData.task_id) {
+        const linkedTask = data.tasks.find((t) => t.id === contributionData.task_id);
+        if (!linkedTask || linkedTask.project_id !== contributionData.project_id) {
+          throw new Error('Task does not belong to this project.');
+        }
+      }
+
       const now = new Date().toISOString();
       const contributionId = uuidv4();
 

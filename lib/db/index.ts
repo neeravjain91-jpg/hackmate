@@ -1,7 +1,7 @@
 import { IDatabaseAdapter } from './types';
 import { LocalDatabaseAdapter } from './localDb';
 import { SupabaseDatabaseAdapter } from './supabaseDb';
-import { getSupabaseAdminClient } from '../supabase';
+import { getSupabaseAdminClient, getSupabaseAuthClient } from '../supabase';
 import { resolveStorageDriver } from './config';
 
 let dbInstance: IDatabaseAdapter | null = null;
@@ -18,7 +18,7 @@ export function getDatabaseAdapter(): IDatabaseAdapter {
         'STORAGE CONFIGURATION ERROR: STORAGE_DRIVER is set to "supabase", but the Supabase admin client could not be initialized. Please configure valid NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.'
       );
     }
-    dbInstance = new SupabaseDatabaseAdapter(supabaseAdmin);
+    dbInstance = new SupabaseDatabaseAdapter(supabaseAdmin, () => getSupabaseAuthClient());
   } else {
     dbInstance = new LocalDatabaseAdapter();
   }

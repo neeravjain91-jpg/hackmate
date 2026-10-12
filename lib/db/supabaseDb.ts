@@ -19,12 +19,33 @@ import {
   WorkspaceTreeItem,
 } from '../types';
 import { IDatabaseAdapter, PaginationOptions } from './types';
+import { getSupabaseAuthClient } from '../supabase';
 
 export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   private client: SupabaseClient;
+  private authClientFactory: () => SupabaseClient | null;
 
-  constructor(client: SupabaseClient) {
-    this.client = client;
+  constructor(
+    adminClient: SupabaseClient,
+    authClient?: SupabaseClient | (() => SupabaseClient | null)
+  ) {
+    this.client = adminClient;
+    if (typeof authClient === 'function') {
+      this.authClientFactory = authClient;
+    } else if (authClient) {
+      this.authClientFactory = () => authClient;
+    } else {
+      this.authClientFactory = () => getSupabaseAuthClient();
+    }
+  }
+
+  private getAuthClient(): SupabaseClient {
+    const client = this.authClientFactory();
+    if (!client) {
+      // Fall back to adminClient only if auth client is completely unavailable (e.g. mock test harnesses)
+      return this.client;
+    }
+    return client;
   }
 
   // --- Users ---
@@ -61,10 +82,17 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     let userId = userData.id;
 
     if (!userId && userData.password && this.client.auth?.admin?.createUser) {
+      // Deliberate email-verification policy:
+      // In production for a student application, require email verification unless explicitly bypassed via AUTH_AUTO_CONFIRM_EMAILS=true.
+      // In test/local environments, auto-confirm to facilitate automated suites.
+      const shouldAutoConfirm =
+        process.env.AUTH_AUTO_CONFIRM_EMAILS === 'true' ||
+        (process.env.NODE_ENV !== 'production' && process.env.AUTH_AUTO_CONFIRM_EMAILS !== 'false');
+
       const { data: authData, error: authError } = await this.client.auth.admin.createUser({
         email: userData.email.toLowerCase(),
         password: userData.password,
-        email_confirm: true,
+        email_confirm: shouldAutoConfirm,
         user_metadata: {
           name: userData.name,
           avatar_url: userData.avatar_url || null,
@@ -93,35 +121,70 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       .single();
 
     if (error) {
+      // Partial failure recovery: delete newly created auth user so we don't leave an orphan in auth.users
+      if (userData.password && userId && this.client.auth?.admin?.deleteUser) {
+        try {
+          await this.client.auth.admin.deleteUser(userId);
+        } catch {
+          // Swallow rollback error and throw original profile failure
+        }
+      }
       throw new Error(`Failed to create profile: ${error.message}`);
     }
     return data as UserProfile;
   }
 
   async authenticateUser(email: string, password: string): Promise<UserProfile | null> {
-    if (!this.client.auth?.signInWithPassword) {
+    const authClient = this.getAuthClient();
+
+    if (!authClient.auth?.signInWithPassword) {
       return null;
     }
 
-    const { data, error } = await this.client.auth.signInWithPassword({
+    const { data, error } = await authClient.auth.signInWithPassword({
       email: email.toLowerCase(),
       password,
     });
 
-    if (error || !data?.user) {
+    if (error) {
+      if (
+        error.message?.toLowerCase().includes('not confirmed') ||
+        error.message?.toLowerCase().includes('unverified')
+      ) {
+        throw new Error('Please verify your email address before logging in. A confirmation email was sent to your inbox.');
+      }
       return null;
     }
 
-    const profile = await this.getUserById(data.user.id);
-    if (profile) return profile;
+    if (!data?.user) {
+      return null;
+    }
 
-    return {
-      id: data.user.id,
-      email: data.user.email || email.toLowerCase(),
-      name: (data.user.user_metadata?.name as string) || email.split('@')[0],
-      avatar_url: (data.user.user_metadata?.avatar_url as string) || null,
-      created_at: data.user.created_at || new Date().toISOString(),
-    };
+    let profile = await this.getUserById(data.user.id);
+    if (!profile) {
+      // Recover missing profile from auth user metadata
+      const name = (data.user.user_metadata?.name as string) || email.split('@')[0];
+      const avatar_url = (data.user.user_metadata?.avatar_url as string) || null;
+      try {
+        profile = await this.createUser({
+          id: data.user.id,
+          email: data.user.email || email.toLowerCase(),
+          name,
+          avatar_url,
+        });
+      } catch {
+        // Fallback to in-memory profile if profile creation fails
+        profile = {
+          id: data.user.id,
+          email: data.user.email || email.toLowerCase(),
+          name,
+          avatar_url,
+          created_at: data.user.created_at || new Date().toISOString(),
+        };
+      }
+    }
+
+    return profile;
   }
 
   // --- Projects ---
@@ -185,15 +248,19 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     if (projError || !project) return null;
 
     const members = await this.getProjectMembers(id);
-    const tasks = await this.getProjectTasks(id);
-    const contributions = await this.getProjectContributions(id);
+
+    // Database-side exact head counts without transferring full rows over the network
+    const [{ count: tasksCount }, { count: contributionsCount }] = await Promise.all([
+      this.client.from('tasks').select('*', { count: 'exact', head: true }).eq('project_id', id),
+      this.client.from('contributions').select('*', { count: 'exact', head: true }).eq('project_id', id),
+    ]);
 
     return {
       ...(project as Project),
       members,
       memberCount: members.length,
-      tasksCount: tasks.length,
-      contributionsCount: contributions.length,
+      tasksCount: tasksCount ?? 0,
+      contributionsCount: contributionsCount ?? 0,
     };
   }
 
@@ -209,21 +276,21 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   }
 
   async getUserProjects(userId: string, pagination?: PaginationOptions): Promise<ProjectWithDetails[]> {
-    const { data: memberships, error } = await this.client
+    let membershipQuery = this.client
       .from('project_members')
       .select('project_id, role')
       .eq('user_id', userId);
 
-    if (error || !memberships) return [];
-
-    let projectIds = memberships.map((m) => m.project_id);
-    if (projectIds.length === 0) return [];
-
     if (pagination?.limit !== undefined) {
-      const offset = pagination.offset || 0;
-      projectIds = projectIds.slice(offset, offset + pagination.limit);
-      if (projectIds.length === 0) return [];
+      const from = pagination.offset || 0;
+      membershipQuery = membershipQuery.range(from, from + pagination.limit - 1);
     }
+
+    const { data: memberships, error } = await membershipQuery;
+
+    if (error || !memberships || memberships.length === 0) return [];
+
+    const projectIds = memberships.map((m) => m.project_id);
 
     const { data: projects } = await this.client
       .from('projects')
@@ -352,6 +419,16 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     created_by: string;
     deadline?: string | null;
   }): Promise<Task> {
+    const isLeader = await this.isProjectLeader(taskData.project_id, taskData.created_by);
+    if (!isLeader) {
+      throw new Error('Only the team leader can create tasks.');
+    }
+
+    const isAssigneeMember = await this.isProjectMember(taskData.project_id, taskData.assigned_to);
+    if (!isAssigneeMember) {
+      throw new Error('Assigned user must be a member of this project.');
+    }
+
     const { data, error } = await this.client
       .from('tasks')
       .insert({
@@ -394,8 +471,18 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     }
 
     if (!isLeader && isAssignee) {
+      if (updates.title !== undefined || updates.description !== undefined || updates.assigned_to !== undefined || updates.deadline !== undefined) {
+        throw new Error('Members cannot change task details, reassign tasks, or set deadlines.');
+      }
       if (updates.status && !['In Progress', 'Submitted'].includes(updates.status)) {
         throw new Error(`Members can only update status to 'In Progress' or 'Submitted'.`);
+      }
+    } else if (isLeader) {
+      if (updates.assigned_to !== undefined) {
+        const isMember = await this.isProjectMember(task.project_id, updates.assigned_to);
+        if (!isMember) {
+          throw new Error('Reassigned user must be a member of this project.');
+        }
       }
     }
 
@@ -465,6 +552,18 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       checksum: string;
     }>
   ): Promise<Contribution> {
+    const isMember = await this.isProjectMember(contributionData.project_id, contributionData.contributor_id);
+    if (!isMember) {
+      throw new Error('Only project members can publish contributions.');
+    }
+
+    if (contributionData.task_id) {
+      const linkedTask = await this.getTaskById(contributionData.task_id);
+      if (!linkedTask || linkedTask.project_id !== contributionData.project_id) {
+        throw new Error('Task does not belong to this project.');
+      }
+    }
+
     const { data: contrib, error: cError } = await this.client
       .from('contributions')
       .insert({

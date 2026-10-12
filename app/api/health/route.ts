@@ -16,7 +16,7 @@ export async function GET() {
           {
             status: 'unhealthy',
             driver,
-            error: 'Supabase admin client could not be initialized.',
+            error: 'Database service is unavailable. Please verify connection configuration.',
             timestamp: new Date().toISOString(),
           },
           { status: 503 }
@@ -34,7 +34,7 @@ export async function GET() {
           {
             status: 'unhealthy',
             driver,
-            error: `Database connectivity probe failed: ${error.message}`,
+            error: 'Database service is unavailable. Please verify connection configuration.',
             timestamp: new Date().toISOString(),
           },
           { status: 503 }
@@ -69,7 +69,10 @@ export async function GET() {
       );
     }
   } catch (err: any) {
-    const { error, status } = sanitizeApiError(err, 'Health check probe failed.');
+    const { error, status } = sanitizeApiError(
+      err,
+      'Database service is unavailable. Please verify connection configuration.'
+    );
     return NextResponse.json(
       {
         status: 'unhealthy',

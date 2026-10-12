@@ -229,6 +229,7 @@ export async function cleanTables(adminClient: Client): Promise<void> {
       public.project_members,
       public.projects,
       public.profiles,
+      public.auth_rate_limits,
       auth.users
     CASCADE;
   `);

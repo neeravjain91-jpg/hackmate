@@ -153,4 +153,63 @@ GRANT ALL ON TABLE public.project_members TO test_runner, postgres;
 
 CREATE INDEX IF NOT EXISTS idx_project_members_user ON public.project_members(user_id);
 
+-- 7. Auth rate limits table & check_rate_limit function
+CREATE TABLE IF NOT EXISTS public.auth_rate_limits (
+    key TEXT PRIMARY KEY,
+    count INT NOT NULL DEFAULT 1,
+    reset_at TIMESTAMPTZ NOT NULL
+);
+
+ALTER TABLE public.auth_rate_limits ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.check_rate_limit(
+    p_key TEXT,
+    p_max INT,
+    p_window_seconds INT
+)
+RETURNS JSONB AS $$
+DECLARE
+    v_now TIMESTAMPTZ := clock_timestamp();
+    v_record public.auth_rate_limits%ROWTYPE;
+    v_allowed BOOLEAN;
+    v_remaining INT;
+    v_reset_at TIMESTAMPTZ;
+BEGIN
+    SELECT * INTO v_record FROM public.auth_rate_limits WHERE key = p_key FOR UPDATE;
+
+    IF NOT FOUND OR v_now > v_record.reset_at THEN
+        v_reset_at := v_now + (p_window_seconds || ' seconds')::interval;
+        INSERT INTO public.auth_rate_limits (key, count, reset_at)
+        VALUES (p_key, 1, v_reset_at)
+        ON CONFLICT (key) DO UPDATE
+            SET count = 1,
+                reset_at = EXCLUDED.reset_at;
+        v_allowed := TRUE;
+        v_remaining := GREATEST(0, p_max - 1);
+    ELSE
+        v_reset_at := v_record.reset_at;
+        IF v_record.count >= p_max THEN
+            v_allowed := FALSE;
+            v_remaining := 0;
+        ELSE
+            UPDATE public.auth_rate_limits
+            SET count = count + 1
+            WHERE key = p_key;
+            v_allowed := TRUE;
+            v_remaining := GREATEST(0, p_max - (v_record.count + 1));
+        END IF;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'allowed', v_allowed,
+        'remaining', v_remaining,
+        'reset_at', extract(epoch from v_reset_at) * 1000
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION public.check_rate_limit(TEXT, INT, INT) TO anon, authenticated, service_role, test_runner;
+GRANT ALL ON TABLE public.auth_rate_limits TO test_runner, postgres, service_role;
+
+
 

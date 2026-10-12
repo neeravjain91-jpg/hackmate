@@ -202,9 +202,9 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 2. **Execute Database Migrations in the Supabase SQL Editor**:
    In your browser, open the Supabase dashboard for your project, navigate to the **SQL Editor**, and execute the full contents of each file in this exact sequential order:
 
-   * **Step 1 — Initial HackMate database schema**:
+   * **Step 1 — Initial HackMate database schema & Distributed Rate Limiting**:
      Open [`supabase/migrations/20241010_init_hackmate.sql`](supabase/migrations/20241010_init_hackmate.sql), copy its SQL contents, and run them in the SQL Editor.  
-     Provisions foundational schemas (`users`, `projects`, `project_members`, `tasks`, `contributions`, `contribution_files`), membership triggers, storage metadata, and Row Level Security (RLS) policies.
+     Provisions foundational schemas (`users`, `profiles`, `projects`, `project_members`, `tasks`, `contributions`, `contribution_files`, `auth_rate_limits`), membership cap triggers, private storage metadata, atomic `check_rate_limit` stored procedure, and Row Level Security (RLS) policies.
 
    * **Step 2 — Common Development Workspace schema**:
      Open [`supabase/migrations/20241011_add_workspace.sql`](supabase/migrations/20241011_add_workspace.sql), copy its SQL contents, and run them in the SQL Editor.  
@@ -224,11 +224,17 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 3. **Configure Environment Variables (Vercel Deployments & `.env.local`)**:
    For Vercel deployments, configure these exact environment variables in your Vercel Project Settings (or via `vercel env add`):
    ```env
+   # Mandatory Production Storage & Authentication Secrets
    STORAGE_DRIVER=supabase
    NEXT_PUBLIC_SUPABASE_URL=<real Supabase project URL>
    NEXT_PUBLIC_SUPABASE_ANON_KEY=<real Supabase anon key>
    SUPABASE_SERVICE_ROLE_KEY=<real Supabase service-role key>
-   AUTH_SECRET=<strong randomly generated production secret>
+   AUTH_SECRET=<strong randomly generated production secret (min 32 bytes)>
+
+   # Production Email Verification & Rate Limiting Options
+   AUTH_AUTO_CONFIRM_EMAILS=false # Defaults to false in production (requires email confirmation). Set true to auto-confirm signups.
+   UPSTASH_REDIS_REST_URL=<optional Upstash Redis REST URL for distributed rate limiting>
+   UPSTASH_REDIS_REST_TOKEN=<optional Upstash Redis REST Token>
    ```
 
    *(Optional: `SUPABASE_STORAGE_BUCKET=hackmate-contributions`, defaults to `hackmate-contributions`)*
@@ -258,6 +264,21 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 | Search & View Shared Library | ✓ | ✓ | ✓ | ✗ (403) |
 | Download Contribution Files | ✓ | ✓ | ✓ | ✗ (403) |
 | Join Project past 6-member limit | ✗ (409) | ✗ (409) | ✗ (409) | ✗ (409) |
+
+### Defense-in-Depth Architecture & Authorization Safeguards
+
+1. **Supabase Client Isolation**:
+   * **Authentication Client**: A public, stateless client initialized with `NEXT_PUBLIC_SUPABASE_ANON_KEY` configured strictly with `autoRefreshToken: false`, `persistSession: false`, and `detectSessionInUrl: false`. Used exclusively to verify user login credentials (`signInWithPassword`).
+   * **Administrative Client**: Isolated service-role client (`SUPABASE_SERVICE_ROLE_KEY`) used exclusively on the server for privileged database operations, ensuring user logins cannot contaminate or alter administrative query authorization contexts.
+2. **Strict Application-Level Authorization (Model B)**:
+   * Every API route handler and database adapter method explicitly verifies user authentication, active project membership (`isProjectMember`), role authority (`isProjectLeader`), and task assignee validity before performing operations.
+   * Tasks and contributions enforce strict project boundaries: assigning tasks to non-members, modifying tasks across projects, or linking foreign-project tasks when publishing contributions fails closed with 400/403 errors.
+3. **Session Token Hardening & HTTP-Only Isolation**:
+   * Authenticated sessions use cryptographically verified HMAC-SHA256 tokens stored exclusively in `HttpOnly`, `SameSite=Lax`, `Secure` cookies (`hackmate_session`).
+   * `/api/auth/refresh` rotates the session cookie and strictly omits raw token strings from the JSON response body, preventing XSS-based token theft.
+4. **Distributed Multi-Instance Rate Limiting**:
+   * `/api/auth/login` and `/api/auth/register` utilize atomic rate limiting (10 requests/minute) backed by PostgreSQL RPC (`check_rate_limit`) with optional Upstash Redis support and local memory fallback.
+   * Client IPs are extracted through trusted proxy headers (`x-vercel-forwarded-for`, regex-validated `x-forwarded-for`, `x-real-ip`).
 
 ---
 

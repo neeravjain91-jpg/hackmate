@@ -16,6 +16,8 @@ const TEST_DB_PATH = path.join(TEST_DIR, 'hackmate_test.json');
 
 describe('Multi-User Production Authentication & Storage Alignment', () => {
   beforeEach(() => {
+    delete process.env.VERCEL;
+    delete process.env.STORAGE_DRIVER;
     resetRateLimiter();
     resetDatabaseAdapter();
     if (fs.existsSync(TEST_DIR)) {
@@ -25,6 +27,8 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
   });
 
   afterEach(() => {
+    delete process.env.VERCEL;
+    delete process.env.STORAGE_DRIVER;
     resetRateLimiter();
     resetDatabaseAdapter();
     if (fs.existsSync(TEST_DIR)) {
@@ -221,19 +225,19 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
   });
 
   describe('3. Rate Limiting Protection on Authentication', () => {
-    it('blocks excessive attempts once limit is reached and returns Retry-After', () => {
+    it('blocks excessive attempts once limit is reached and returns Retry-After', async () => {
       process.env.ENABLE_RATE_LIMIT_IN_TEST = 'true';
 
       const key = 'test-ip-rate-limit';
       const limit = 5;
 
       for (let i = 0; i < limit; i++) {
-        const res = checkRateLimit(key, { max: limit, windowMs: 60000 });
+        const res = await checkRateLimit(key, { max: limit, windowMs: 60000 });
         expect(res.allowed).toBe(true);
       }
 
       // 6th attempt should be blocked
-      const blocked = checkRateLimit(key, { max: limit, windowMs: 60000 });
+      const blocked = await checkRateLimit(key, { max: limit, windowMs: 60000 });
       expect(blocked.allowed).toBe(false);
       expect(blocked.remaining).toBe(0);
       expect(blocked.resetAt).toBeGreaterThan(Date.now());
@@ -247,10 +251,20 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       });
       expect(getClientIp(req)).toBe('203.0.113.195');
     });
+
+    it('prioritizes trusted x-vercel-forwarded-for header', () => {
+      const req = new Request('http://localhost:3000/api/auth/login', {
+        headers: {
+          'x-vercel-forwarded-for': '198.51.100.42',
+          'x-forwarded-for': '203.0.113.195, 70.41.3.18',
+        },
+      });
+      expect(getClientIp(req)).toBe('198.51.100.42');
+    });
   });
 
   describe('4. Session Refresh & Expiration Sliding', () => {
-    it('refreshes session via POST /api/auth/refresh and updates session cookie', async () => {
+    it('refreshes session via POST /api/auth/refresh and updates session cookie without returning token in body', async () => {
       const localAdapter = new LocalDatabaseAdapter(TEST_DB_PATH);
       setDatabaseAdapter(localAdapter);
 
@@ -273,11 +287,13 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
 
       const data = await res.json();
       expect(data.user.id).toBe(user.id);
-      expect(data.token).toBeDefined();
+      expect(data.token).toBeUndefined(); // Token MUST NOT be exposed in response body
+      expect(data.success).toBe(true);
 
       const cookie = res.cookies.get(SESSION_COOKIE_NAME);
       expect(cookie).toBeDefined();
-      expect(cookie?.value).toBe(data.token);
+      expect(typeof cookie?.value).toBe('string');
+      expect(cookie?.value.length).toBeGreaterThan(0);
     });
 
     it('rejects POST /api/auth/refresh with 401 when unauthenticated', async () => {
@@ -388,4 +404,187 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       expect(page3[0].title).toBe('Task 5');
     });
   });
+
+  describe('7. Supabase Client Isolation & Authentication Boundary', () => {
+    it('uses dedicated auth client for signInWithPassword without altering admin client', async () => {
+      const adminClient: any = {
+        auth: {
+          admin: {
+            createUser: vi.fn(),
+          },
+        },
+        from: vi.fn().mockReturnValue({
+          select: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnValue({
+              single: vi.fn().mockResolvedValue({
+                data: {
+                  id: 'user-isolated-123',
+                  email: 'isolated@uni.edu',
+                  name: 'Isolated User',
+                  avatar_url: null,
+                  created_at: new Date().toISOString(),
+                },
+                error: null,
+              }),
+            }),
+          }),
+        }),
+      };
+
+      const authClient: any = {
+        auth: {
+          signInWithPassword: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: 'user-isolated-123',
+                email: 'isolated@uni.edu',
+                user_metadata: { name: 'Isolated User' },
+              },
+            },
+            error: null,
+          }),
+        },
+      };
+
+      const adapter = new SupabaseDatabaseAdapter(adminClient, () => authClient);
+      const user = await adapter.authenticateUser('isolated@uni.edu', 'secretPass');
+
+      expect(user).not.toBeNull();
+      expect(user?.id).toBe('user-isolated-123');
+      // Auth was routed to authClient
+      expect(authClient.auth.signInWithPassword).toHaveBeenCalledWith({
+        email: 'isolated@uni.edu',
+        password: 'secretPass',
+      });
+      // Admin client auth methods were NOT called for signInWithPassword
+      expect((adminClient.auth as any).signInWithPassword).toBeUndefined();
+    });
+  });
+
+  describe('8. Partial Failure Recovery & Auth User Rollback', () => {
+    it('deletes newly created auth user if profile creation fails', async () => {
+      const createdAuthId = 'orphan-user-uuid-999';
+      const deleteUserMock = vi.fn().mockResolvedValue({ data: {}, error: null });
+
+      const adminClient: any = {
+        auth: {
+          admin: {
+            createUser: vi.fn().mockResolvedValue({
+              data: {
+                user: {
+                  id: createdAuthId,
+                  email: 'fail@uni.edu',
+                  user_metadata: { name: 'Fail User' },
+                },
+              },
+              error: null,
+            }),
+            deleteUser: deleteUserMock,
+          },
+        },
+        from: (table: string) => {
+          if (table === 'profiles') {
+            return {
+              upsert: () => ({
+                select: () => ({
+                  single: () =>
+                    Promise.resolve({
+                      data: null,
+                      error: { message: 'Database connection failed during profile write' },
+                    }),
+                }),
+              }),
+            };
+          }
+          throw new Error(`Unexpected table: ${table}`);
+        },
+      };
+
+      const adapter = new SupabaseDatabaseAdapter(adminClient);
+
+      await expect(
+        adapter.createUser({
+          email: 'fail@uni.edu',
+          name: 'Fail User',
+          password: 'password123',
+        })
+      ).rejects.toThrow('Failed to create profile: Database connection failed during profile write');
+
+      // Verify that deleteUser was called to clean up the orphaned user
+      expect(deleteUserMock).toHaveBeenCalledWith(createdAuthId);
+    });
+  });
+
+  describe('9. Cross-Project Task & Contribution Isolation', () => {
+    it('enforces task and contribution project boundaries in LocalDatabaseAdapter', async () => {
+      const adapter = new LocalDatabaseAdapter(TEST_DB_PATH);
+
+      const leaderA = await adapter.createUser({
+        email: 'leaderA@uni.edu',
+        name: 'Leader A',
+        password: 'password123',
+      });
+      const leaderB = await adapter.createUser({
+        email: 'leaderB@uni.edu',
+        name: 'Leader B',
+        password: 'password123',
+      });
+      const memberB = await adapter.createUser({
+        email: 'memberB@uni.edu',
+        name: 'Member B',
+        password: 'password123',
+      });
+
+      const projA = await adapter.createProject({
+        name: 'Project A',
+        description: 'First Project',
+        leader_id: leaderA.id,
+      });
+      const projB = await adapter.createProject({
+        name: 'Project B',
+        description: 'Second Project',
+        leader_id: leaderB.id,
+      });
+
+      await adapter.joinProject(projB.id, memberB.id, 'member');
+
+      // 1. Leader A cannot assign task to Member B (who is only in Project B)
+      await expect(
+        adapter.createTask({
+          project_id: projA.id,
+          title: 'Cross Task',
+          description: 'Invalid assignment',
+          assigned_to: memberB.id,
+          created_by: leaderA.id,
+        })
+      ).rejects.toThrow('Assigned user must be a member of this project.');
+
+      // 2. Create valid task in Project B
+      const taskB = await adapter.createTask({
+        project_id: projB.id,
+        title: 'Project B Task',
+        description: 'Valid task in B',
+        assigned_to: memberB.id,
+        created_by: leaderB.id,
+      });
+
+      // 3. Leader A cannot link Project B task when publishing contribution in Project A
+      await expect(
+        adapter.createContribution(
+          {
+            project_id: projA.id,
+            title: 'Contribution in A with B task',
+            description: 'Illicit cross link',
+            contributor_id: leaderA.id,
+            contributor_name: leaderA.name,
+            task_id: taskB.id,
+            usage_instructions: 'none',
+            dependencies: 'none',
+          },
+          []
+        )
+      ).rejects.toThrow('Task does not belong to this project.');
+    });
+  });
 });
+
