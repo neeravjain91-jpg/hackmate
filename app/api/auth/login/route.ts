@@ -39,7 +39,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (typeof db.isUserVerified === 'function') {
+    if (typeof db.isUserVerified !== 'function') {
+      return NextResponse.json({ error: 'Email verification status cannot be established.' }, { status: 503 });
+    }
+    {
       const isVerified = await db.isUserVerified(user.id);
       if (!isVerified) {
         return NextResponse.json(
