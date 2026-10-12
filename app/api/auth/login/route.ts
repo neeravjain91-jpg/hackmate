@@ -39,6 +39,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (typeof db.isUserVerified === 'function') {
+      const isVerified = await db.isUserVerified(user.id);
+      if (!isVerified) {
+        return NextResponse.json(
+          { error: 'Please verify your email address before logging in. A confirmation email was sent to your inbox.' },
+          { status: 403 }
+        );
+      }
+    }
+
     const token = createSessionToken(user.id);
     const response = NextResponse.json({ user });
 

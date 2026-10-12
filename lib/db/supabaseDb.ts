@@ -74,19 +74,23 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   }
 
   async isUserVerified(userId: string): Promise<boolean> {
+    // Explicitly configured administrative auto-confirm override
     if (process.env.AUTH_AUTO_CONFIRM_EMAILS === 'true') {
       return true;
     }
-    if (this.client.auth?.admin?.getUserById) {
-      try {
-        const { data, error } = await this.client.auth.admin.getUserById(userId);
-        if (error || !data?.user) return false;
-        return Boolean(data.user.email_confirmed_at || data.user.confirmed_at);
-      } catch {
-        return false;
-      }
+
+    // Fail closed if administrative user lookup is unavailable
+    if (!this.client.auth?.admin?.getUserById) {
+      return false;
     }
-    return true;
+
+    try {
+      const { data, error } = await this.client.auth.admin.getUserById(userId);
+      if (error || !data?.user) return false;
+      return Boolean(data.user.email_confirmed_at || data.user.confirmed_at);
+    } catch {
+      return false;
+    }
   }
 
   async createUser(

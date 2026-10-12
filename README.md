@@ -199,7 +199,28 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
    - Create a new project at [https://supabase.com](https://supabase.com).
    - In the Supabase Storage dashboard, create a private bucket named `hackmate-contributions`.
 
-2. **Execute Database Migrations in the Supabase SQL Editor**:
+2. **Configure Supabase Auth Settings & Email Templates**:
+   In the Supabase Project Dashboard, configure the following authentication settings:
+
+   * **Site URL & Redirect URLs Allowlist** (**Authentication > URL Configuration**):
+     - **Site URL**: `https://try-kohl-mu.vercel.app` (or your canonical production domain).
+     - **Redirect URLs (Allowlist)**:
+       - `https://try-kohl-mu.vercel.app/api/auth/callback`
+       - `http://localhost:3000/api/auth/callback` (for local development)
+   
+   * **Confirmation Email Template** (**Authentication > Email Templates > Confirm signup**):
+     - **Subject**: `Confirm Your HackMate Registration`
+     - **Message (HTML)**:
+       ```html
+       <h2>Confirm your HackMate account</h2>
+       <p>Welcome to HackMate! Please verify your email address to complete your registration:</p>
+       <p><a href="{{ .SiteURL }}/api/auth/callback?token_hash={{ .TokenHash }}&type=email">Verify Email</a></p>
+       <p>If you did not sign up for HackMate, you can safely ignore this email.</p>
+       ```
+     > [!IMPORTANT]
+     > HackMate's serverless architecture on Vercel requires the `token_hash` OTP verification flow. The email template must link directly to `{{ .SiteURL }}/api/auth/callback?token_hash={{ .TokenHash }}&type=email`. This sends the cryptographic token hash directly to `/api/auth/callback`, which validates it via `supabase.auth.verifyOtp({ token_hash, type: 'email' })`. This is completely stateless and succeeds across separate serverless instances and external devices. PKCE code exchange (`?code=...`) is unsupported on serverless without sticky sessions and will be rejected.
+
+3. **Execute Database Migrations in the Supabase SQL Editor**:
    In your browser, open the Supabase dashboard for your project, navigate to the **SQL Editor**, and execute the full contents of each file in this exact sequential order:
 
    * **Step 1 — Initial HackMate database schema & Distributed Rate Limiting**:
@@ -221,18 +242,20 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
 
      *(Note: File revision restoration is handled at the application adapter level: `SupabaseDatabaseAdapter.restoreWorkspaceRevision()` retrieves the historical revision from `workspace_revisions` and calls `saveWorkspaceFile()`, which executes `save_workspace_file_atomic` to create a new revision non-destructively.)*
 
-3. **Configure Environment Variables (Vercel Deployments & `.env.local`)**:
+4. **Configure Environment Variables (Vercel Deployments & `.env.local`)**:
    For Vercel deployments, configure these exact environment variables in your Vercel Project Settings (or via `vercel env add`):
    ```env
-   # Mandatory Production Storage & Authentication Secrets
+   # Mandatory Production Storage & Canonical Host
+   NEXT_PUBLIC_APP_URL=https://try-kohl-mu.vercel.app
    STORAGE_DRIVER=supabase
    NEXT_PUBLIC_SUPABASE_URL=<real Supabase project URL>
    NEXT_PUBLIC_SUPABASE_ANON_KEY=<real Supabase anon key>
    SUPABASE_SERVICE_ROLE_KEY=<real Supabase service-role key>
    AUTH_SECRET=<strong randomly generated production secret (min 32 bytes)>
+   CRON_SECRET=<strong randomly generated secret for maintenance cron (min 16 bytes)>
 
    # Production Email Verification & Rate Limiting Options
-   AUTH_AUTO_CONFIRM_EMAILS=false # Defaults to false in production (requires email confirmation). Set true to auto-confirm signups.
+   AUTH_AUTO_CONFIRM_EMAILS=false # Defaults to false in production (requires email confirmation). Set true in test environments only.
    UPSTASH_REDIS_REST_URL=<optional Upstash Redis REST URL for distributed rate limiting>
    UPSTASH_REDIS_REST_TOKEN=<optional Upstash Redis REST Token>
    ```
@@ -244,6 +267,10 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
    > - `AUTH_SECRET` is mandatory for production and must be generated using a cryptographically secure random generator:
    >   ```bash
    >   openssl rand -base64 32
+   >   ```
+   > - `CRON_SECRET` secures `/api/cron/cleanup-rate-limits` and should be generated using:
+   >   ```bash
+   >   openssl rand -hex 24
    >   ```
 
 > [!NOTE]
@@ -283,8 +310,10 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
    * **SECURITY DEFINER Hardening**: Functions run with restricted empty search path (`SET search_path = ''`) and full schema qualification to eliminate search-path hijacking risks. Execution is revoked from `PUBLIC, anon, authenticated` and granted exclusively to `service_role`.
    * **Automated Cleanup Architecture (`public.cleanup_expired_rate_limits()`)**:
      * *Non-Destructive Retention*: Prunes rate-limit records whose `reset_at` timestamp is older than 1 hour; active windows are never deleted.
-     * *Bounded Background Sweep*: Built-in opportunistic cleanup in `lib/auth/rateLimit.ts` throttles database cleanup to execute at most once per 15-minute cooldown window, running asynchronously without blocking client requests.
-     * *Protected Maintenance Endpoint*: An authenticated maintenance endpoint at `/api/cron/cleanup-rate-limits` requires `Authorization: Bearer <CRON_SECRET>` or Vercel Cron headers, blocking unauthenticated callers with HTTP 401.
+     * *Repository-Defined Vercel Cron Schedule*: Configured in `vercel.json` to execute hourly (`0 * * * *`) against `/api/cron/cleanup-rate-limits`. When deployed on Vercel with `CRON_SECRET` configured in project environment variables, Vercel automatically invokes the endpoint with `Authorization: Bearer <CRON_SECRET>`.
+     * *Protected Maintenance Endpoint Authentication*: The endpoint strictly verifies `CRON_SECRET` and requires an exact matching `Authorization: Bearer <CRON_SECRET>` header. Forged headers (such as standalone `x-vercel-cron`) are rejected with HTTP 401 Unauthorized.
+     * *Bounded Opportunistic Sweep*: Built-in opportunistic cleanup in `lib/auth/rateLimit.ts` throttles database cleanup to execute at most once per 15-minute cooldown window during active rate-check queries, running asynchronously without blocking client requests.
+     * *Environment Scheduling Reality*: In local development and automated CI testing environments, scheduled background cron jobs do not run; pruning operates exclusively via the in-process opportunistic mechanism or through manual authenticated requests to `/api/cron/cleanup-rate-limits`.
      * *Optional Database Scheduler (`pg_cron`)*: On Supabase, operators can automate hourly pruning directly within PostgreSQL:
        ```sql
        -- Optional pg_cron setup in Supabase SQL editor:

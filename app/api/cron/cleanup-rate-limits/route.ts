@@ -12,14 +12,16 @@ import { cleanupExpiredRateLimits } from '@/lib/auth/rateLimit';
 export async function GET(request: NextRequest) {
   const cronSecret = process.env.CRON_SECRET;
   const authHeader = request.headers.get('authorization');
-  const isVercelCron = request.headers.get('x-vercel-cron') === '1';
 
-  const isAuthorized = Boolean(
-    (cronSecret && authHeader === `Bearer ${cronSecret}`) ||
-    (isVercelCron && (!cronSecret || authHeader === `Bearer ${cronSecret}`))
-  );
+  // CRON_SECRET must be configured and exact matching Bearer header is required
+  if (!cronSecret || cronSecret.trim().length === 0) {
+    return NextResponse.json(
+      { error: 'Unauthorized: CRON_SECRET is not configured on the server.' },
+      { status: 401 }
+    );
+  }
 
-  if (!isAuthorized) {
+  if (authHeader !== `Bearer ${cronSecret}`) {
     return NextResponse.json(
       { error: 'Unauthorized: Valid maintenance authentication is required.' },
       { status: 401 }

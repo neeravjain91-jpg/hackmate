@@ -20,11 +20,21 @@ import { getCanonicalAppUrl } from '@/lib/auth/url';
  * - Never leaks internal database errors in redirect query strings.
  * - Confirms existing profile ownership before authenticating.
  */
+const SUPPORTED_EMAIL_OTP_TYPES = [
+  'email',
+  'signup',
+  'invite',
+  'magiclink',
+  'recovery',
+  'email_change',
+] as const;
+type SupportedEmailOtpType = typeof SUPPORTED_EMAIL_OTP_TYPES[number];
+
 export async function GET(request: NextRequest) {
   const requestUrl = new URL(request.url);
   const code = requestUrl.searchParams.get('code');
   const tokenHash = requestUrl.searchParams.get('token_hash');
-  const type = requestUrl.searchParams.get('type') || 'signup';
+  const typeParam = requestUrl.searchParams.get('type');
   const errorParam = requestUrl.searchParams.get('error');
   const errorDescription = requestUrl.searchParams.get('error_description');
 
@@ -37,9 +47,46 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  // Reject unsupported PKCE code flow across serverless requests
+  if (code && !tokenHash) {
+    return NextResponse.redirect(
+      new URL(
+        '/login?error=unsupported_flow&message=PKCE+code+exchange+is+not+supported.+Please+use+the+token_hash+verification+link+sent+to+your+email.',
+        canonicalOrigin
+      )
+    );
+  }
+
+  // Require explicit token_hash
+  if (!tokenHash || tokenHash.trim().length === 0) {
+    return NextResponse.redirect(
+      new URL('/login?error=missing_verification_params&message=Missing+required+token_hash+parameter.', canonicalOrigin)
+    );
+  }
+
+  // Require explicit type parameter without silent defaulting
+  if (!typeParam || typeParam.trim().length === 0) {
+    return NextResponse.redirect(
+      new URL(
+        '/login?error=missing_verification_type&message=Missing+required+verification+type+parameter+(e.g.+type=email).',
+        canonicalOrigin
+      )
+    );
+  }
+
+  // Validate that type is a supported Supabase email OTP type
+  if (!SUPPORTED_EMAIL_OTP_TYPES.includes(typeParam as any)) {
+    return NextResponse.redirect(
+      new URL(
+        '/login?error=invalid_verification_type&message=Invalid+or+unsupported+verification+type+parameter.',
+        canonicalOrigin
+      )
+    );
+  }
+
   // Obtain an auth client instance (fresh or configured)
   const authClient = getSupabaseAuthClient() || createSupabaseAuthClient();
-  if (!authClient) {
+  if (!authClient || !authClient.auth?.verifyOtp) {
     return NextResponse.redirect(
       new URL('/login?error=auth_unavailable&message=Authentication+service+is+temporarily+unavailable.', canonicalOrigin)
     );
@@ -48,32 +95,17 @@ export async function GET(request: NextRequest) {
   let verifiedUser: { id: string; email?: string; user_metadata?: any } | null = null;
 
   try {
-    if (tokenHash) {
-      // 1. Stateless Token Hash / OTP Verification Flow (Supported across serverless instances)
-      const { data, error } = await authClient.auth.verifyOtp({
-        token_hash: tokenHash,
-        type: type as any,
-      });
-      if (error || !data?.user) {
-        return NextResponse.redirect(
-          new URL('/login?error=verification_failed&message=Verification+token+is+invalid+or+has+expired.', canonicalOrigin)
-        );
-      }
-      verifiedUser = data.user;
-    } else if (code) {
-      // 2. PKCE Code Exchange Flow
-      const { data, error } = await authClient.auth.exchangeCodeForSession(code);
-      if (error || !data?.user) {
-        return NextResponse.redirect(
-          new URL('/login?error=verification_failed&message=Verification+code+is+invalid+or+has+expired.', canonicalOrigin)
-        );
-      }
-      verifiedUser = data.user;
-    } else {
+    // Stateless Token Hash / OTP Verification Flow (Supported across serverless instances)
+    const { data, error } = await authClient.auth.verifyOtp({
+      token_hash: tokenHash.trim(),
+      type: typeParam as SupportedEmailOtpType,
+    });
+    if (error || !data?.user) {
       return NextResponse.redirect(
-        new URL('/login?error=missing_verification_params&message=Missing+verification+parameters.', canonicalOrigin)
+        new URL('/login?error=verification_failed&message=Verification+token+is+invalid+or+has+expired.', canonicalOrigin)
       );
     }
+    verifiedUser = data.user;
 
     if (!verifiedUser?.id) {
       return NextResponse.redirect(

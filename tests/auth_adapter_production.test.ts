@@ -6,6 +6,7 @@ import { SupabaseDatabaseAdapter } from '@/lib/db/supabaseDb';
 import { LocalDatabaseAdapter } from '@/lib/db/localDb';
 import { checkRateLimit, resetRateLimiter, getClientIp } from '@/lib/auth/rateLimit';
 import { POST as registerHandler } from '@/app/api/auth/register/route';
+import { POST as loginHandler } from '@/app/api/auth/login/route';
 import { GET as callbackHandler } from '@/app/api/auth/callback/route';
 import { GET as cronCleanupHandler } from '@/app/api/cron/cleanup-rate-limits/route';
 import { POST as refreshHandler } from '@/app/api/auth/refresh/route';
@@ -1259,6 +1260,67 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       expect(passedRedirectTo).not.toContain('phishing-site.evil.org');
       expect(passedRedirectTo).toBe(`${getCanonicalAppUrl()}/api/auth/callback`);
     });
+
+    it('rejects verification callback when token_hash parameter is missing', async () => {
+      const req = new NextRequest('http://localhost:3000/api/auth/callback?type=email');
+      const res = await callbackHandler(req);
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toContain('error=missing_verification_params');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('rejects verification callback when type parameter is missing', async () => {
+      const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=some-token-hash');
+      const res = await callbackHandler(req);
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toContain('error=missing_verification_type');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('rejects verification callback when type parameter is invalid or unsupported', async () => {
+      const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=some-token-hash&type=invalid_type');
+      const res = await callbackHandler(req);
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toContain('error=invalid_verification_type');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('clearly rejects unsupported PKCE code exchange flow across serverless requests', async () => {
+      const req = new NextRequest('http://localhost:3000/api/auth/callback?code=some-pkce-code-123');
+      const res = await callbackHandler(req);
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toContain('error=unsupported_flow');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('fails closed when authentication client or verifyOtp is not configured', async () => {
+      vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(null);
+      vi.spyOn(await import('@/lib/supabase'), 'createSupabaseAuthClient').mockReturnValue(null);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=validhash&type=email');
+      const res = await callbackHandler(req);
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toContain('error=auth_unavailable');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('fails closed when verification token is invalid or expired', async () => {
+      const mockAuthClient: any = {
+        auth: {
+          verifyOtp: vi.fn().mockResolvedValue({
+            data: null,
+            error: { message: 'Token has expired or is invalid' },
+          }),
+        },
+      };
+      vi.spyOn(await import('@/lib/supabase'), 'getSupabaseAuthClient').mockReturnValue(mockAuthClient);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/callback?token_hash=expiredhash&type=email');
+      const res = await callbackHandler(req);
+      expect(res.status).toBe(307);
+      expect(res.headers.get('location')).toContain('error=verification_failed');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
   });
 
   describe('12. Fail Closed on Profile Recovery Failures', () => {
@@ -1347,7 +1409,76 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       expect(data.error).toContain('Unauthorized');
     });
 
-    it('executes cleanup when authorized with CRON_SECRET Bearer token', async () => {
+    it('rejects cleanup request when CRON_SECRET is not configured on the server with 401', async () => {
+      const originalSecret = process.env.CRON_SECRET;
+      delete process.env.CRON_SECRET;
+
+      try {
+        const req = new NextRequest('http://localhost:3000/api/cron/cleanup-rate-limits', {
+          headers: {
+            authorization: 'Bearer any-secret-token',
+          },
+        });
+        const res = await cronCleanupHandler(req);
+        expect(res.status).toBe(401);
+        const data = await res.json();
+        expect(data.error).toContain('CRON_SECRET is not configured');
+      } finally {
+        if (originalSecret !== undefined) process.env.CRON_SECRET = originalSecret;
+        else delete process.env.CRON_SECRET;
+      }
+    });
+
+    it('rejects cleanup request with incorrect secret with 401', async () => {
+      const originalSecret = process.env.CRON_SECRET;
+      process.env.CRON_SECRET = 'expected-secret-value-123';
+
+      try {
+        const req = new NextRequest('http://localhost:3000/api/cron/cleanup-rate-limits', {
+          headers: {
+            authorization: 'Bearer wrong-secret-value',
+          },
+        });
+        const res = await cronCleanupHandler(req);
+        expect(res.status).toBe(401);
+        const data = await res.json();
+        expect(data.error).toContain('Valid maintenance authentication is required');
+      } finally {
+        if (originalSecret !== undefined) process.env.CRON_SECRET = originalSecret;
+        else delete process.env.CRON_SECRET;
+      }
+    });
+
+    it('rejects forged x-vercel-cron header without matching Authorization header with 401', async () => {
+      const originalSecret = process.env.CRON_SECRET;
+      process.env.CRON_SECRET = 'expected-secret-value-123';
+
+      try {
+        // Forged cron header without authorization header
+        const reqNoAuth = new NextRequest('http://localhost:3000/api/cron/cleanup-rate-limits', {
+          headers: {
+            'x-vercel-cron': '1',
+          },
+        });
+        const resNoAuth = await cronCleanupHandler(reqNoAuth);
+        expect(resNoAuth.status).toBe(401);
+
+        // Forged cron header with incorrect authorization header
+        const reqWrongAuth = new NextRequest('http://localhost:3000/api/cron/cleanup-rate-limits', {
+          headers: {
+            'x-vercel-cron': '1',
+            authorization: 'Bearer forged-fake-secret',
+          },
+        });
+        const resWrongAuth = await cronCleanupHandler(reqWrongAuth);
+        expect(resWrongAuth.status).toBe(401);
+      } finally {
+        if (originalSecret !== undefined) process.env.CRON_SECRET = originalSecret;
+        else delete process.env.CRON_SECRET;
+      }
+    });
+
+    it('executes cleanup when authorized with exact matching CRON_SECRET Bearer token', async () => {
       const originalSecret = process.env.CRON_SECRET;
       process.env.CRON_SECRET = 'super-secret-cron-token-123';
 
@@ -1489,6 +1620,158 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       const res = await checkRateLimit('key-valid-redis', { max: 5 });
       expect(res.allowed).toBe(true);
       expect(res.remaining).toBe(3);
+    });
+  });
+
+  describe('16. Fail-Closed Email Verification Status (isUserVerified)', () => {
+    it('returns false when getUserById is not supported on administrative client', async () => {
+      const adminClient: any = { auth: { admin: {} } };
+      const adapter = new SupabaseDatabaseAdapter(adminClient, () => ({}) as any);
+      const isVerified = await adapter.isUserVerified('user-no-admin-method');
+      expect(isVerified).toBe(false);
+    });
+
+    it('returns false when administrative user lookup fails or returns error', async () => {
+      const adminClient: any = {
+        auth: {
+          admin: {
+            getUserById: vi.fn().mockResolvedValue({
+              data: null,
+              error: { message: 'Database connection failed' },
+            }),
+          },
+        },
+      };
+      const adapter = new SupabaseDatabaseAdapter(adminClient, () => ({}) as any);
+      const isVerified = await adapter.isUserVerified('user-lookup-error');
+      expect(isVerified).toBe(false);
+    });
+
+    it('returns false when administrative lookup throws an unhandled exception', async () => {
+      const adminClient: any = {
+        auth: {
+          admin: {
+            getUserById: vi.fn().mockRejectedValue(new Error('Network failure')),
+          },
+        },
+      };
+      const adapter = new SupabaseDatabaseAdapter(adminClient, () => ({}) as any);
+      const isVerified = await adapter.isUserVerified('user-throws-exception');
+      expect(isVerified).toBe(false);
+    });
+
+    it('returns false for unconfirmed user with null email_confirmed_at and confirmed_at', async () => {
+      const adminClient: any = {
+        auth: {
+          admin: {
+            getUserById: vi.fn().mockResolvedValue({
+              data: {
+                user: {
+                  id: 'unconfirmed-student-1',
+                  email: 'student@uni.edu',
+                  email_confirmed_at: null,
+                  confirmed_at: null,
+                },
+              },
+              error: null,
+            }),
+          },
+        },
+      };
+      const adapter = new SupabaseDatabaseAdapter(adminClient, () => ({}) as any);
+      const isVerified = await adapter.isUserVerified('unconfirmed-student-1');
+      expect(isVerified).toBe(false);
+    });
+
+    it('returns true for confirmed user with email_confirmed_at set', async () => {
+      const adminClient: any = {
+        auth: {
+          admin: {
+            getUserById: vi.fn().mockResolvedValue({
+              data: {
+                user: {
+                  id: 'confirmed-student-1',
+                  email: 'confirmed@uni.edu',
+                  email_confirmed_at: '2026-10-10T12:00:00Z',
+                  confirmed_at: '2026-10-10T12:00:00Z',
+                },
+              },
+              error: null,
+            }),
+          },
+        },
+      };
+      const adapter = new SupabaseDatabaseAdapter(adminClient, () => ({}) as any);
+      const isVerified = await adapter.isUserVerified('confirmed-student-1');
+      expect(isVerified).toBe(true);
+    });
+
+    it('returns true when administrative auto-confirm override is explicitly enabled', async () => {
+      const original = process.env.AUTH_AUTO_CONFIRM_EMAILS;
+      process.env.AUTH_AUTO_CONFIRM_EMAILS = 'true';
+
+      try {
+        const adminClient: any = { auth: { admin: {} } };
+        const adapter = new SupabaseDatabaseAdapter(adminClient, () => ({}) as any);
+        const isVerified = await adapter.isUserVerified('override-user-1');
+        expect(isVerified).toBe(true);
+      } finally {
+        if (original !== undefined) process.env.AUTH_AUTO_CONFIRM_EMAILS = original;
+        else delete process.env.AUTH_AUTO_CONFIRM_EMAILS;
+      }
+    });
+
+    it('prevents issuing session cookie during login when isUserVerified returns false', async () => {
+      const mockDb: any = {
+        authenticateUser: vi.fn().mockResolvedValue({
+          id: 'unverified-login-user',
+          email: 'unverified@uni.edu',
+          name: 'Unverified Student',
+        }),
+        isUserVerified: vi.fn().mockResolvedValue(false),
+      };
+      setDatabaseAdapter(mockDb);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'unverified@uni.edu',
+          password: 'password123',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(403);
+      const data = await res.json();
+      expect(data.error).toContain('Please verify your email address before logging in');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('prevents refreshing session when isUserVerified returns false', async () => {
+      const mockDb: any = {
+        getUserById: vi.fn().mockResolvedValue({
+          id: 'unverified-refresh-user',
+          email: 'unverified@uni.edu',
+          name: 'Unverified Student',
+        }),
+        isUserVerified: vi.fn().mockResolvedValue(false),
+      };
+      setDatabaseAdapter(mockDb);
+
+      const token = createSessionToken('unverified-refresh-user');
+      const req = new NextRequest('http://localhost:3000/api/auth/refresh', {
+        method: 'POST',
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${token}`,
+        },
+      });
+
+      const res = await refreshHandler(req);
+      expect(res.status).toBe(401);
+      const data = await res.json();
+      expect(data.error).toContain('Unauthorized');
+      expect(res.headers.get('set-cookie')).toBeNull();
     });
   });
 });
