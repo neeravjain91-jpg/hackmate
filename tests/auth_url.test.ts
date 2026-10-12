@@ -6,21 +6,22 @@ describe('canonical application URL configuration', () => {
   const originalVercel = process.env.VERCEL;
   const originalAppUrl = process.env.NEXT_PUBLIC_APP_URL;
 
+  function setEnv(key: string, value: string | undefined): void {
+    const env = process.env as Record<string, string | undefined>;
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+
   beforeEach(() => {
-    process.env.NODE_ENV = 'test';
-    delete process.env.VERCEL;
-    delete process.env.NEXT_PUBLIC_APP_URL;
+    setEnv('NODE_ENV', 'test');
+    setEnv('VERCEL', undefined);
+    setEnv('NEXT_PUBLIC_APP_URL', undefined);
   });
 
   afterEach(() => {
-    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = originalNodeEnv;
-
-    if (originalVercel === undefined) delete process.env.VERCEL;
-    else process.env.VERCEL = originalVercel;
-
-    if (originalAppUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
-    else process.env.NEXT_PUBLIC_APP_URL = originalAppUrl;
+    setEnv('NODE_ENV', originalNodeEnv);
+    setEnv('VERCEL', originalVercel);
+    setEnv('NEXT_PUBLIC_APP_URL', originalAppUrl);
   });
 
   it('uses localhost as the development default when no URL is configured', () => {
@@ -28,35 +29,35 @@ describe('canonical application URL configuration', () => {
   });
 
   it('returns the origin of a valid development URL', () => {
-    process.env.NEXT_PUBLIC_APP_URL = 'http://localhost:3000/nested/path';
+    setEnv('NEXT_PUBLIC_APP_URL', 'http://localhost:3000/nested/path');
     expect(getCanonicalAppUrl()).toBe('http://localhost:3000');
   });
 
   it('requires an explicit canonical URL in production', () => {
-    process.env.NODE_ENV = 'production';
+    setEnv('NODE_ENV', 'production');
     expect(() => getCanonicalAppUrl()).toThrow(/NEXT_PUBLIC_APP_URL must be configured.*HTTPS origin/i);
   });
 
   it('also requires an explicit canonical URL on Vercel even if NODE_ENV is not production', () => {
-    process.env.VERCEL = '1';
+    setEnv('VERCEL', '1');
     expect(() => getCanonicalAppUrl()).toThrow(/NEXT_PUBLIC_APP_URL must be configured.*HTTPS origin/i);
   });
 
   it('rejects malformed production URLs without falling back to another deployment', () => {
-    process.env.NODE_ENV = 'production';
-    process.env.NEXT_PUBLIC_APP_URL = 'not-a-valid-origin';
+    setEnv('NODE_ENV', 'production');
+    setEnv('NEXT_PUBLIC_APP_URL', 'not-a-valid-origin');
     expect(() => getCanonicalAppUrl()).toThrow(/NEXT_PUBLIC_APP_URL must be configured.*HTTPS origin/i);
   });
 
   it('rejects HTTP URLs in production', () => {
-    process.env.NODE_ENV = 'production';
-    process.env.NEXT_PUBLIC_APP_URL = 'http://hackmate.example';
+    setEnv('NODE_ENV', 'production');
+    setEnv('NEXT_PUBLIC_APP_URL', 'http://hackmate.example');
     expect(() => getCanonicalAppUrl()).toThrow(/NEXT_PUBLIC_APP_URL must be configured.*HTTPS origin/i);
   });
 
   it('accepts a configured production HTTPS URL and normalizes it to origin', () => {
-    process.env.NODE_ENV = 'production';
-    process.env.NEXT_PUBLIC_APP_URL = 'https://hackmate.example/path?ignored=yes';
+    setEnv('NODE_ENV', 'production');
+    setEnv('NEXT_PUBLIC_APP_URL', 'https://hackmate.example/path?ignored=yes');
     expect(getCanonicalAppUrl()).toBe('https://hackmate.example');
   });
 });
