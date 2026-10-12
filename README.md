@@ -118,7 +118,7 @@ HackMate is a web collaboration platform engineered specifically for hackathon t
 ## 4. Setup and Quickstart
 
 ### Prerequisites
-* Node.js 18+ (tested on Node v24.18.1)
+* Node.js 22+ (the current Supabase JS dependency tree requires Node.js 22 or later; also tested on Node v24.18.1)
 * npm 9+
 
 ### 1. Install Dependencies
