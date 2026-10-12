@@ -52,14 +52,35 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const user = await db.createUser({
-      email,
-      name,
-      password,
-    });
+    const host = request.headers.get('x-forwarded-host') || request.headers.get('host') || 'localhost:3000';
+    const proto = request.headers.get('x-forwarded-proto') || 'http';
+    const emailRedirectTo = `${proto}://${host}/api/auth/callback`;
+
+    const user = await db.createUser(
+      {
+        email,
+        name,
+        password,
+      },
+      {
+        emailRedirectTo,
+      }
+    );
+
+    if (user.requiresVerification) {
+      return NextResponse.json(
+        {
+          user,
+          requiresVerification: true,
+          message:
+            'Registration successful. A verification email has been sent. Please verify your email address before logging in.',
+        },
+        { status: 201 }
+      );
+    }
 
     const token = createSessionToken(user.id);
-    const response = NextResponse.json({ user }, { status: 201 });
+    const response = NextResponse.json({ user, requiresVerification: false }, { status: 201 });
 
     response.cookies.set({
       name: SESSION_COOKIE_NAME,

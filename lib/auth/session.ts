@@ -225,5 +225,15 @@ export async function getCurrentUserFromRequest(request: NextRequest | Request):
   if (!userId) return null;
 
   const db = getDatabaseAdapter();
-  return db.getUserById(userId);
+  const user = await db.getUserById(userId);
+  if (!user) return null;
+
+  if (typeof db.isUserVerified === 'function') {
+    const isVerified = await db.isUserVerified(userId);
+    if (!isVerified) {
+      return null;
+    }
+  }
+
+  return user;
 }

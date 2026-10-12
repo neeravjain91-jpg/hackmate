@@ -4,13 +4,14 @@ import React, { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/components/AuthProvider';
-import { Layers, AlertCircle, ArrowRight } from 'lucide-react';
+import { Layers, AlertCircle, ArrowRight, MailCheck } from 'lucide-react';
 
 export default function RegisterPage() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const { register } = useAuth();
   const router = useRouter();
@@ -18,13 +19,21 @@ export default function RegisterPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setSuccessMessage(null);
     setLoading(true);
 
     const result = await register(email, password, name);
     setLoading(false);
 
     if (result.success) {
-      router.push('/dashboard');
+      if (result.requiresVerification) {
+        setSuccessMessage(
+          result.message ||
+            'Registration successful! Please check your email inbox to verify your address before logging in.'
+        );
+      } else {
+        router.push('/dashboard');
+      }
     } else {
       setError(result.error || 'Failed to register account.');
     }
@@ -48,9 +57,24 @@ export default function RegisterPage() {
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5">
+        {successMessage ? (
+          <div className="text-center py-4">
+            <div className="w-12 h-12 bg-emerald-100 text-emerald-700 rounded-full flex items-center justify-center mx-auto mb-4">
+              <MailCheck className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-bold text-slate-900 mb-2">Verify your email address</h3>
+            <p className="text-sm text-slate-600 mb-6">{successMessage}</p>
+            <Link
+              href="/login"
+              className="inline-flex items-center justify-center px-5 py-2.5 rounded-xl bg-emerald-600 text-white font-semibold text-sm hover:bg-emerald-700 shadow-sm transition"
+            >
+              Proceed to Sign In
+            </Link>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1.5">
               Full Name
             </label>
             <input
@@ -106,6 +130,7 @@ export default function RegisterPage() {
             )}
           </button>
         </form>
+        )}
 
         <div className="mt-8 pt-6 border-t border-slate-100 text-center text-sm text-slate-600">
           Already have an account?{' '}

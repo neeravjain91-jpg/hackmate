@@ -20,15 +20,21 @@ export interface IDatabaseAdapter {
   // User Management
   getUserByEmail(email: string): Promise<UserAuthRecord | null>;
   getUserById(id: string): Promise<UserProfile | null>;
-  createUser(user: {
-    id?: string;
-    email: string;
-    name: string;
-    password?: string;
-    password_hash?: string;
-    avatar_url?: string | null;
-  }): Promise<UserProfile>;
+  createUser(
+    user: {
+      id?: string;
+      email: string;
+      name: string;
+      password?: string;
+      password_hash?: string;
+      avatar_url?: string | null;
+    },
+    options?: {
+      emailRedirectTo?: string;
+    }
+  ): Promise<UserProfile>;
   authenticateUser(email: string, password: string): Promise<UserProfile | null>;
+  isUserVerified?(userId: string): Promise<boolean>;
 
   // Project Management
   createProject(data: {

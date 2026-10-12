@@ -176,6 +176,10 @@ export class LocalDatabaseAdapter implements IDatabaseAdapter {
     });
   }
 
+  async isUserVerified(_userId: string): Promise<boolean> {
+    return true;
+  }
+
   // --- Projects ---
   async createProject(projectData: {
     name: string;

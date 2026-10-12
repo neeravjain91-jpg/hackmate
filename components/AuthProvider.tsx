@@ -8,7 +8,11 @@ interface AuthContextType {
   user: UserProfile | null;
   loading: boolean;
   login: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
-  register: (email: string, pass: string, name: string) => Promise<{ success: boolean; error?: string }>;
+  register: (
+    email: string,
+    pass: string,
+    name: string
+  ) => Promise<{ success: boolean; requiresVerification?: boolean; message?: string; error?: string }>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<void>;
 }
@@ -75,6 +79,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const data = await res.json();
       if (!res.ok) {
         return { success: false, error: data.error || 'Registration failed' };
+      }
+      if (data.requiresVerification) {
+        return {
+          success: true,
+          requiresVerification: true,
+          message:
+            data.message ||
+            'Registration successful. Please check your email to verify your account before logging in.',
+        };
       }
       setUser(data.user);
       return { success: true };

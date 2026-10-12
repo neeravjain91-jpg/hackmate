@@ -1112,4 +1112,183 @@ describe('PostgreSQL Integration Test Harness - HackMate Workspace', () => {
       ).rejects.toThrow(/permission denied for table workspace_nodes/);
     });
   });
+
+  describe('PostgreSQL check_rate_limit & cleanup_expired_rate_limits RPC', () => {
+    it('denies execution of check_rate_limit to anon and authenticated roles (42501)', async () => {
+      // 1. As anon role
+      await expect(
+        withAnon(testClient, async (c) => {
+          await c.query(`SELECT public.check_rate_limit('test-key', 5, 60);`);
+        })
+      ).rejects.toThrow(/permission denied for function check_rate_limit/);
+
+      // 2. As authenticated role
+      await expect(
+        withUser(testClient, USER_1, async (c) => {
+          await c.query(`SELECT public.check_rate_limit('test-key', 5, 60);`);
+        })
+      ).rejects.toThrow(/permission denied for function check_rate_limit/);
+    });
+
+    it('denies execution of cleanup_expired_rate_limits to anon and authenticated roles (42501)', async () => {
+      // 1. As anon role
+      await expect(
+        withAnon(testClient, async (c) => {
+          await c.query(`SELECT public.cleanup_expired_rate_limits();`);
+        })
+      ).rejects.toThrow(/permission denied for function cleanup_expired_rate_limits/);
+
+      // 2. As authenticated role
+      await expect(
+        withUser(testClient, USER_1, async (c) => {
+          await c.query(`SELECT public.cleanup_expired_rate_limits();`);
+        })
+      ).rejects.toThrow(/permission denied for function cleanup_expired_rate_limits/);
+    });
+
+    it('allows execution to service_role and enforces rate limit thresholds', async () => {
+      await withServiceRole(testClient, async (c) => {
+        const key = `service-key-${crypto.randomUUID()}`;
+
+        // 1st request (count 1, remaining 2)
+        const res1 = await c.query(`SELECT public.check_rate_limit($1, 3, 60) as result;`, [key]);
+        const r1 = res1.rows[0].result;
+        expect(r1.allowed).toBe(true);
+        expect(r1.remaining).toBe(2);
+
+        // 2nd request (count 2, remaining 1)
+        const res2 = await c.query(`SELECT public.check_rate_limit($1, 3, 60) as result;`, [key]);
+        const r2 = res2.rows[0].result;
+        expect(r2.allowed).toBe(true);
+        expect(r2.remaining).toBe(1);
+
+        // 3rd request (count 3, remaining 0)
+        const res3 = await c.query(`SELECT public.check_rate_limit($1, 3, 60) as result;`, [key]);
+        const r3 = res3.rows[0].result;
+        expect(r3.allowed).toBe(true);
+        expect(r3.remaining).toBe(0);
+
+        // 4th request (count 4, blocked!)
+        const res4 = await c.query(`SELECT public.check_rate_limit($1, 3, 60) as result;`, [key]);
+        const r4 = res4.rows[0].result;
+        expect(r4.allowed).toBe(false);
+        expect(r4.remaining).toBe(0);
+      });
+    });
+
+    it('validates parameters strictly in check_rate_limit', async () => {
+      // Empty key
+      await expect(
+        withServiceRole(testClient, (c) => c.query(`SELECT public.check_rate_limit('', 5, 60);`))
+      ).rejects.toThrow(/Invalid rate limit key: must be between 1 and 255 characters/);
+
+      // Key > 255 chars
+      const longKey = 'a'.repeat(256);
+      await expect(
+        withServiceRole(testClient, (c) => c.query(`SELECT public.check_rate_limit($1, 5, 60);`, [longKey]))
+      ).rejects.toThrow(/Invalid rate limit key: must be between 1 and 255 characters/);
+
+      // Max < 1
+      await expect(
+        withServiceRole(testClient, (c) => c.query(`SELECT public.check_rate_limit('valid-key', 0, 60);`))
+      ).rejects.toThrow(/Invalid rate limit max: must be between 1 and 10000/);
+
+      // Max > 10000
+      await expect(
+        withServiceRole(testClient, (c) => c.query(`SELECT public.check_rate_limit('valid-key', 10001, 60);`))
+      ).rejects.toThrow(/Invalid rate limit max: must be between 1 and 10000/);
+
+      // Window < 1
+      await expect(
+        withServiceRole(testClient, (c) => c.query(`SELECT public.check_rate_limit('valid-key', 5, 0);`))
+      ).rejects.toThrow(/Invalid rate limit window: must be between 1 and 86400 seconds/);
+
+      // Window > 86400
+      await expect(
+        withServiceRole(testClient, (c) => c.query(`SELECT public.check_rate_limit('valid-key', 5, 86401);`))
+      ).rejects.toThrow(/Invalid rate limit window: must be between 1 and 86400 seconds/);
+    });
+
+    it('guarantees concurrency safety without race conditions on simultaneous requests', async () => {
+      const concurrentKey = `concurrent-${crypto.randomUUID()}`;
+      const numClients = 5;
+      const clients: Client[] = [];
+
+      try {
+        for (let i = 0; i < numClients; i++) {
+          clients.push(await createTestRunnerClient());
+        }
+
+        // Fire 5 simultaneous check_rate_limit requests with max = 10
+        const results = await Promise.all(
+          clients.map((c) =>
+            withServiceRole(c, async (client) => {
+              const res = await client.query(
+                `SELECT public.check_rate_limit($1, 10, 60) as result;`,
+                [concurrentKey]
+              );
+              return res.rows[0].result;
+            })
+          )
+        );
+
+        // Verify all 5 were allowed
+        results.forEach((r) => expect(r.allowed).toBe(true));
+
+        // Verify remaining counts are distinct: 9, 8, 7, 6, 5 (no duplicates like duplicate count=1)
+        const remainings = results.map((r) => r.remaining).sort((a, b) => a - b);
+        expect(remainings).toEqual([5, 6, 7, 8, 9]);
+
+        // Verify in DB that final count is exactly 5
+        const dbRes = await adminClient.query(
+          `SELECT count FROM public.auth_rate_limits WHERE key = $1;`,
+          [concurrentKey]
+        );
+        expect(dbRes.rows[0].count).toBe(5);
+      } finally {
+        for (const c of clients) {
+          try {
+            await c.end();
+          } catch {}
+        }
+      }
+    });
+
+    it('prunes expired rate limit entries via cleanup_expired_rate_limits', async () => {
+      // Insert an expired record (> 1 hour old)
+      const expiredKey = `expired-${crypto.randomUUID()}`;
+      await adminClient.query(`
+        INSERT INTO public.auth_rate_limits (key, count, reset_at)
+        VALUES ($1, 5, clock_timestamp() - INTERVAL '2 hours');
+      `, [expiredKey]);
+
+      // Insert a fresh active record
+      const activeKey = `active-${crypto.randomUUID()}`;
+      await adminClient.query(`
+        INSERT INTO public.auth_rate_limits (key, count, reset_at)
+        VALUES ($1, 1, clock_timestamp() + INTERVAL '1 hour');
+      `, [activeKey]);
+
+      // Run cleanup_expired_rate_limits and commit transaction
+      const deleted = await withServiceRole(testClient, async (c) => {
+        const cleanupRes = await c.query(`SELECT public.cleanup_expired_rate_limits() as deleted;`);
+        return cleanupRes.rows[0].deleted;
+      });
+      expect(deleted).toBeGreaterThanOrEqual(1);
+
+      // Verify expired record is deleted
+      const checkExpired = await adminClient.query(
+        `SELECT 1 FROM public.auth_rate_limits WHERE key = $1;`,
+        [expiredKey]
+      );
+      expect(checkExpired.rows).toHaveLength(0);
+
+      // Verify active record is preserved
+      const checkActive = await adminClient.query(
+        `SELECT 1 FROM public.auth_rate_limits WHERE key = $1;`,
+        [activeKey]
+      );
+      expect(checkActive.rows).toHaveLength(1);
+    });
+  });
 });

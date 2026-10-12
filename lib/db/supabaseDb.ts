@@ -40,10 +40,11 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
   }
 
   private getAuthClient(): SupabaseClient {
-    const client = this.authClientFactory();
+    const client = this.authClientFactory ? this.authClientFactory() : null;
     if (!client) {
-      // Fall back to adminClient only if auth client is completely unavailable (e.g. mock test harnesses)
-      return this.client;
+      throw new Error(
+        'STORAGE CONFIGURATION ERROR: Supabase authentication client could not be initialized. Please configure valid NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY environment variables.'
+      );
     }
     return client;
   }
@@ -71,38 +72,125 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
     return data as UserProfile;
   }
 
-  async createUser(userData: {
-    id?: string;
-    email: string;
-    name: string;
-    password?: string;
-    password_hash?: string;
-    avatar_url?: string | null;
-  }): Promise<UserProfile> {
-    let userId = userData.id;
+  async isUserVerified(userId: string): Promise<boolean> {
+    if (process.env.AUTH_AUTO_CONFIRM_EMAILS === 'true') {
+      return true;
+    }
+    if (this.client.auth?.admin?.getUserById) {
+      try {
+        const { data, error } = await this.client.auth.admin.getUserById(userId);
+        if (error || !data?.user) return false;
+        return Boolean(data.user.email_confirmed_at || data.user.confirmed_at);
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
 
-    if (!userId && userData.password && this.client.auth?.admin?.createUser) {
-      // Deliberate email-verification policy:
-      // In production for a student application, require email verification unless explicitly bypassed via AUTH_AUTO_CONFIRM_EMAILS=true.
-      // In test/local environments, auto-confirm to facilitate automated suites.
+  async createUser(
+    userData: {
+      id?: string;
+      email: string;
+      name: string;
+      password?: string;
+      password_hash?: string;
+      avatar_url?: string | null;
+    },
+    options?: {
+      emailRedirectTo?: string;
+    }
+  ): Promise<UserProfile> {
+    let userId = userData.id;
+    let requiresVerification = false;
+
+    if (!userId && userData.password) {
       const shouldAutoConfirm =
         process.env.AUTH_AUTO_CONFIRM_EMAILS === 'true' ||
         (process.env.NODE_ENV !== 'production' && process.env.AUTH_AUTO_CONFIRM_EMAILS !== 'false');
 
-      const { data: authData, error: authError } = await this.client.auth.admin.createUser({
-        email: userData.email.toLowerCase(),
-        password: userData.password,
-        email_confirm: shouldAutoConfirm,
-        user_metadata: {
-          name: userData.name,
-          avatar_url: userData.avatar_url || null,
-        },
-      });
+      if (!shouldAutoConfirm) {
+        // Genuine public signup initiating email verification
+        const authClient = this.getAuthClient();
+        if (!authClient.auth?.signUp) {
+          throw new Error('Supabase authentication client does not support signUp.');
+        }
 
-      if (authError || !authData?.user) {
-        throw new Error(authError?.message || 'Failed to create user in Supabase Auth.');
+        const emailRedirectTo =
+          options?.emailRedirectTo ||
+          `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/auth/callback`;
+
+        const { data: signUpData, error: signUpError } = await authClient.auth.signUp({
+          email: userData.email.toLowerCase(),
+          password: userData.password,
+          options: {
+            data: {
+              name: userData.name,
+              avatar_url: userData.avatar_url || null,
+            },
+            emailRedirectTo,
+          },
+        });
+
+        if (signUpError) {
+          throw new Error(signUpError.message || 'Failed to register with Supabase Auth.');
+        }
+
+        if (!signUpData?.user) {
+          throw new Error('Supabase Auth registration did not return a user.');
+        }
+
+        // In Supabase, if email is already registered and confirmed, identities is empty array []
+        if (signUpData.user.identities && signUpData.user.identities.length === 0) {
+          throw new Error('An account with this email address already exists.');
+        }
+
+        userId = signUpData.user.id;
+        const isConfirmed = Boolean(
+          signUpData.user.email_confirmed_at ||
+          signUpData.user.confirmed_at ||
+          signUpData.session
+        );
+        requiresVerification = !isConfirmed;
+      } else if (this.client.auth?.admin?.createUser) {
+        // Auto-confirm flow for local integration tests or administrative override
+        const { data: authData, error: authError } = await this.client.auth.admin.createUser({
+          email: userData.email.toLowerCase(),
+          password: userData.password,
+          email_confirm: true,
+          user_metadata: {
+            name: userData.name,
+            avatar_url: userData.avatar_url || null,
+          },
+        });
+
+        if (authError || !authData?.user) {
+          throw new Error(authError?.message || 'Failed to create user in Supabase Auth.');
+        }
+        userId = authData.user.id;
+        requiresVerification = false;
+      } else {
+        const authClient = this.getAuthClient();
+        if (!authClient.auth?.signUp) {
+          throw new Error('Supabase authentication client does not support signUp.');
+        }
+        const { data: signUpData, error: signUpError } = await authClient.auth.signUp({
+          email: userData.email.toLowerCase(),
+          password: userData.password,
+          options: {
+            data: {
+              name: userData.name,
+              avatar_url: userData.avatar_url || null,
+            },
+          },
+        });
+
+        if (signUpError || !signUpData?.user) {
+          throw new Error(signUpError?.message || 'Failed to register with Supabase Auth.');
+        }
+        userId = signUpData.user.id;
+        requiresVerification = false;
       }
-      userId = authData.user.id;
     }
 
     if (!userId) {
@@ -131,7 +219,11 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       }
       throw new Error(`Failed to create profile: ${error.message}`);
     }
-    return data as UserProfile;
+
+    return {
+      ...(data as UserProfile),
+      requiresVerification,
+    };
   }
 
   async authenticateUser(email: string, password: string): Promise<UserProfile | null> {
@@ -160,6 +252,16 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       return null;
     }
 
+    // Check verification status on user object if returned
+    const isConfirmed = Boolean(
+      data.user.email_confirmed_at ||
+      data.user.confirmed_at ||
+      process.env.AUTH_AUTO_CONFIRM_EMAILS === 'true'
+    );
+    if (!isConfirmed) {
+      throw new Error('Please verify your email address before logging in. A confirmation email was sent to your inbox.');
+    }
+
     let profile = await this.getUserById(data.user.id);
     if (!profile) {
       // Recover missing profile from auth user metadata
@@ -172,16 +274,14 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
           name,
           avatar_url,
         });
-      } catch {
-        // Fallback to in-memory profile if profile creation fails
-        profile = {
-          id: data.user.id,
-          email: data.user.email || email.toLowerCase(),
-          name,
-          avatar_url,
-          created_at: data.user.created_at || new Date().toISOString(),
-        };
+      } catch (err: any) {
+        // Operational failure: Fail closed! Never return an in-memory profile
+        throw new Error(`Failed to recover user profile in database: ${err.message}`);
       }
+    }
+
+    if (!profile) {
+      throw new Error('Failed to load user profile after authentication.');
     }
 
     return profile;

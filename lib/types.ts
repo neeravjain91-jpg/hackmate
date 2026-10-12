@@ -17,6 +17,8 @@ export interface UserProfile {
   name: string;
   avatar_url?: string | null;
   created_at: string;
+  email_confirmed?: boolean;
+  requiresVerification?: boolean;
 }
 
 export interface UserAuthRecord extends UserProfile {

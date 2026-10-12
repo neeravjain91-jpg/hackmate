@@ -162,6 +162,8 @@ CREATE TABLE IF NOT EXISTS public.auth_rate_limits (
 
 ALTER TABLE public.auth_rate_limits ENABLE ROW LEVEL SECURITY;
 
+CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_reset ON public.auth_rate_limits(reset_at);
+
 CREATE OR REPLACE FUNCTION public.check_rate_limit(
     p_key TEXT,
     p_max INT,
@@ -170,34 +172,48 @@ CREATE OR REPLACE FUNCTION public.check_rate_limit(
 RETURNS JSONB AS $$
 DECLARE
     v_now TIMESTAMPTZ := clock_timestamp();
-    v_record public.auth_rate_limits%ROWTYPE;
+    v_count INT;
+    v_reset_at TIMESTAMPTZ;
     v_allowed BOOLEAN;
     v_remaining INT;
-    v_reset_at TIMESTAMPTZ;
 BEGIN
-    SELECT * INTO v_record FROM public.auth_rate_limits WHERE key = p_key FOR UPDATE;
+    -- Validate parameters
+    IF p_key IS NULL OR length(trim(p_key)) < 1 OR length(p_key) > 255 THEN
+        RAISE EXCEPTION 'Invalid rate limit key: must be between 1 and 255 characters';
+    END IF;
 
-    IF NOT FOUND OR v_now > v_record.reset_at THEN
-        v_reset_at := v_now + (p_window_seconds || ' seconds')::interval;
-        INSERT INTO public.auth_rate_limits (key, count, reset_at)
-        VALUES (p_key, 1, v_reset_at)
-        ON CONFLICT (key) DO UPDATE
-            SET count = 1,
-                reset_at = EXCLUDED.reset_at;
+    IF p_max IS NULL OR p_max < 1 OR p_max > 10000 THEN
+        RAISE EXCEPTION 'Invalid rate limit max: must be between 1 and 10000';
+    END IF;
+
+    IF p_window_seconds IS NULL OR p_window_seconds < 1 OR p_window_seconds > 86400 THEN
+        RAISE EXCEPTION 'Invalid rate limit window: must be between 1 and 86400 seconds';
+    END IF;
+
+    -- Concurrency-safe atomic UPSERT:
+    -- If key does not exist: INSERT count=1 and reset_at = v_now + window
+    -- If key exists and expired (reset_at < v_now): start new window count=1 and reset_at = v_now + window
+    -- If key exists and active (reset_at >= v_now): increment count, keep existing reset_at
+    INSERT INTO public.auth_rate_limits (key, count, reset_at)
+    VALUES (p_key, 1, v_now + (p_window_seconds || ' seconds')::interval)
+    ON CONFLICT (key) DO UPDATE
+    SET count = CASE
+            WHEN public.auth_rate_limits.reset_at < v_now THEN 1
+            ELSE public.auth_rate_limits.count + 1
+        END,
+        reset_at = CASE
+            WHEN public.auth_rate_limits.reset_at < v_now THEN v_now + (p_window_seconds || ' seconds')::interval
+            ELSE public.auth_rate_limits.reset_at
+        END
+    RETURNING public.auth_rate_limits.count, public.auth_rate_limits.reset_at
+    INTO v_count, v_reset_at;
+
+    IF v_count <= p_max THEN
         v_allowed := TRUE;
-        v_remaining := GREATEST(0, p_max - 1);
+        v_remaining := p_max - v_count;
     ELSE
-        v_reset_at := v_record.reset_at;
-        IF v_record.count >= p_max THEN
-            v_allowed := FALSE;
-            v_remaining := 0;
-        ELSE
-            UPDATE public.auth_rate_limits
-            SET count = count + 1
-            WHERE key = p_key;
-            v_allowed := TRUE;
-            v_remaining := GREATEST(0, p_max - (v_record.count + 1));
-        END IF;
+        v_allowed := FALSE;
+        v_remaining := 0;
     END IF;
 
     RETURN jsonb_build_object(
@@ -206,10 +222,30 @@ BEGIN
         'reset_at', extract(epoch from v_reset_at) * 1000
     );
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
-GRANT EXECUTE ON FUNCTION public.check_rate_limit(TEXT, INT, INT) TO anon, authenticated, service_role, test_runner;
+-- Prune expired rate limit entries older than 1 hour
+CREATE OR REPLACE FUNCTION public.cleanup_expired_rate_limits()
+RETURNS INT AS $$
+DECLARE
+    v_deleted INT;
+BEGIN
+    DELETE FROM public.auth_rate_limits
+    WHERE reset_at < clock_timestamp() - INTERVAL '1 hour';
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+-- Revoke execution from PUBLIC, anon, and authenticated
+REVOKE ALL ON FUNCTION public.check_rate_limit(TEXT, INT, INT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.cleanup_expired_rate_limits() FROM PUBLIC, anon, authenticated;
+
+-- Grant execution to service_role, test_runner, postgres
+GRANT EXECUTE ON FUNCTION public.check_rate_limit(TEXT, INT, INT) TO service_role, test_runner, postgres;
+GRANT EXECUTE ON FUNCTION public.cleanup_expired_rate_limits() TO service_role, test_runner, postgres;
 GRANT ALL ON TABLE public.auth_rate_limits TO test_runner, postgres, service_role;
+
 
 
 

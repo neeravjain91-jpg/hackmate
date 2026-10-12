@@ -1,4 +1,5 @@
 import { getSupabaseAdminClient } from '@/lib/supabase';
+import net from 'net';
 
 interface RateLimitRecord {
   count: number;
@@ -19,39 +20,35 @@ export interface RateLimitResult {
 }
 
 /**
- * Validates whether an IP address matches IPv4 or IPv6 format.
+ * Validates whether an IP address matches IPv4 or IPv6 format using Node's net.isIP().
+ * Returns true if valid IPv4 (4) or IPv6 (6), false otherwise (0).
  */
-function isValidIp(ip: string): boolean {
+export function isValidIp(ip: string | null | undefined): boolean {
   if (!ip || typeof ip !== 'string') return false;
-  // IPv4 format check
-  const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-  if (ipv4Regex.test(ip)) return true;
-  // Basic IPv6 format check
-  const ipv6Regex = /^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}$|^::1$|^::$/;
-  return ipv6Regex.test(ip);
+  return net.isIP(ip.trim()) !== 0;
 }
 
 /**
- * Extracts and sanitizes the client IP address from trusted headers.
- * Evaluates x-vercel-forwarded-for, x-forwarded-for (first client hop), and x-real-ip.
+ * Extracts and sanitizes the client IP address from trusted hosting proxy headers.
+ * Trusts ONLY hosting proxy headers (x-vercel-forwarded-for, x-real-ip).
+ * Avoids mapping valid IPv6 to fallback IP.
+ * Does NOT trust raw unverified x-forwarded-for.
  */
 export function getClientIp(request: Request): string {
   const vercelIp = request.headers.get('x-vercel-forwarded-for');
-  if (vercelIp && isValidIp(vercelIp.trim())) {
-    return vercelIp.trim();
-  }
-
-  const forwarded = request.headers.get('x-forwarded-for');
-  if (forwarded) {
-    const clientIp = forwarded.split(',')[0].trim();
-    if (isValidIp(clientIp)) {
-      return clientIp;
+  if (vercelIp) {
+    const candidate = vercelIp.split(',')[0].trim();
+    if (isValidIp(candidate)) {
+      return candidate;
     }
   }
 
   const realIp = request.headers.get('x-real-ip');
-  if (realIp && isValidIp(realIp.trim())) {
-    return realIp.trim();
+  if (realIp) {
+    const candidate = realIp.split(',')[0].trim();
+    if (isValidIp(candidate)) {
+      return candidate;
+    }
   }
 
   return '127.0.0.1';
@@ -144,6 +141,15 @@ export async function checkRateLimit(
         resetAt: Date.now() + windowMs,
       };
     }
+  }
+
+  // In production or on Vercel, persistent storage is required: fail closed
+  if (process.env.NODE_ENV === 'production' || process.env.VERCEL === '1') {
+    return {
+      allowed: false,
+      remaining: 0,
+      resetAt: Date.now() + windowMs,
+    };
   }
 
   // 3. In-memory sliding window fallback (Local development and unit tests)
