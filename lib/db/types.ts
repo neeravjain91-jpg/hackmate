@@ -34,7 +34,7 @@ export interface IDatabaseAdapter {
     }
   ): Promise<UserProfile>;
   authenticateUser(email: string, password: string): Promise<UserProfile | null>;
-  isUserVerified?(userId: string): Promise<boolean>;
+  isUserVerified(userId: string): Promise<boolean>;
 
   // Project Management
   createProject(data: {
