@@ -156,6 +156,11 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
+
+### Rate-limit cleanup schedule
+
+`vercel.json` defines an hourly Vercel Cron invocation for `/api/cron/cleanup-rate-limits` (`0 * * * *`). The repository schedule has not been independently verified as active in the deployed Vercel project; check Project Settings > Cron Jobs after deployment. The endpoint requires exact `Authorization: Bearer <CRON_SECRET>` and does not trust `x-vercel-cron`. The rate limiter also attempts bounded opportunistic cleanup at most every 15 minutes per warm instance when the Supabase admin client is available.
+
 ## 5. Verification and Testing
 
 ### Run Automated Test Suite
@@ -200,25 +205,24 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
    - In the Supabase Storage dashboard, create a private bucket named `hackmate-contributions`.
 
 2. **Configure Supabase Auth Settings & Email Templates**:
-   In the Supabase Project Dashboard, configure the following authentication settings:
 
-   * **Site URL & Redirect URLs Allowlist** (**Authentication > URL Configuration**):
-     - **Site URL**: `https://try-kohl-mu.vercel.app` (or your canonical production domain).
-     - **Redirect URLs (Allowlist)**:
-       - `https://try-kohl-mu.vercel.app/api/auth/callback`
-       - `http://localhost:3000/api/auth/callback` (for local development)
-   
-   * **Confirmation Email Template** (**Authentication > Email Templates > Confirm signup**):
-     - **Subject**: `Confirm Your HackMate Registration`
-     - **Message (HTML)**:
-       ```html
-       <h2>Confirm your HackMate account</h2>
-       <p>Welcome to HackMate! Please verify your email address to complete your registration:</p>
-       <p><a href="{{ .SiteURL }}/api/auth/callback?token_hash={{ .TokenHash }}&type=email">Verify Email</a></p>
-       <p>If you did not sign up for HackMate, you can safely ignore this email.</p>
-       ```
-     > [!IMPORTANT]
-     > HackMate's serverless architecture on Vercel requires the `token_hash` OTP verification flow. The email template must link directly to `{{ .SiteURL }}/api/auth/callback?token_hash={{ .TokenHash }}&type=email`. This sends the cryptographic token hash directly to `/api/auth/callback`, which validates it via `supabase.auth.verifyOtp({ token_hash, type: 'email' })`. This is completely stateless and succeeds across separate serverless instances and external devices. PKCE code exchange (`?code=...`) is unsupported on serverless without sticky sessions and will be rejected.
+   In Supabase Dashboard > **Authentication > URL Configuration**:
+
+   * **Site URL**: set to the exact canonical app origin in `NEXT_PUBLIC_APP_URL`, e.g. `https://your-production-domain.example`; do not retain a sample hostname unless it is the actual deployment domain.
+   * **Redirect URLs allowlist**: add `https://your-production-domain.example/api/auth/callback` and `http://localhost:3000/api/auth/callback` for local development. Add exact preview callback URLs if needed. The allowlist must include the `emailRedirectTo` passed to `signUp`.
+
+   In **Authentication > Email Templates > Confirm signup**, use this action link:
+
+   ```html
+   <h2>Confirm your HackMate account</h2>
+   <p>Verify your email address to complete registration:</p>
+   <p><a href="{{ .SiteURL }}/api/auth/callback?token_hash={{ .TokenHash }}&type=email">Verify Email</a></p>
+   ```
+
+   Required callback URL: `/api/auth/callback?token_hash=<TokenHash>&type=email`; the handler calls `verifyOtp({ token_hash, type: 'email' })`. The stock `{{ .ConfirmationURL }}` link is unsupported because it first targets Supabase's verify endpoint. PKCE `?code=...` is rejected because verifier-cookie persistence is not implemented. Disable email link tracking/rewriting if it changes this URL.
+
+   Configure these Vercel environment variables in every deployed environment: `NEXT_PUBLIC_APP_URL` (canonical HTTPS origin matching Supabase Site URL), `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, server-only `SUPABASE_SERVICE_ROLE_KEY`, `STORAGE_DRIVER=supabase`, `SUPABASE_STORAGE_BUCKET=hackmate-contributions`, `AUTH_SECRET` (cryptographically random, at least 32 bytes), and `CRON_SECRET` (random, at least 16 characters). Do not set `AUTH_AUTO_CONFIRM_EMAILS=true` in normal production.
+
 
 3. **Execute Database Migrations in the Supabase SQL Editor**:
    In your browser, open the Supabase dashboard for your project, navigate to the **SQL Editor**, and execute the full contents of each file in this exact sequential order:
