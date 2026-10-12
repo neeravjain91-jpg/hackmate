@@ -8,11 +8,9 @@ import { getCanonicalAppUrl } from '@/lib/auth/url';
  * Supabase Auth Email Verification Callback Route.
  *
  * Handles verification callbacks across separate serverless instances.
- * Supports:
- * 1. Stateless OTP token-hash flow (type=signup/email, token_hash=...)
- *    Compatible with standard Supabase email templates and fully functional
- *    across distinct serverless instances and devices without shared state.
- * 2. PKCE code exchange flow (code=...) with request-scoped client.
+ * Uses stateless token-hash email confirmation (type=email, token_hash=...).
+ * Requires the custom Supabase confirmation template documented in README.
+ * PKCE code exchange is intentionally rejected because no verifier-cookie persistence is implemented.
  *
  * Security Guarantees:
  * - Redirects stay strictly on the validated canonical origin.
@@ -20,15 +18,8 @@ import { getCanonicalAppUrl } from '@/lib/auth/url';
  * - Never leaks internal database errors in redirect query strings.
  * - Confirms existing profile ownership before authenticating.
  */
-const SUPPORTED_EMAIL_OTP_TYPES = [
-  'email',
-  'signup',
-  'invite',
-  'magiclink',
-  'recovery',
-  'email_change',
-] as const;
-type SupportedEmailOtpType = typeof SUPPORTED_EMAIL_OTP_TYPES[number];
+// Signup confirmation only: reject deprecated/inappropriate OTP types.
+const SUPPORTED_EMAIL_OTP_TYPES = ['email'] as const;
 
 export async function GET(request: NextRequest) {
   const requestUrl = new URL(request.url);
@@ -98,7 +89,7 @@ export async function GET(request: NextRequest) {
     // Stateless Token Hash / OTP Verification Flow (Supported across serverless instances)
     const { data, error } = await authClient.auth.verifyOtp({
       token_hash: tokenHash.trim(),
-      type: typeParam as SupportedEmailOtpType,
+      type: 'email',
     });
     if (error || !data?.user) {
       return NextResponse.redirect(
@@ -158,7 +149,12 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // 4. Issue session cookie ONLY after verified persistence
+    if (typeof db.isUserVerified !== 'function' || !(await db.isUserVerified(verifiedUser.id))) {
+      return NextResponse.redirect(
+        new URL('/login?error=verification_status_unavailable&message=Unable+to+confirm+email+verification+status.', canonicalOrigin)
+      );
+    }
+
     const token = createSessionToken(verifiedUser.id);
     const response = NextResponse.redirect(
       new URL('/dashboard?verified=true', canonicalOrigin)
