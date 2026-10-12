@@ -1495,8 +1495,12 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
         const res = await cronCleanupHandler(req);
         expect([200, 503]).toContain(res.status);
         const data = await res.json();
-        if (res.status === 200) expect(data.success).toBe(true);
-        expect(typeof data.deleted).toBe('number');
+        if (res.status === 200) {
+          expect(data.success).toBe(true);
+          expect(typeof data.deleted).toBe('number');
+        } else {
+          expect(data.error).toContain('cleanup is temporarily unavailable');
+        }
       } finally {
         if (originalSecret !== undefined) process.env.CRON_SECRET = originalSecret;
         else delete process.env.CRON_SECRET;
