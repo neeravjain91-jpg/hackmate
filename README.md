@@ -216,10 +216,10 @@ If you choose to connect HackMate to a live Supabase project (`STORAGE_DRIVER=su
    ```html
    <h2>Confirm your HackMate account</h2>
    <p>Verify your email address to complete registration:</p>
-   <p><a href="{{ .SiteURL }}/api/auth/callback?token_hash={{ .TokenHash }}&type=email">Verify Email</a></p>
+   <p><a href="{{ or .RedirectTo (print .SiteURL "/api/auth/callback") }}?token_hash={{ .TokenHash }}&type=email">Verify Email</a></p>
    ```
 
-   Required callback URL: `/api/auth/callback?token_hash=<TokenHash>&type=email`; the handler calls `verifyOtp({ token_hash, type: 'email' })`. The stock `{{ .ConfirmationURL }}` link is unsupported because it first targets Supabase's verify endpoint. PKCE `?code=...` is rejected because verifier-cookie persistence is not implemented. Disable email link tracking/rewriting if it changes this URL.
+   Required callback URL: uses the exact callback URL passed via `emailRedirectTo` (`{{ or .RedirectTo (print .SiteURL "/api/auth/callback") }}`) with `?token_hash={{ .TokenHash }}&type=email`; the handler calls `verifyOtp({ token_hash, type: 'email' })`. The stock `{{ .ConfirmationURL }}` link is unsupported because it first targets Supabase's verify endpoint. PKCE `?code=...` is rejected because verifier-cookie persistence is not implemented. Disable email link tracking/rewriting if it changes this URL.
 
    Configure these Vercel environment variables in every deployed environment: `NEXT_PUBLIC_APP_URL` (canonical HTTPS origin matching Supabase Site URL), `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, server-only `SUPABASE_SERVICE_ROLE_KEY`, `STORAGE_DRIVER=supabase`, `SUPABASE_STORAGE_BUCKET=hackmate-contributions`, `AUTH_SECRET` (cryptographically random, at least 32 bytes), and `CRON_SECRET` (random, at least 16 characters). Do not set `AUTH_AUTO_CONFIRM_EMAILS=true` in normal production.
 
