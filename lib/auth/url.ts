@@ -16,11 +16,12 @@
 export function getCanonicalAppUrl(): string {
   const isProduction =
     process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
-  const configured = process.env.NEXT_PUBLIC_APP_URL;
+  const rawConfigured = process.env.NEXT_PUBLIC_APP_URL;
+  const configured = rawConfigured?.trim().replace(/^["']|["']$/g, '').trim();
 
   if (configured) {
     try {
-      const parsed = new URL(configured.trim());
+      const parsed = new URL(configured);
       const allowedProtocol =
         parsed.protocol === 'https:' ||
         (!isProduction && parsed.protocol === 'http:');

@@ -60,4 +60,10 @@ describe('canonical application URL configuration', () => {
     setEnv('NEXT_PUBLIC_APP_URL', 'https://hackmate.example/path?ignored=yes');
     expect(getCanonicalAppUrl()).toBe('https://hackmate.example');
   });
+
+  it('normalizes quoted production HTTPS URLs', () => {
+    setEnv('NODE_ENV', 'production');
+    setEnv('NEXT_PUBLIC_APP_URL', '"https://hackmate.example/path"');
+    expect(getCanonicalAppUrl()).toBe('https://hackmate.example');
+  });
 });

@@ -89,6 +89,16 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
       const storage = getStorageAdapter();
       expect(storage).toBeInstanceOf(LocalStorageAdapter);
     });
+
+    it('normalizes driver strings containing quotes or surrounding whitespace', () => {
+      process.env.STORAGE_DRIVER = '  "local"  ';
+      delete process.env.VERCEL;
+      delete process.env.VERCEL_ENV;
+      expect(resolveStorageDriver()).toBe('local');
+
+      process.env.STORAGE_DRIVER = "'local'";
+      expect(resolveStorageDriver()).toBe('local');
+    });
   });
 
   describe('Unsupported driver validation', () => {
@@ -217,6 +227,21 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
 
       expect(() => resolveStorageDriver()).toThrowError(
         'STORAGE CONFIGURATION ERROR: Unsupported STORAGE_DRIVER "redis" on Vercel. Vercel deployments require STORAGE_DRIVER=supabase.'
+      );
+    });
+
+    it('normalizes quoted STORAGE_DRIVER strings on Vercel', () => {
+      process.env.VERCEL = '1';
+
+      process.env.STORAGE_DRIVER = ' "supabase" ';
+      expect(resolveStorageDriver()).toBe('supabase');
+
+      process.env.STORAGE_DRIVER = "'supabase'";
+      expect(resolveStorageDriver()).toBe('supabase');
+
+      process.env.STORAGE_DRIVER = '"local"';
+      expect(() => resolveStorageDriver()).toThrowError(
+        /Local JSON storage is ephemeral on Vercel deployments/
       );
     });
 

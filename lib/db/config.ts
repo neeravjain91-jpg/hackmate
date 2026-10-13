@@ -23,19 +23,25 @@ export function isVercelEnvironment(): boolean {
  *    only when explicitly configured.
  * 6. Never prints sensitive environment variable values or secrets in error messages.
  */
+function normalizeDriver(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const unquoted = raw.trim().replace(/^["']|["']$/g, '').trim();
+  return unquoted.length > 0 ? unquoted.toLowerCase() : null;
+}
+
 export function resolveStorageDriver(): StorageDriver {
   const rawDriver = process.env.STORAGE_DRIVER;
   const isVercel = isVercelEnvironment();
   const isProduction = process.env.NODE_ENV === 'production';
+  const normalized = normalizeDriver(rawDriver);
 
   // 1. Vercel deployment safety checks: serverless local filesystem is ephemeral
   if (isVercel) {
-    if (!rawDriver || rawDriver.trim().length === 0) {
+    if (!normalized) {
       throw new Error(
         'STORAGE CONFIGURATION ERROR: Vercel deployments require an explicitly configured persistent database for student collaboration. Please set STORAGE_DRIVER=supabase along with NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.'
       );
     }
-    const normalized = rawDriver.trim().toLowerCase();
     if (normalized === 'local') {
       throw new Error(
         'STORAGE CONFIGURATION ERROR: Local JSON storage is ephemeral on Vercel deployments and cannot be used for student collaboration. Please configure STORAGE_DRIVER=supabase along with NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.'
@@ -51,7 +57,7 @@ export function resolveStorageDriver(): StorageDriver {
   }
 
   // 2. Production configuration checks: prevent silent fallback to local JSON storage
-  if (!rawDriver || rawDriver.trim().length === 0) {
+  if (!normalized) {
     if (isProduction) {
       throw new Error(
         'STORAGE CONFIGURATION ERROR: STORAGE_DRIVER must be explicitly configured in production. Configure "supabase" for persistent cloud storage or "local" for persistent self-hosted volumes.'
@@ -60,8 +66,6 @@ export function resolveStorageDriver(): StorageDriver {
     // Zero-config local development and testing
     return 'local';
   }
-
-  const normalized = rawDriver.trim().toLowerCase();
 
   // 3. Reject unsupported drivers (sanitize output to prevent leaking accidental secrets)
   if (normalized !== 'local' && normalized !== 'supabase') {
