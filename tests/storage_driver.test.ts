@@ -391,5 +391,36 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
       expect(sanitizedString.status).toBe(403);
       expect(sanitizedString.error).toContain('Please verify your email address before logging in');
     });
+
+    it('sanitizeApiError preserves HTTP 403 for unrelated authorization errors without misclassifying as unverified email', () => {
+      const unrelated403: any = new Error('Access denied: You do not have permission to perform this action.');
+      unrelated403.status = 403;
+
+      const sanitized = sanitizeApiError(unrelated403, 'Action failed.');
+      expect(sanitized.status).toBe(403);
+      expect(sanitized.error).toBe('Access denied: You do not have permission to perform this action.');
+      expect(sanitized.error).not.toContain('verify your email address');
+
+      // Also test without error message (uses fallbackMessage)
+      const noMsg403: any = { status: 403 };
+      const sanitizedFallback = sanitizeApiError(noMsg403, 'Forbidden action.');
+      expect(sanitizedFallback.status).toBe(403);
+      expect(sanitizedFallback.error).toBe('Forbidden action.');
+      expect(sanitizedFallback.error).not.toContain('verify your email address');
+    });
+
+    it('sanitizeApiError preserves client 4xx status codes for non-system errors', () => {
+      const notFoundErr: any = new Error('Project not found.');
+      notFoundErr.status = 404;
+      const sanitizedNotFound = sanitizeApiError(notFoundErr, 'Operation failed.');
+      expect(sanitizedNotFound.status).toBe(404);
+      expect(sanitizedNotFound.error).toBe('Project not found.');
+
+      const badReqErr: any = new Error('Invalid request parameters.');
+      badReqErr.status = 400;
+      const sanitizedBadReq = sanitizeApiError(badReqErr, 'Operation failed.');
+      expect(sanitizedBadReq.status).toBe(400);
+      expect(sanitizedBadReq.error).toBe('Invalid request parameters.');
+    });
   });
 });

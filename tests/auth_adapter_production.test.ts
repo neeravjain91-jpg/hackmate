@@ -1872,6 +1872,57 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       expect(res.headers.get('set-cookie')).toBeNull();
     });
 
+    it('returns HTTP 403 with original message and no session cookie when authenticateUser throws an unrelated 403 error', async () => {
+      const forbiddenError: any = new Error('Access denied: organization account suspended.');
+      forbiddenError.status = 403;
+
+      const mockDb: any = {
+        authenticateUser: vi.fn().mockRejectedValue(forbiddenError),
+      };
+      setDatabaseAdapter(mockDb);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'suspended@uni.edu',
+          password: 'password123',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(403);
+      const data = await res.json();
+      expect(data.error).toBe('Access denied: organization account suspended.');
+      expect(data.error).not.toContain('verify your email address');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('returns HTTP 403 with fallback message and no session cookie when authenticateUser throws unrelated 403 without message', async () => {
+      const forbiddenError: any = { status: 403 };
+
+      const mockDb: any = {
+        authenticateUser: vi.fn().mockRejectedValue(forbiddenError),
+      };
+      setDatabaseAdapter(mockDb);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'forbidden@uni.edu',
+          password: 'password123',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(403);
+      const data = await res.json();
+      expect(data.error).toBe('Login failed.');
+      expect(data.error).not.toContain('verify your email address');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
     it('prevents refreshing session when isUserVerified returns false', async () => {
       const mockDb: any = {
         getUserById: vi.fn().mockResolvedValue({

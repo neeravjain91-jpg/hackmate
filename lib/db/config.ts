@@ -94,13 +94,14 @@ export function sanitizeApiError(
   }
 
   // 2. Expected unverified email condition: 403 Forbidden
-  if (
-    err?.status === 403 ||
+  // Narrowly check explicit provider code or recognizable email-verification messages
+  const isUnconfirmedEmail =
     err?.code === 'email_not_confirmed' ||
     message.includes('verify your email address before logging in') ||
     (message.toLowerCase().includes('email') &&
-      (message.toLowerCase().includes('not confirmed') || message.toLowerCase().includes('unverified')))
-  ) {
+      (message.toLowerCase().includes('not confirmed') || message.toLowerCase().includes('unverified')));
+
+  if (isUnconfirmedEmail) {
     return {
       error:
         'Please verify your email address before logging in. A confirmation email was sent to your inbox.',
@@ -121,6 +122,21 @@ export function sanitizeApiError(
     return {
       error: 'Database storage service is temporarily unavailable. Please check server configuration.',
       status: 503,
+    };
+  }
+
+  // 4. Preserve client HTTP status codes (e.g. 400, 401, 403, 404, 409) if explicitly specified on the error
+  const customStatus =
+    typeof err?.status === 'number'
+      ? err.status
+      : typeof err?.statusCode === 'number'
+        ? err.statusCode
+        : null;
+
+  if (customStatus && customStatus >= 400 && customStatus < 500) {
+    return {
+      error: message || fallbackMessage,
+      status: customStatus,
     };
   }
 

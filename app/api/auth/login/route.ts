@@ -69,7 +69,6 @@ export async function POST(request: NextRequest) {
   } catch (err: any) {
     const message = typeof err?.message === 'string' ? err.message : '';
     const isUnverified =
-      err?.status === 403 ||
       err?.code === 'email_not_confirmed' ||
       message.includes('verify your email address before logging in') ||
       (message.toLowerCase().includes('email') &&

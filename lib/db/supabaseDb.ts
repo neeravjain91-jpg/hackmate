@@ -245,6 +245,7 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
     if (error) {
       if (
+        (error as any)?.code === 'email_not_confirmed' ||
         error.message?.toLowerCase().includes('not confirmed') ||
         error.message?.toLowerCase().includes('unverified')
       ) {
