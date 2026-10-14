@@ -1,0 +1,52 @@
+name: PostgreSQL Integration & CI Quality Gates
+
+on:
+  push:
+    branches:
+      - feature/common-development-workspace
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  postgres-integration:
+    name: PostgreSQL Integration & Quality Gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Ensure PostgreSQL server binaries
+        run: |
+          if ! command -v initdb >/dev/null 2>&1; then
+            for bin_dir in /usr/lib/postgresql/*/bin; do
+              if [ -x "$bin_dir/initdb" ]; then
+                echo "$bin_dir" >> $GITHUB_PATH
+                break
+              fi
+            done
+          fi
+          initdb --version || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client postgresql && for bin_dir in /usr/lib/postgresql/*/bin; do if [ -x "$bin_dir/initdb" ]; then echo "$bin_dir" >> $GITHUB_PATH; break; fi; done)
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Run PostgreSQL Integration Tests
+        run: npm run test:postgres
+
+      - name: Run Full Test Suite
+        run: npm test
+
+      - name: Production Next.js Build
+        run: npm run build

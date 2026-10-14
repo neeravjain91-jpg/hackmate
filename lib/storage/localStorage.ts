@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { IStorageAdapter, StoredFileResult } from './types';
+import { isVercelEnvironment } from '../db/config';
 
 export function sanitizeFileName(name: string): string {
   // Strip path traversal and forbidden characters
@@ -14,6 +15,11 @@ export class LocalStorageAdapter implements IStorageAdapter {
   private baseDir: string;
 
   constructor(baseDir?: string) {
+    if (isVercelEnvironment()) {
+      throw new Error(
+        'STORAGE CONFIGURATION ERROR: Local disk storage cannot be instantiated in a Vercel environment. Vercel deployments require an explicitly configured persistent object storage (STORAGE_DRIVER=supabase).'
+      );
+    }
     this.baseDir = baseDir || process.env.LOCAL_STORAGE_DIR || path.join(process.cwd(), 'data', 'storage');
     if (!fs.existsSync(this.baseDir)) {
       fs.mkdirSync(this.baseDir, { recursive: true });

@@ -4,15 +4,28 @@ import React, { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/components/AuthProvider';
-import { Layers, AlertCircle, ArrowRight } from 'lucide-react';
+import { Layers, AlertCircle, ArrowRight, MailCheck } from 'lucide-react';
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
   const router = useRouter();
+
+  React.useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('verified') === 'true') {
+        setInfoMessage('Email address verified successfully! You can now sign in to your account.');
+      } else if (params.get('error')) {
+        const msg = params.get('message') || 'Email verification failed or link expired. Please sign in or try again.';
+        setError(msg);
+      }
+    }
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -39,6 +52,13 @@ export default function LoginPage() {
           <h2 className="text-2xl font-bold text-slate-900 tracking-tight">Sign in to HackMate</h2>
           <p className="text-sm text-slate-600 mt-1">Access your hackathon team workspace</p>
         </div>
+
+        {infoMessage && (
+          <div className="mb-6 p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start gap-3 text-emerald-800 text-sm">
+            <MailCheck className="w-5 h-5 flex-shrink-0 text-emerald-600 mt-0.5" />
+            <span>{infoMessage}</span>
+          </div>
+        )}
 
         {error && (
           <div className="mb-6 p-4 rounded-xl bg-rose-50 border border-rose-200 flex items-start gap-3 text-rose-800 text-sm">

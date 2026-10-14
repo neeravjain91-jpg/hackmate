@@ -1,10 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import bcrypt from 'bcryptjs';
-import { getDatabaseAdapter } from '@/lib/db';
+import { getDatabaseAdapter, sanitizeApiError } from '@/lib/db';
 import { createSessionToken, SESSION_COOKIE_NAME } from '@/lib/auth/session';
+import { checkRateLimit, getClientIp } from '@/lib/auth/rateLimit';
+import { getCanonicalAppUrl } from '@/lib/auth/url';
 
 export async function POST(request: NextRequest) {
   try {
+    const clientIp = getClientIp(request);
+    const rateCheck = await checkRateLimit(`register:${clientIp}`, { max: 10, windowMs: 60 * 1000 });
+    if (!rateCheck.allowed) {
+      return NextResponse.json(
+        { error: 'Too many registration attempts. Please try again later.' },
+        {
+          status: 429,
+          headers: {
+            'Retry-After': Math.ceil((rateCheck.resetAt - Date.now()) / 1000).toString(),
+          },
+        }
+      );
+    }
+
     const body = await request.json();
     const { email, password, name } = body;
 
@@ -38,17 +53,34 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const password_hash = await bcrypt.hash(password, salt);
+    const canonicalOrigin = getCanonicalAppUrl();
+    const emailRedirectTo = `${canonicalOrigin}/api/auth/callback`;
 
-    const user = await db.createUser({
-      email,
-      name,
-      password_hash,
-    });
+    const user = await db.createUser(
+      {
+        email,
+        name,
+        password,
+      },
+      {
+        emailRedirectTo,
+      }
+    );
+
+    if (user.requiresVerification) {
+      return NextResponse.json(
+        {
+          user,
+          requiresVerification: true,
+          message:
+            'Registration successful. A verification email has been sent. Please verify your email address before logging in.',
+        },
+        { status: 201 }
+      );
+    }
 
     const token = createSessionToken(user.id);
-    const response = NextResponse.json({ user }, { status: 201 });
+    const response = NextResponse.json({ user, requiresVerification: false }, { status: 201 });
 
     response.cookies.set({
       name: SESSION_COOKIE_NAME,
@@ -62,9 +94,18 @@ export async function POST(request: NextRequest) {
 
     return response;
   } catch (err: any) {
-    return NextResponse.json(
-      { error: err.message || 'Registration failed.' },
-      { status: 500 }
-    );
+    if (
+      err?.message?.toLowerCase().includes('already') ||
+      err?.message?.toLowerCase().includes('registered') ||
+      err?.message?.toLowerCase().includes('duplicate') ||
+      err?.message?.toLowerCase().includes('exists')
+    ) {
+      return NextResponse.json(
+        { error: 'An account with this email address already exists.' },
+        { status: 409 }
+      );
+    }
+    const { error, status } = sanitizeApiError(err, 'Registration failed.');
+    return NextResponse.json({ error }, { status });
   }
 }

@@ -31,12 +31,18 @@ export async function GET(
     const search = searchParams.get('search') || undefined;
     const contributorId = searchParams.get('contributorId') || undefined;
     const taskId = searchParams.get('taskId') || undefined;
+    const limit = searchParams.get('limit') ? parseInt(searchParams.get('limit')!, 10) : undefined;
+    const offset = searchParams.get('offset') ? parseInt(searchParams.get('offset')!, 10) : undefined;
 
-    const contributions = await db.getProjectContributions(projectId, {
-      search,
-      contributorId,
-      taskId,
-    });
+    const contributions = await db.getProjectContributions(
+      projectId,
+      {
+        search,
+        contributorId,
+        taskId,
+      },
+      { limit, offset }
+    );
 
     return NextResponse.json({ contributions });
   } catch (err: any) {
@@ -76,6 +82,16 @@ export async function POST(
 
     if (!title.trim()) {
       return NextResponse.json({ error: 'Contribution title is required.' }, { status: 400 });
+    }
+
+    if (taskId) {
+      const task = await db.getTaskById(taskId);
+      if (!task || task.project_id !== projectId) {
+        return NextResponse.json(
+          { error: 'Specified task does not exist in this project.' },
+          { status: 400 }
+        );
+      }
     }
 
     // Extract uploaded files

@@ -284,3 +284,106 @@ CREATE POLICY "Project members can upload private contribution files"
         bucket_id = 'hackmate-contributions' AND
         is_project_member((storage.foldername(name))[1]::uuid, auth.uid())
     );
+
+-- 9. PERFORMANCE INDEXES (High-Traffic Multi-User Optimization)
+CREATE INDEX IF NOT EXISTS idx_project_members_user ON public.project_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON public.tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to ON public.tasks(assigned_to);
+CREATE INDEX IF NOT EXISTS idx_contributions_project ON public.contributions(project_id);
+CREATE INDEX IF NOT EXISTS idx_contribution_files_project ON public.contribution_files(project_id);
+CREATE INDEX IF NOT EXISTS idx_contribution_files_contrib ON public.contribution_files(contribution_id);
+
+-- 10. AUTH RATE LIMITS TABLE & ATOMIC CHECK RPC
+CREATE TABLE IF NOT EXISTS public.auth_rate_limits (
+    key TEXT PRIMARY KEY,
+    count INT NOT NULL DEFAULT 1,
+    reset_at TIMESTAMPTZ NOT NULL
+);
+
+ALTER TABLE public.auth_rate_limits ENABLE ROW LEVEL SECURITY;
+
+CREATE INDEX IF NOT EXISTS idx_auth_rate_limits_reset ON public.auth_rate_limits(reset_at);
+
+CREATE OR REPLACE FUNCTION public.check_rate_limit(
+    p_key pg_catalog.text,
+    p_max pg_catalog.int4,
+    p_window_seconds pg_catalog.int4
+)
+RETURNS pg_catalog.jsonb AS $$
+DECLARE
+    v_now pg_catalog.timestamptz := pg_catalog.clock_timestamp();
+    v_count pg_catalog.int4;
+    v_reset_at pg_catalog.timestamptz;
+    v_allowed pg_catalog.bool;
+    v_remaining pg_catalog.int4;
+BEGIN
+    -- Validate parameters
+    IF p_key IS NULL OR pg_catalog.length(pg_catalog.btrim(p_key)) < 1 OR pg_catalog.length(p_key) > 255 THEN
+        RAISE EXCEPTION 'Invalid rate limit key: must be between 1 and 255 characters';
+    END IF;
+
+    IF p_max IS NULL OR p_max < 1 OR p_max > 10000 THEN
+        RAISE EXCEPTION 'Invalid rate limit max: must be between 1 and 10000';
+    END IF;
+
+    IF p_window_seconds IS NULL OR p_window_seconds < 1 OR p_window_seconds > 86400 THEN
+        RAISE EXCEPTION 'Invalid rate limit window: must be between 1 and 86400 seconds';
+    END IF;
+
+    -- Concurrency-safe atomic UPSERT:
+    -- If key does not exist: INSERT count=1 and reset_at = v_now + window
+    -- If key exists and expired (reset_at < v_now): start new window count=1 and reset_at = v_now + window
+    -- If key exists and active (reset_at >= v_now): increment count, keep existing reset_at
+    INSERT INTO public.auth_rate_limits (key, count, reset_at)
+    VALUES (p_key, 1, v_now + (p_window_seconds || ' seconds')::pg_catalog.interval)
+    ON CONFLICT (key) DO UPDATE
+    SET count = CASE
+            WHEN public.auth_rate_limits.reset_at < v_now THEN 1
+            ELSE public.auth_rate_limits.count + 1
+        END,
+        reset_at = CASE
+            WHEN public.auth_rate_limits.reset_at < v_now THEN v_now + (p_window_seconds || ' seconds')::pg_catalog.interval
+            ELSE public.auth_rate_limits.reset_at
+        END
+    RETURNING public.auth_rate_limits.count, public.auth_rate_limits.reset_at
+    INTO v_count, v_reset_at;
+
+    IF v_count <= p_max THEN
+        v_allowed := TRUE;
+        v_remaining := p_max - v_count;
+    ELSE
+        v_allowed := FALSE;
+        v_remaining := 0;
+    END IF;
+
+    RETURN pg_catalog.jsonb_build_object(
+        'allowed', v_allowed,
+        'remaining', v_remaining,
+        'reset_at', pg_catalog.date_part('epoch', v_reset_at) * 1000
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
+
+-- Prune expired rate limit entries older than 1 hour
+CREATE OR REPLACE FUNCTION public.cleanup_expired_rate_limits()
+RETURNS pg_catalog.int4 AS $$
+DECLARE
+    v_deleted pg_catalog.int4;
+BEGIN
+    DELETE FROM public.auth_rate_limits
+    WHERE reset_at < pg_catalog.clock_timestamp() - '1 hour'::pg_catalog.interval;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = '';
+
+-- Revoke execution from PUBLIC, anon, and authenticated
+REVOKE ALL ON FUNCTION public.check_rate_limit(pg_catalog.text, pg_catalog.int4, pg_catalog.int4) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.cleanup_expired_rate_limits() FROM PUBLIC, anon, authenticated;
+
+-- Grant execution ONLY to service_role
+GRANT EXECUTE ON FUNCTION public.check_rate_limit(pg_catalog.text, pg_catalog.int4, pg_catalog.int4) TO service_role;
+GRANT EXECUTE ON FUNCTION public.cleanup_expired_rate_limits() TO service_role;
+
+
+
