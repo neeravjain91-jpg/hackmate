@@ -93,7 +93,22 @@ export function sanitizeApiError(
     return { error: message, status: 503 };
   }
 
-  // 2. File system, operating system, or network connection errors: sanitize completely
+  // 2. Expected unverified email condition: 403 Forbidden
+  if (
+    err?.status === 403 ||
+    err?.code === 'email_not_confirmed' ||
+    message.includes('verify your email address before logging in') ||
+    (message.toLowerCase().includes('email') &&
+      (message.toLowerCase().includes('not confirmed') || message.toLowerCase().includes('unverified')))
+  ) {
+    return {
+      error:
+        'Please verify your email address before logging in. A confirmation email was sent to your inbox.',
+      status: 403,
+    };
+  }
+
+  // 3. File system, operating system, or network connection errors: sanitize completely
   const isSystemError =
     Boolean(err?.code && (String(err.code).startsWith('E') || typeof err.errno === 'number')) ||
     message.includes('/var/task') ||

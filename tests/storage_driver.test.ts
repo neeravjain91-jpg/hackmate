@@ -375,5 +375,21 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
       expect(sanitized.error).not.toContain('ENOENT');
       expect(sanitized.error).not.toContain('mkdir');
     });
+
+    it('sanitizeApiError maps unverified email conditions to HTTP 403', () => {
+      const unverifiedError: any = new Error('Please verify your email address before logging in. A confirmation email was sent to your inbox.');
+      unverifiedError.status = 403;
+      unverifiedError.code = 'email_not_confirmed';
+
+      const sanitized = sanitizeApiError(unverifiedError, 'Login failed.');
+      expect(sanitized.status).toBe(403);
+      expect(sanitized.error).toContain('Please verify your email address before logging in');
+
+      // Also test string match without explicit status code
+      const stringError = new Error('Email not confirmed');
+      const sanitizedString = sanitizeApiError(stringError, 'Login failed.');
+      expect(sanitizedString.status).toBe(403);
+      expect(sanitizedString.error).toContain('Please verify your email address before logging in');
+    });
   });
 });

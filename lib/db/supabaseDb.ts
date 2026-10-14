@@ -248,7 +248,12 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
         error.message?.toLowerCase().includes('not confirmed') ||
         error.message?.toLowerCase().includes('unverified')
       ) {
-        throw new Error('Please verify your email address before logging in. A confirmation email was sent to your inbox.');
+        const unconfirmedError: any = new Error(
+          'Please verify your email address before logging in. A confirmation email was sent to your inbox.'
+        );
+        unconfirmedError.status = 403;
+        unconfirmedError.code = 'email_not_confirmed';
+        throw unconfirmedError;
       }
       return null;
     }
@@ -264,7 +269,12 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
       process.env.AUTH_AUTO_CONFIRM_EMAILS === 'true'
     );
     if (!isConfirmed) {
-      throw new Error('Please verify your email address before logging in. A confirmation email was sent to your inbox.');
+      const unconfirmedError: any = new Error(
+        'Please verify your email address before logging in. A confirmation email was sent to your inbox.'
+      );
+      unconfirmedError.status = 403;
+      unconfirmedError.code = 'email_not_confirmed';
+      throw unconfirmedError;
     }
 
     let profile = await this.getUserById(data.user.id);

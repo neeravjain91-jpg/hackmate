@@ -67,6 +67,24 @@ export async function POST(request: NextRequest) {
 
     return response;
   } catch (err: any) {
+    const message = typeof err?.message === 'string' ? err.message : '';
+    const isUnverified =
+      err?.status === 403 ||
+      err?.code === 'email_not_confirmed' ||
+      message.includes('verify your email address before logging in') ||
+      (message.toLowerCase().includes('email') &&
+        (message.toLowerCase().includes('not confirmed') || message.toLowerCase().includes('unverified')));
+
+    if (isUnverified) {
+      return NextResponse.json(
+        {
+          error:
+            'Please verify your email address before logging in. A confirmation email was sent to your inbox.',
+        },
+        { status: 403 }
+      );
+    }
+
     const { error, status } = sanitizeApiError(err, 'Login failed.');
     return NextResponse.json({ error }, { status });
   }

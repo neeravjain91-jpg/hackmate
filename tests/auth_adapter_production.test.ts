@@ -1762,6 +1762,116 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       expect(res.headers.get('set-cookie')).toBeNull();
     });
 
+    it('returns HTTP 403 and no session cookie when authenticateUser throws unverified-email error', async () => {
+      const unverifiedError: any = new Error(
+        'Please verify your email address before logging in. A confirmation email was sent to your inbox.'
+      );
+      unverifiedError.status = 403;
+      unverifiedError.code = 'email_not_confirmed';
+
+      const mockDb: any = {
+        authenticateUser: vi.fn().mockRejectedValue(unverifiedError),
+      };
+      setDatabaseAdapter(mockDb);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'unverified@uni.edu',
+          password: 'password123',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(403);
+      const data = await res.json();
+      expect(data.error).toContain('Please verify your email address before logging in');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('returns HTTP 403 and no session cookie when real SupabaseDatabaseAdapter authenticates an unconfirmed user', async () => {
+      const adminClient: any = { auth: { admin: {} } };
+      const authClient: any = {
+        auth: {
+          signInWithPassword: vi.fn().mockResolvedValue({
+            data: { user: null },
+            error: { message: 'Email not confirmed' },
+          }),
+        },
+      };
+      const realAdapter = new SupabaseDatabaseAdapter(adminClient, () => authClient);
+      setDatabaseAdapter(realAdapter);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'unconfirmed@student.edu',
+          password: 'password123',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(403);
+      const data = await res.json();
+      expect(data.error).toContain('Please verify your email address before logging in');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('returns HTTP 401 when invalid credentials are provided', async () => {
+      const adminClient: any = { auth: { admin: {} } };
+      const authClient: any = {
+        auth: {
+          signInWithPassword: vi.fn().mockResolvedValue({
+            data: { user: null },
+            error: { message: 'Invalid login credentials' },
+          }),
+        },
+      };
+      const realAdapter = new SupabaseDatabaseAdapter(adminClient, () => authClient);
+      setDatabaseAdapter(realAdapter);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'wrong@student.edu',
+          password: 'wrongPassword',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(401);
+      const data = await res.json();
+      expect(data.error).toBe('Invalid email or password.');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
+    it('returns HTTP 503 and no session cookie when database storage configuration fails during login', async () => {
+      const mockDb: any = {
+        authenticateUser: vi.fn().mockRejectedValue(
+          new Error('STORAGE CONFIGURATION ERROR: Supabase admin client unavailable')
+        ),
+      };
+      setDatabaseAdapter(mockDb);
+
+      const req = new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: 'user@student.edu',
+          password: 'password123',
+        }),
+      });
+
+      const res = await loginHandler(req);
+      expect(res.status).toBe(503);
+      const data = await res.json();
+      expect(data.error).toContain('STORAGE CONFIGURATION ERROR');
+      expect(res.headers.get('set-cookie')).toBeNull();
+    });
+
     it('prevents refreshing session when isUserVerified returns false', async () => {
       const mockDb: any = {
         getUserById: vi.fn().mockResolvedValue({
