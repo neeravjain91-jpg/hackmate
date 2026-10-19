@@ -125,13 +125,27 @@ export function sanitizeApiError(
     };
   }
 
-  // 4. Preserve client HTTP status codes (e.g. 400, 401, 403, 404, 409) if explicitly specified on the error
+  // 4. Explicit email confirmation delivery and provider failures: sanitize internal details
+  const isEmailSendFailure =
+    message.toLowerCase().includes('error sending confirmation email') ||
+    message.toLowerCase().includes('error sending verification email') ||
+    err?.code === 'email_provider_disabled' ||
+    err?.code === 'over_email_send_rate_limit';
+
+  // 5. Preserve client HTTP status codes (e.g. 400, 401, 403, 404, 409, 429) if explicitly specified on the error
   const customStatus =
     typeof err?.status === 'number'
       ? err.status
       : typeof err?.statusCode === 'number'
         ? err.statusCode
         : null;
+
+  if (isEmailSendFailure) {
+    return {
+      error: 'Error sending confirmation email',
+      status: customStatus && customStatus >= 400 && customStatus < 500 ? customStatus : 500,
+    };
+  }
 
   if (customStatus && customStatus >= 400 && customStatus < 500) {
     return {

@@ -975,6 +975,53 @@ describe('Multi-User Production Authentication & Storage Alignment', () => {
       }
     });
 
+    it('preserves status and code when Supabase Auth signUp fails with email delivery error', async () => {
+      const originalEnv = process.env.NODE_ENV;
+      const originalAutoConfirm = process.env.AUTH_AUTO_CONFIRM_EMAILS;
+      try {
+        (process.env as any).NODE_ENV = 'production';
+        process.env.AUTH_AUTO_CONFIRM_EMAILS = 'false';
+
+        const authClient: any = {
+          auth: {
+            signUp: vi.fn().mockResolvedValue({
+              data: { user: null },
+              error: {
+                message: 'Error sending confirmation email',
+                status: 500,
+                code: 'unexpected_failure',
+              },
+            }),
+          },
+        };
+
+        const adapter = new SupabaseDatabaseAdapter({ auth: { admin: {} } } as any, () => authClient);
+
+        let thrownError: any = null;
+        try {
+          await adapter.createUser({
+            email: 'newuser@uni.edu',
+            name: 'New User',
+            password: 'password123!',
+          });
+        } catch (err) {
+          thrownError = err;
+        }
+
+        expect(thrownError).toBeDefined();
+        expect(thrownError.message).toBe('Error sending confirmation email');
+        expect(thrownError.status).toBe(500);
+        expect(thrownError.code).toBe('unexpected_failure');
+      } finally {
+        (process.env as any).NODE_ENV = originalEnv;
+        if (originalAutoConfirm !== undefined) {
+          process.env.AUTH_AUTO_CONFIRM_EMAILS = originalAutoConfirm;
+        } else {
+          delete process.env.AUTH_AUTO_CONFIRM_EMAILS;
+        }
+      }
+    });
+
     it('callback fails closed and issues NO session cookie if profile creation fails', async () => {
       const mockAdapter: any = {
         isUserVerified: vi.fn().mockResolvedValue(true),

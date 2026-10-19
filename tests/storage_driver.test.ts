@@ -422,5 +422,22 @@ describe('Storage Driver Configuration & Production Safeguards', () => {
       expect(sanitizedBadReq.status).toBe(400);
       expect(sanitizedBadReq.error).toBe('Invalid request parameters.');
     });
+
+    it('sanitizeApiError sanitizes email delivery failures without leaking provider or network details', () => {
+      const emailSendErr: any = new Error('Error sending confirmation email: 550 5.7.1 Domain not verified on smtp.resend.com');
+      emailSendErr.status = 500;
+      const sanitized = sanitizeApiError(emailSendErr, 'Registration failed.');
+      expect(sanitized.status).toBe(500);
+      expect(sanitized.error).toBe('Error sending confirmation email');
+      expect(sanitized.error).not.toContain('resend');
+      expect(sanitized.error).not.toContain('550');
+
+      const rateLimitEmailErr: any = new Error('Over email send rate limit');
+      rateLimitEmailErr.code = 'over_email_send_rate_limit';
+      rateLimitEmailErr.status = 429;
+      const sanitizedRateLimit = sanitizeApiError(rateLimitEmailErr, 'Registration failed.');
+      expect(sanitizedRateLimit.status).toBe(429);
+      expect(sanitizedRateLimit.error).toBe('Error sending confirmation email');
+    });
   });
 });

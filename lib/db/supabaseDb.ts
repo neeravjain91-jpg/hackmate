@@ -138,7 +138,14 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
         });
 
         if (signUpError) {
-          throw new Error(signUpError.message || 'Failed to register with Supabase Auth.');
+          const authError: any = new Error(signUpError.message || 'Failed to register with Supabase Auth.');
+          if (typeof (signUpError as any).status === 'number') {
+            authError.status = (signUpError as any).status;
+          }
+          if ((signUpError as any).code) {
+            authError.code = (signUpError as any).code;
+          }
+          throw authError;
         }
 
         if (!signUpData?.user) {
@@ -147,7 +154,9 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
 
         // In Supabase, if email is already registered and confirmed, identities is empty array []
         if (signUpData.user.identities && signUpData.user.identities.length === 0) {
-          throw new Error('An account with this email address already exists.');
+          const conflictError: any = new Error('An account with this email address already exists.');
+          conflictError.status = 409;
+          throw conflictError;
         }
 
         userId = signUpData.user.id;
@@ -170,7 +179,10 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
         });
 
         if (authError || !authData?.user) {
-          throw new Error(authError?.message || 'Failed to create user in Supabase Auth.');
+          const error: any = new Error(authError?.message || 'Failed to create user in Supabase Auth.');
+          if (typeof (authError as any)?.status === 'number') error.status = (authError as any).status;
+          if ((authError as any)?.code) error.code = (authError as any).code;
+          throw error;
         }
         userId = authData.user.id;
         requiresVerification = false;
@@ -191,7 +203,10 @@ export class SupabaseDatabaseAdapter implements IDatabaseAdapter {
         });
 
         if (signUpError || !signUpData?.user) {
-          throw new Error(signUpError?.message || 'Failed to register with Supabase Auth.');
+          const error: any = new Error(signUpError?.message || 'Failed to register with Supabase Auth.');
+          if (typeof (signUpError as any)?.status === 'number') error.status = (signUpError as any).status;
+          if ((signUpError as any)?.code) error.code = (signUpError as any).code;
+          throw error;
         }
         userId = signUpData.user.id;
         requiresVerification = false;
