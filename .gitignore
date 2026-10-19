@@ -41,6 +41,8 @@ out/
 # HackMate Local storage & env
 .env*.local
 data/storage/
+data/workspaces/
+data/test_workspace_data/
 data/hackmate.json
 tsconfig.tsbuildinfo
 
